@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "ExceptionRewriter": {
+      "commandName": "Project",
+      "commandLineArgs": "\"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Debug\\NetFramework.exe\" C:\\Users\\Katelyn\\Desktop\\rewritten.exe"
+    }
+  }
+}
