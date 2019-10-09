@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Linq;
 using System.Text;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
@@ -9,12 +11,42 @@ namespace ExceptionRewriter {
         public readonly AssemblyDefinition Assembly;
         public readonly AssemblyAnalyzer Analyzer;
 
+        private TypeDefinition RewriterUtilType;
+        private MethodDefinition CaptureStackImpl;
+
         public AssemblyRewriter (AssemblyAnalyzer analyzer) {
             Assembly = analyzer.Input;
             Analyzer = analyzer;
         }
 
+        // The encouraged typeof() based import isn't valid because it will import
+        //  corelib types into netframework apps. yay
+        private TypeReference ImportCorlibType (ModuleDefinition module, string @namespace, string name) {
+            foreach (var m in Assembly.Modules) {
+                var ts = m.TypeSystem;
+                var mLookup = ts.GetType().GetMethod("LookupType", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                var result = mLookup.Invoke(ts, new object[] { @namespace, name });
+                if (result != null)
+                    return module.ImportReference((TypeReference)result);
+            }
+
+            return null;
+        }
+
+        private TypeReference GetException (ModuleDefinition module) {
+            return ImportCorlibType(module, "System", "Exception");
+        }
+
+        private TypeReference GetExceptionDispatchInfo (ModuleDefinition module) {
+            return ImportCorlibType(module, "System.Runtime.ExceptionServices", "ExceptionDispatchInfo");
+        }
+
         public void Rewrite () {
+            RewriterUtilType = Assembly.MainModule.GetType("Mono.AssemblyRewriter.Internal");
+            if (RewriterUtilType == null)
+                RewriterUtilType = CreateRewriterUtilType();
+            CaptureStackImpl = RewriterUtilType.Methods.First(m => m.Name == "CaptureStackTrace");
+
             var queue = new HashSet<AnalyzedMethod>();
 
             // First, collect a full set of all the methods we will rewrite
@@ -32,28 +64,157 @@ namespace ExceptionRewriter {
             }
         }
 
+        private MethodReference GetThrow (ModuleDefinition module) {
+            var tDispatchInfo = GetExceptionDispatchInfo(module);
+            return module.ImportReference(new MethodReference(
+                "Throw", module.TypeSystem.Void, tDispatchInfo
+            ) {
+                HasThis = true
+            });
+        }
+
+        private TypeDefinition CreateRewriterUtilType () {
+            var mod = Assembly.MainModule;
+            var td = new TypeDefinition(
+                "Mono.AssemblyRewriter", "Internal",
+                TypeAttributes.Sealed | TypeAttributes.Public,
+                mod.TypeSystem.Object
+            );
+
+            var tException = GetException(mod);
+            var tDispatchInfo = GetExceptionDispatchInfo(mod);
+            var method = new MethodDefinition(
+                "CaptureStackTrace", MethodAttributes.Static | MethodAttributes.Public | MethodAttributes.Final, tDispatchInfo
+            );
+            MethodReference mCapture = new MethodReference(
+                "Capture", tDispatchInfo, tDispatchInfo
+            ) {
+                Parameters = {
+                    new ParameterDefinition("source", ParameterAttributes.None, tException)
+                },
+                HasThis = false
+            };
+            mCapture = mod.ImportReference(mCapture);
+
+            var excParam = new ParameterDefinition("exc", ParameterAttributes.None, tException);
+            method.Parameters.Add(excParam);
+
+            var result = new VariableDefinition(tDispatchInfo);
+
+            var body = method.Body = new MethodBody(method);
+            body.Variables.Add(result);
+            body.Instructions.Add(Instruction.Create(OpCodes.Ldnull));
+            body.Instructions.Add(Instruction.Create(OpCodes.Stloc, result));
+
+            var ret = Instruction.Create(OpCodes.Ldloc, result);
+
+            var tryStart = Instruction.Create(OpCodes.Ldarg_0);
+            var tryEnd = Instruction.Create(OpCodes.Leave, ret);
+            body.Instructions.Add(tryStart);
+            body.Instructions.Add(Instruction.Create(OpCodes.Throw));
+            body.Instructions.Add(tryEnd);
+
+            var catchStart = Instruction.Create(OpCodes.Ldarg_0);
+            var catchEnd = Instruction.Create(OpCodes.Leave, ret);
+
+            // catch { return ExceptionDispatchInfo.Capture(exc); }
+            body.Instructions.Add(catchStart);
+            body.Instructions.Add(Instruction.Create(OpCodes.Call, mCapture));
+            body.Instructions.Add(Instruction.Create(OpCodes.Stloc, result));
+
+            body.Instructions.Add(catchEnd);
+
+            body.Instructions.Add(ret);
+            body.Instructions.Add(Instruction.Create(OpCodes.Ret));
+
+            body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch) {
+                TryStart = tryStart,
+                TryEnd = catchStart,
+                HandlerStart = catchStart,
+                HandlerEnd = ret,
+                CatchType = tException
+            });
+
+            td.Methods.Add(method);
+            mod.Types.Add(td);
+            return td;
+        }
+
         private void Rewrite (AnalyzedMethod am, HashSet<AnalyzedMethod> methods) {
             var method = am.Method;
             var backing = CloneMethod(method);
             ConvertToOutException(backing);
             am.Method.DeclaringType.Methods.Add(backing);
-            // var backing = method.Clone();
+            ReplaceWithBackingCall(method, backing);
         }
 
-        private Instruction MakeDefault (TypeReference t) {
+        private void ReplaceWithBackingCall (
+            MethodDefinition method, MethodDefinition target
+        ) {
+            var body = method.Body.Instructions;
+            body.Clear();
+            method.Body.ExceptionHandlers.Clear();
+
+            var ediType = GetExceptionDispatchInfo(method.Module);
+            var refType = new ByReferenceType(ediType);
+
+            var excVariable = new VariableDefinition(ediType);
+            method.Body.Variables.Add(excVariable);
+
+            // Null-init the exc outvar (is this necessary?)
+            body.Add(Instruction.Create(OpCodes.Ldnull));
+            body.Add(Instruction.Create(OpCodes.Stloc, excVariable));
+
+            // Push the arguments onto the stack
+            for (int i = 0; i < method.Parameters.Count; i++)
+                body.Add(Instruction.Create(OpCodes.Ldarg, method.Parameters[i]));
+            // Push address of our exc local for the out exc parameter
+            body.Add(Instruction.Create(OpCodes.Ldloca, excVariable));
+            // Now invoke, leaving retval on the stack.
+            body.Add(Instruction.Create(OpCodes.Call, target));
+
+            var throwTarget = Instruction.Create(OpCodes.Ldloc, excVariable);
+
+            // Now read exc local and branch if != null to a throw
+            body.Add(Instruction.Create(OpCodes.Ldloc, excVariable));
+            body.Add(Instruction.Create(OpCodes.Ldnull));
+            body.Add(Instruction.Create(OpCodes.Ceq));
+            body.Add(Instruction.Create(OpCodes.Brfalse, throwTarget));
+            // If we didn't branch to the throw, the only thing on the stack should be the retval
+            //  from our call to _impl, so we can just ret.
+            body.Add(Instruction.Create(OpCodes.Ret));
+
+            body.Add(throwTarget);
+            body.Add(Instruction.Create(OpCodes.Call, GetThrow(method.Module)));
+            body.Add(Instruction.Create(OpCodes.Ret));
+        }
+
+        private Instruction[] MakeDefault (
+            TypeReference t,
+            Dictionary<TypeReference, VariableDefinition> tempLocals
+        ) {
             if (t.FullName == "System.Void")
-                return Instruction.Create(OpCodes.Nop);
+                return new Instruction[0];
 
             if (t.IsByReference || !t.IsValueType)
-                return Instruction.Create(OpCodes.Ldnull);
+                return new [] { Instruction.Create(OpCodes.Ldnull) };
 
             switch (t.FullName) {
                 case "System.Int32":
                 case "System.UInt32":
                 case "System.Boolean":
-                    return Instruction.Create(OpCodes.Ldc_I4_0);
+                    return new [] { Instruction.Create(OpCodes.Ldc_I4_0) };
                 default:
-                    throw new NotImplementedException();
+                    VariableDefinition tempLocal;
+                    if (!tempLocals.TryGetValue(t, out tempLocal)) {
+                        tempLocals[t] = tempLocal = new VariableDefinition(t);
+                        return new[] {
+                            Instruction.Create(OpCodes.Ldloca_S, tempLocal),
+                            Instruction.Create(OpCodes.Initobj, t),
+                            Instruction.Create(OpCodes.Ldloc, tempLocal)
+                        };
+                    } else
+                        return new[] { Instruction.Create(OpCodes.Ldloc, tempLocal) };
             }
         }
 
@@ -88,10 +249,11 @@ namespace ExceptionRewriter {
         }
 
         private void ConvertToOutException (MethodDefinition method) {
-            var excType = method.Module.ImportReference(typeof(Exception));
-            var refType = new ByReferenceType(excType);
+            var tempStructLocals = new Dictionary<TypeReference, VariableDefinition>();
+            var ediType = GetExceptionDispatchInfo(method.Module);
+            var refType = new ByReferenceType(ediType);
             var outParam = new ParameterDefinition("_error", ParameterAttributes.Out, refType);
-            var tempLocal = new VariableDefinition(excType);
+            var tempLocal = new VariableDefinition(ediType);
             var resultLocal = method.ReturnType.FullName != "System.Void" 
                 ? new VariableDefinition(method.ReturnType) : null;
             if (resultLocal != null)
@@ -115,18 +277,20 @@ namespace ExceptionRewriter {
 
                 var valueType = param.ParameterType.GetElementType();
 
-                InsertOps(insns, 1, new[] {
-                    Instruction.Create(OpCodes.Ldarg, param),
-                    MakeDefault(valueType),
-                    Instruction.Create(OpCodes.Stind_Ref)
-                });
+                InsertOps(insns, 1, 
+                    (new[] { Instruction.Create(OpCodes.Ldarg, param) })
+                    .Concat(MakeDefault(valueType, tempStructLocals))
+                    .Concat(new [] { Instruction.Create(OpCodes.Stind_Ref)})
+                    .ToArray()
+                );
             }
 
             if (resultLocal != null) {
-                InsertOps(insns, 1, new[] {
-                    MakeDefault(method.ReturnType),
-                    Instruction.Create(OpCodes.Stloc, resultLocal)
-                });
+                InsertOps(insns, 1, 
+                    MakeDefault(method.ReturnType, tempStructLocals)
+                    .Concat(new[] { Instruction.Create(OpCodes.Stloc, resultLocal) })
+                    .ToArray()
+                );
             }
 
             // We generate an exit point at the end of the function where the result local is
@@ -140,19 +304,22 @@ namespace ExceptionRewriter {
 
                 switch (insn.OpCode.Code) {
                     case Code.Throw:
-                        // store the exc, load the address of the outparam, then load + restore the exc
-                        insns[i] = Instruction.Create(OpCodes.Stloc, tempLocal);
+                        // Pass the exc through capture to get an exception dispatch info
+                        insns[i] = Instruction.Create(OpCodes.Call, CaptureStackImpl);
                         Patch(method, insn, insns[i]);
-                        InsertOps(insns, i + 1, new[] { 
+                        InsertOps(insns, i + 1, new[] {
+                            Instruction.Create(OpCodes.Stloc, tempLocal),
+                            // Now that it's in the temp local, load the & of the out exc param and store into it
                             Instruction.Create(OpCodes.Ldarg, outParam),
                             Instruction.Create(OpCodes.Ldloc, tempLocal),
+                            // Branch to exit
                             Instruction.Create(OpCodes.Stind_Ref),
                             Instruction.Create(OpCodes.Br, exitPoint)
                         });
                         break;
                     case Code.Ret:
                         // Jump to the exit point where we will run finally blocks
-                        insns[i] = Instruction.Create(OpCodes.Br, exitRet);
+                        insns[i] = Instruction.Create(OpCodes.Br, exitPoint);
                         Patch(method, insn, insns[i]);
                         if (resultLocal != null) {
                             // Stash the retval from the stack into the result local
@@ -163,6 +330,9 @@ namespace ExceptionRewriter {
                         continue;
                 }
             }
+
+            foreach (var kvp in tempStructLocals)
+                method.Body.Variables.Add(kvp.Value);
 
             insns.Add(Instruction.Create(OpCodes.Nop));
             if (exitLoad != null)
