@@ -64,6 +64,19 @@ namespace ExceptionRewriter {
             }
         }
 
+        private MethodReference GetCapture (ModuleDefinition module) {
+            var tDispatchInfo = GetExceptionDispatchInfo(module);
+            MethodReference mCapture = new MethodReference(
+                "Capture", tDispatchInfo, tDispatchInfo
+            ) {
+                Parameters = {
+                    new ParameterDefinition("source", ParameterAttributes.None, GetException(module))
+                },
+                HasThis = false
+            };
+            return module.ImportReference(mCapture);
+        }
+
         private MethodReference GetThrow (ModuleDefinition module) {
             var tDispatchInfo = GetExceptionDispatchInfo(module);
             return module.ImportReference(new MethodReference(
@@ -82,56 +95,35 @@ namespace ExceptionRewriter {
             );
 
             var tException = GetException(mod);
-            var tDispatchInfo = GetExceptionDispatchInfo(mod);
             var method = new MethodDefinition(
-                "CaptureStackTrace", MethodAttributes.Static | MethodAttributes.Public | MethodAttributes.Final, tDispatchInfo
+                "CaptureStackTrace", MethodAttributes.Static | MethodAttributes.Public | MethodAttributes.Final, tException
             );
-            MethodReference mCapture = new MethodReference(
-                "Capture", tDispatchInfo, tDispatchInfo
-            ) {
-                Parameters = {
-                    new ParameterDefinition("source", ParameterAttributes.None, tException)
-                },
-                HasThis = false
-            };
-            mCapture = mod.ImportReference(mCapture);
 
             var excParam = new ParameterDefinition("exc", ParameterAttributes.None, tException);
             method.Parameters.Add(excParam);
 
-            var result = new VariableDefinition(tDispatchInfo);
-
             var body = method.Body = new MethodBody(method);
-            body.Variables.Add(result);
-            body.Instructions.Add(Instruction.Create(OpCodes.Ldnull));
-            body.Instructions.Add(Instruction.Create(OpCodes.Stloc, result));
 
-            var ret = Instruction.Create(OpCodes.Ldloc, result);
+            var nop = Instruction.Create(OpCodes.Ldarg_0);
 
             var tryStart = Instruction.Create(OpCodes.Ldarg_0);
-            var tryEnd = Instruction.Create(OpCodes.Leave, ret);
             body.Instructions.Add(tryStart);
             body.Instructions.Add(Instruction.Create(OpCodes.Throw));
-            body.Instructions.Add(tryEnd);
+            body.Instructions.Add(Instruction.Create(OpCodes.Leave, nop));
 
-            var catchStart = Instruction.Create(OpCodes.Ldarg_0);
-            var catchEnd = Instruction.Create(OpCodes.Leave, ret);
+            var catchOp = Instruction.Create(OpCodes.Leave, nop);
 
             // catch { return ExceptionDispatchInfo.Capture(exc); }
-            body.Instructions.Add(catchStart);
-            body.Instructions.Add(Instruction.Create(OpCodes.Call, mCapture));
-            body.Instructions.Add(Instruction.Create(OpCodes.Stloc, result));
+            body.Instructions.Add(catchOp);
 
-            body.Instructions.Add(catchEnd);
-
-            body.Instructions.Add(ret);
+            body.Instructions.Add(nop);
             body.Instructions.Add(Instruction.Create(OpCodes.Ret));
 
             body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch) {
                 TryStart = tryStart,
-                TryEnd = catchStart,
-                HandlerStart = catchStart,
-                HandlerEnd = ret,
+                TryEnd = catchOp,
+                HandlerStart = catchOp,
+                HandlerEnd = nop,
                 CatchType = tException
             });
 
@@ -250,15 +242,16 @@ namespace ExceptionRewriter {
 
         private void ConvertToOutException (MethodDefinition method) {
             var tempStructLocals = new Dictionary<TypeReference, VariableDefinition>();
+            var excType = GetException(method.Module);
             var ediType = GetExceptionDispatchInfo(method.Module);
             var refType = new ByReferenceType(ediType);
             var outParam = new ParameterDefinition("_error", ParameterAttributes.Out, refType);
-            var tempLocal = new VariableDefinition(ediType);
+            var tempExceptionLocal = new VariableDefinition(excType);
             var resultLocal = method.ReturnType.FullName != "System.Void" 
                 ? new VariableDefinition(method.ReturnType) : null;
             if (resultLocal != null)
                 method.Body.Variables.Add(resultLocal);
-            method.Body.Variables.Add(tempLocal);
+            method.Body.Variables.Add(tempExceptionLocal);
             method.Parameters.Add(outParam);
 
             var defaultException = Instruction.Create(OpCodes.Ldnull);
@@ -304,16 +297,20 @@ namespace ExceptionRewriter {
 
                 switch (insn.OpCode.Code) {
                     case Code.Throw:
-                        // Pass the exc through capture to get an exception dispatch info
+                        // Pass the exc through capture to store the stack trace on it
                         insns[i] = Instruction.Create(OpCodes.Call, CaptureStackImpl);
                         Patch(method, insn, insns[i]);
                         InsertOps(insns, i + 1, new[] {
-                            Instruction.Create(OpCodes.Stloc, tempLocal),
-                            // Now that it's in the temp local, load the & of the out exc param and store into it
+                            // Store it into a temp exception local
+                            Instruction.Create(OpCodes.Stloc, tempExceptionLocal),
+                            // Prepare to store the output
                             Instruction.Create(OpCodes.Ldarg, outParam),
-                            Instruction.Create(OpCodes.Ldloc, tempLocal),
-                            // Branch to exit
+                            // Now convert it into an ExceptionDispatchInfo
+                            Instruction.Create(OpCodes.Ldloc, tempExceptionLocal),
+                            Instruction.Create(OpCodes.Call, GetCapture(method.Module)),
+                            // Write the info into the output
                             Instruction.Create(OpCodes.Stind_Ref),
+                            // Branch to exit
                             Instruction.Create(OpCodes.Br, exitPoint)
                         });
                         break;
