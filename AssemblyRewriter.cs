@@ -52,15 +52,22 @@ namespace ExceptionRewriter {
             // First, collect a full set of all the methods we will rewrite
             // The rewriting process needs to know this in order to identify whether
             //  a given method call needs to be wrapped in a try block.
+
             foreach (var m in Analyzer.Methods.Values) {
                 if (!m.ShouldRewrite)
                     continue;
+
+                // Create empty backing method definitions for each method, so that
+                //  we can reference them when modifying other methods.
+                m.BackingMethod = CloneMethod(m.Method);
+                m.Method.DeclaringType.Methods.Add(m.BackingMethod);
+
                 queue.Add(m);
             }
 
             foreach (var m in queue) {
                 Console.WriteLine("Rewriting {0}", m.Method.FullName);
-                Rewrite(m, queue);
+                Rewrite(m);
             }
         }
 
@@ -95,35 +102,43 @@ namespace ExceptionRewriter {
             );
 
             var tException = GetException(mod);
+            var tDispatchInfo = GetExceptionDispatchInfo(mod);
             var method = new MethodDefinition(
-                "CaptureStackTrace", MethodAttributes.Static | MethodAttributes.Public | MethodAttributes.Final, tException
+                "CaptureStackTrace", MethodAttributes.Static | MethodAttributes.Public | MethodAttributes.Final, tDispatchInfo
             );
+            var result = new VariableDefinition(tDispatchInfo);
 
             var excParam = new ParameterDefinition("exc", ParameterAttributes.None, tException);
             method.Parameters.Add(excParam);
 
             var body = method.Body = new MethodBody(method);
+            body.Variables.Add(result);
 
-            var nop = Instruction.Create(OpCodes.Ldarg_0);
+            var loadResult = Instruction.Create(OpCodes.Ldloc, result);
 
             var tryStart = Instruction.Create(OpCodes.Ldarg_0);
             body.Instructions.Add(tryStart);
             body.Instructions.Add(Instruction.Create(OpCodes.Throw));
-            body.Instructions.Add(Instruction.Create(OpCodes.Leave, nop));
+            body.Instructions.Add(Instruction.Create(OpCodes.Leave, loadResult));
 
-            var catchOp = Instruction.Create(OpCodes.Leave, nop);
+            var catchOp = Instruction.Create(OpCodes.Ldnull);
 
-            // catch { return ExceptionDispatchInfo.Capture(exc); }
+            // catch { result = ExceptionDispatchInfo.Capture(exc); }
             body.Instructions.Add(catchOp);
+            body.Instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
+            body.Instructions.Add(Instruction.Create(OpCodes.Call, GetCapture(mod)));
+            body.Instructions.Add(Instruction.Create(OpCodes.Stloc, result));
+            body.Instructions.Add(Instruction.Create(OpCodes.Leave, loadResult));
 
-            body.Instructions.Add(nop);
+            // return result;
+            body.Instructions.Add(loadResult);
             body.Instructions.Add(Instruction.Create(OpCodes.Ret));
 
             body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch) {
                 TryStart = tryStart,
                 TryEnd = catchOp,
                 HandlerStart = catchOp,
-                HandlerEnd = nop,
+                HandlerEnd = loadResult,
                 CatchType = tException
             });
 
@@ -132,11 +147,10 @@ namespace ExceptionRewriter {
             return td;
         }
 
-        private void Rewrite (AnalyzedMethod am, HashSet<AnalyzedMethod> methods) {
+        private void Rewrite (AnalyzedMethod am) {
             var method = am.Method;
-            var backing = CloneMethod(method);
+            var backing = am.BackingMethod;
             ConvertToOutException(backing);
-            am.Method.DeclaringType.Methods.Add(backing);
             ReplaceWithBackingCall(method, backing);
         }
 
@@ -165,20 +179,17 @@ namespace ExceptionRewriter {
             // Now invoke, leaving retval on the stack.
             body.Add(Instruction.Create(OpCodes.Call, target));
 
-            var throwTarget = Instruction.Create(OpCodes.Ldloc, excVariable);
+            var ret = Instruction.Create(OpCodes.Ret);
 
-            // Now read exc local and branch if != null to a throw
+            // Now read exc local and throw if != null
             body.Add(Instruction.Create(OpCodes.Ldloc, excVariable));
             body.Add(Instruction.Create(OpCodes.Ldnull));
             body.Add(Instruction.Create(OpCodes.Ceq));
-            body.Add(Instruction.Create(OpCodes.Brfalse, throwTarget));
-            // If we didn't branch to the throw, the only thing on the stack should be the retval
-            //  from our call to _impl, so we can just ret.
-            body.Add(Instruction.Create(OpCodes.Ret));
-
-            body.Add(throwTarget);
+            body.Add(Instruction.Create(OpCodes.Brtrue, ret));
+            body.Add(Instruction.Create(OpCodes.Ldloc, excVariable));
             body.Add(Instruction.Create(OpCodes.Call, GetThrow(method.Module)));
-            body.Add(Instruction.Create(OpCodes.Ret));
+
+            body.Add(ret);
         }
 
         private Instruction[] MakeDefault (
@@ -246,7 +257,7 @@ namespace ExceptionRewriter {
             var ediType = GetExceptionDispatchInfo(method.Module);
             var refType = new ByReferenceType(ediType);
             var outParam = new ParameterDefinition("_error", ParameterAttributes.Out, refType);
-            var tempExceptionLocal = new VariableDefinition(excType);
+            var tempExceptionLocal = new VariableDefinition(ediType);
             var resultLocal = method.ReturnType.FullName != "System.Void" 
                 ? new VariableDefinition(method.ReturnType) : null;
             if (resultLocal != null)
@@ -296,6 +307,18 @@ namespace ExceptionRewriter {
                 var insn = insns[i];
 
                 switch (insn.OpCode.Code) {
+                    case Code.Call:
+                        var target = (MethodReference)insn.Operand;
+                        var am = Analyzer.GetResult(target);
+                        if ((am == null) || !am.ShouldRewrite)
+                            continue;
+                        var newTarget = am.BackingMethod;
+                        insns[i] = Instruction.Create(OpCodes.Call, newTarget);
+                        Patch(method, insn, insns[i]);
+                        // Push the out param onto the args list since we're now calling the backing method
+                        //  which takes an out param
+                        insns.Insert(i, Instruction.Create(OpCodes.Ldarg, outParam));
+                        break;
                     case Code.Throw:
                         // Pass the exc through capture to store the stack trace on it
                         insns[i] = Instruction.Create(OpCodes.Call, CaptureStackImpl);
@@ -307,7 +330,6 @@ namespace ExceptionRewriter {
                             Instruction.Create(OpCodes.Ldarg, outParam),
                             // Now convert it into an ExceptionDispatchInfo
                             Instruction.Create(OpCodes.Ldloc, tempExceptionLocal),
-                            Instruction.Create(OpCodes.Call, GetCapture(method.Module)),
                             // Write the info into the output
                             Instruction.Create(OpCodes.Stind_Ref),
                             // Branch to exit
