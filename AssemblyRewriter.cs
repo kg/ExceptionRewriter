@@ -251,22 +251,47 @@ namespace ExceptionRewriter {
                 body.Insert(offset, ops[i]);
         }
 
+        private void InsertErrorCheck (
+            Mono.Collections.Generic.Collection<Instruction> body, int offset, ModuleDefinition module, 
+            ParameterDefinition outParam, Instruction exitPoint, ExceptionHandler tryBlock
+        ) {
+            var skipTarget = Instruction.Create(OpCodes.Nop);
+            var onError = (tryBlock != null) ? tryBlock.HandlerStart : exitPoint;
+            InsertOps(body, offset, new[] {
+                Instruction.Create(OpCodes.Ldarg, outParam),
+                Instruction.Create(OpCodes.Ldind_Ref),
+                Instruction.Create(OpCodes.Ldnull),
+                Instruction.Create(OpCodes.Ceq),
+                Instruction.Create(OpCodes.Brtrue, skipTarget),
+                Instruction.Create(OpCodes.Br, onError),
+                skipTarget
+                /*
+                Instruction.Create(OpCodes.Ldarg, outParam),
+                Instruction.Create(OpCodes.Ldind_Ref),
+                Instruction.Create(OpCodes.Call, GetThrow(module)),
+                */
+            });
+        }
+
         private void ConvertToOutException (MethodDefinition method) {
             var tempStructLocals = new Dictionary<TypeReference, VariableDefinition>();
             var excType = GetException(method.Module);
             var ediType = GetExceptionDispatchInfo(method.Module);
             var refType = new ByReferenceType(ediType);
             var outParam = new ParameterDefinition("_error", ParameterAttributes.Out, refType);
-            var tempExceptionLocal = new VariableDefinition(ediType);
+            var tempExceptionLocal = new VariableDefinition(excType);
+            var tempEdiLocal = new VariableDefinition(ediType);
             var resultLocal = method.ReturnType.FullName != "System.Void" 
                 ? new VariableDefinition(method.ReturnType) : null;
             if (resultLocal != null)
                 method.Body.Variables.Add(resultLocal);
             method.Body.Variables.Add(tempExceptionLocal);
+            method.Body.Variables.Add(tempEdiLocal);
             method.Parameters.Add(outParam);
 
             var defaultException = Instruction.Create(OpCodes.Ldnull);
             var insns = method.Body.Instructions;
+            var tryBlocksByInsn = new Dictionary<Instruction, ExceptionHandler>();
 
             insns.Insert(0, Instruction.Create(OpCodes.Nop));
 
@@ -297,11 +322,69 @@ namespace ExceptionRewriter {
                 );
             }
 
+            var deadExceptionHandlers = new HashSet<ExceptionHandler>();
+
+            foreach (var eh in method.Body.ExceptionHandlers) {
+                if (eh.HandlerStart == null)
+                    continue;
+                if (eh.HandlerType != ExceptionHandlerType.Catch)
+                    continue;
+
+                Instruction catchStart = eh.HandlerStart, catchEnd = eh.HandlerEnd, tryStart = eh.TryStart;
+                int i = insns.IndexOf(eh.HandlerStart), i2 = insns.IndexOf(eh.HandlerEnd), i0 = insns.IndexOf(tryStart);
+
+                if (ShouldPreserveTryBlock(eh)) {
+                    // Store a copy of the exception at entry. We need this to implement rethrow
+                    // We also want to erase the current error value here since the catch is handling
+                    //  it and is either erasing it or writing something new into it by throw/rethrow
+                    insns[i] = Instruction.Create(OpCodes.Dup);
+                    Patch(method, catchStart, insns[i]);
+                    InsertOps(insns, i + 1, new[] {
+                        Instruction.Create(OpCodes.Stloc, tempExceptionLocal),
+                        Instruction.Create(OpCodes.Ldarg, outParam),
+                        Instruction.Create(OpCodes.Ldnull),
+                        Instruction.Create(OpCodes.Stind_Ref),
+                        catchStart,
+                    });
+                } else {
+                    // Replace leaves with branches to the end of the catch block.
+                    for (int j = i0; j < i2; j++) {
+                        var insn = insns[j];
+                        tryBlocksByInsn[insn] = eh;
+
+                        if ((insn.OpCode != OpCodes.Leave) && (insn.OpCode != OpCodes.Leave_S))
+                            continue;
+
+                        // We unconditionally use leave here even though the EH is gone
+                        //  because it clears the stack.
+                        insns[j] = Instruction.Create(OpCodes.Leave, catchEnd);
+                        Patch(method, insn, insns[j]);
+                    }
+
+                    // Push the current contents of the error arg onto the stack, then zero it.
+                    // This matches try blocks where the ex is on the stack at entry.
+                    insns[i] = Instruction.Create(OpCodes.Ldarg, outParam);
+                    Patch(method, catchStart, insns[i]);
+                    InsertOps(insns, i + 1, new[] {
+                        Instruction.Create(OpCodes.Ldind_Ref),
+                        Instruction.Create(OpCodes.Ldarg, outParam),
+                        Instruction.Create(OpCodes.Ldnull),
+                        Instruction.Create(OpCodes.Stind_Ref),
+                    });
+
+                    deadExceptionHandlers.Add(eh);
+                }
+            }
+
+            foreach (var eh in deadExceptionHandlers)
+                method.Body.ExceptionHandlers.Remove(eh);
+
             // We generate an exit point at the end of the function where the result local is
             //  loaded and returned + any finally blocks are run
             var exitLoad = resultLocal != null ? Instruction.Create(OpCodes.Ldloc, resultLocal) : null;
             var exitRet = Instruction.Create(OpCodes.Ret);
             var exitPoint = exitLoad ?? exitRet;
+            ExceptionHandler tryBlock;
 
             for (int i = 0; i < insns.Count; i++) {
                 var insn = insns[i];
@@ -315,25 +398,57 @@ namespace ExceptionRewriter {
                         var newTarget = am.BackingMethod;
                         insns[i] = Instruction.Create(OpCodes.Call, newTarget);
                         Patch(method, insn, insns[i]);
+                        // Generate an error check immediately after the call
+                        tryBlocksByInsn.TryGetValue(insn, out tryBlock);
+                        InsertErrorCheck(insns, i + 1, method.Module, outParam, exitPoint, tryBlock);
                         // Push the out param onto the args list since we're now calling the backing method
                         //  which takes an out param
                         insns.Insert(i, Instruction.Create(OpCodes.Ldarg, outParam));
+                        break;
+                    case Code.Rethrow:
+                        // FIXME
+                        if (!tryBlocksByInsn.TryGetValue(insn, out tryBlock)) {
+                            insns[i] = Instruction.Create(OpCodes.Nop);
+                            Patch(method, insn, insns[i]);
+                            continue;
+                        }
+
+                        if (deadExceptionHandlers.Contains(tryBlock)) {
+                            insns[i] = Instruction.Create(OpCodes.Nop);
+                            Patch(method, insn, insns[i]);
+                        } else {
+                            // Load the address of the output before doing the rethrow conversion
+                            insns[i] = Instruction.Create(OpCodes.Ldarg, outParam);
+                            Patch(method, insn, insns[i]);
+                            InsertOps(insns, i + 1, new[] {
+                                // Load the exception we're rethrowing (we stored it at try entry) and convert it
+                                Instruction.Create(OpCodes.Ldloc, tempExceptionLocal),
+                                Instruction.Create(OpCodes.Call, CaptureStackImpl),
+                                // Write the info into the output
+                                Instruction.Create(OpCodes.Stind_Ref),
+                                // Branch to exit, clearing the stack.
+                                Instruction.Create(OpCodes.Leave, exitPoint)
+                            });
+                        }
                         break;
                     case Code.Throw:
                         // Pass the exc through capture to store the stack trace on it
                         insns[i] = Instruction.Create(OpCodes.Call, CaptureStackImpl);
                         Patch(method, insn, insns[i]);
+                        tryBlocksByInsn.TryGetValue(insn, out tryBlock);
+                        // If this throw is inside a try/catch then we need to clear the stack w/leave
+                        var exitOpcode = tryBlock != null ? OpCodes.Leave : OpCodes.Br;
                         InsertOps(insns, i + 1, new[] {
                             // Store it into a temp exception local
-                            Instruction.Create(OpCodes.Stloc, tempExceptionLocal),
+                            Instruction.Create(OpCodes.Stloc, tempEdiLocal),
                             // Prepare to store the output
                             Instruction.Create(OpCodes.Ldarg, outParam),
                             // Now convert it into an ExceptionDispatchInfo
-                            Instruction.Create(OpCodes.Ldloc, tempExceptionLocal),
+                            Instruction.Create(OpCodes.Ldloc, tempEdiLocal),
                             // Write the info into the output
                             Instruction.Create(OpCodes.Stind_Ref),
                             // Branch to exit
-                            Instruction.Create(OpCodes.Br, exitPoint)
+                            Instruction.Create(exitOpcode, exitPoint)
                         });
                         break;
                     case Code.Ret:
@@ -357,6 +472,14 @@ namespace ExceptionRewriter {
             if (exitLoad != null)
                 insns.Add(exitLoad);
             insns.Add(exitRet);
+        }
+
+        private bool ShouldPreserveTryBlock (
+            ExceptionHandler eh
+        ) {
+            // FIXME: Detect whether the try block contains any operations that can throw,
+            //  and if it does, preserve it.
+            return false;
         }
 
         private Instruction RemapInstruction (
