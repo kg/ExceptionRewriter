@@ -25,10 +25,7 @@ namespace ExceptionRewriter {
 
         private void SecondPass () {
             foreach (var m in Methods.Values)
-                m.ShouldRewrite = m.MayNeedRewriting && !m.SuppressRewriting &&
-                    m.ReferencedMethods.Any(rm =>
-                        (GetResult(rm)?.CanThrow ?? true) || (GetResult(rm)?.SuppressRewriting ?? true)
-                    );
+                m.ShouldRewrite = m.MayNeedRewriting && !m.SuppressRewriting;
         }
 
         private void Analyze (ModuleDefinition module, TypeDefinition type) {
@@ -43,20 +40,10 @@ namespace ExceptionRewriter {
             var result = new AnalyzedMethod {
                 Method = method,
                 SuppressRewriting = method.CustomAttributes.Any(ca => ca.AttributeType.Name == "SuppressRewritingAttribute") ||
-                    // Rewriting ctors seems generally impossible.
-                    method.Name.StartsWith(".") ||
-                    // Rewriting operators might be feasible but I suspect it is not.
-                    method.Name.StartsWith("op_") ||
-                    // Can we rewrite virtual or abstract? Since the impl could be in another assembly,
-                    //  I'm not sure it's possible to do this.
-                    method.IsVirtual ||
-                    method.IsAbstract ||
-                    // FIXME: Same as above
+                    // FIXME: This is complicated so it's not being handled yet
                     method.IsGenericInstance ||
                     // FIXME: Same as above
-                    method.HasGenericParameters ||
-                    method.Module.EntryPoint == method,
-                OriginalName = method.Name
+                    method.HasGenericParameters
             };
 
             var body = method.Body;
@@ -67,19 +54,6 @@ namespace ExceptionRewriter {
                     (insn.OpCode == OpCodes.Rethrow)
                 )
                     result.HasThrowStatement = true;
-                else if (
-                    (insn.OpCode == OpCodes.Call) ||
-                    (insn.OpCode == OpCodes.Calli) ||
-                    (insn.OpCode == OpCodes.Callvirt) ||
-                    (insn.OpCode == OpCodes.Newobj)
-                ) {
-                    var mr = insn.Operand as MethodReference;
-                    if (mr != null)
-                        result.ReferencedMethods.Add(mr);
-                    else
-                        Console.WriteLine("Unrecognized call operand {0}", insn.Operand);
-                    result.HasCalls = true;
-                }
             }
 
             foreach (var eh in body.ExceptionHandlers) {
@@ -92,13 +66,10 @@ namespace ExceptionRewriter {
             // FIXME: Extract filter into method, extract referenced locals into a
             //  closure object
             // Also, this is not possible period for methods with ref/out parameters
-            if (result.HasExceptionFilter)
+            if (!result.HasExceptionFilter)
                 result.SuppressRewriting = true;
 
             result.MayNeedRewriting =
-                result.HasTryBlock ||
-                result.HasThrowStatement ||
-                result.HasCalls ||
                 result.HasExceptionFilter;
 
             if (result.SuppressRewriting)
@@ -119,10 +90,9 @@ namespace ExceptionRewriter {
 
     public class AnalyzedMethod {
         public MethodDefinition Method;
-        public MethodDefinition BackingMethod;
-        public string OriginalName;
 
-        public HashSet<MethodReference> ReferencedMethods = new HashSet<MethodReference>();
+        public Dictionary<ExceptionHandler, MethodDefinition> Filters = 
+            new Dictionary<ExceptionHandler, MethodDefinition>();
 
         public bool HasCalls;
         public bool HasTryBlock;

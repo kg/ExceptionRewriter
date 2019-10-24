@@ -11,8 +11,7 @@ namespace ExceptionRewriter {
         public readonly AssemblyDefinition Assembly;
         public readonly AssemblyAnalyzer Analyzer;
 
-        private TypeDefinition RewriterUtilType;
-        private MethodDefinition CaptureStackImpl;
+        private TypeDefinition ExceptionFilter;
 
         public AssemblyRewriter (AssemblyAnalyzer analyzer) {
             Assembly = analyzer.Input;
@@ -42,25 +41,13 @@ namespace ExceptionRewriter {
         }
 
         public void Rewrite () {
-            RewriterUtilType = Assembly.MainModule.GetType("Mono.AssemblyRewriter.Internal");
-            if (RewriterUtilType == null)
-                RewriterUtilType = CreateRewriterUtilType();
-            CaptureStackImpl = RewriterUtilType.Methods.First(m => m.Name == "CaptureStackTrace");
+            ExceptionFilter = Assembly.MainModule.GetType("Mono.Runtime.Internal.ExceptionFilter");
 
             var queue = new HashSet<AnalyzedMethod>();
-
-            // First, collect a full set of all the methods we will rewrite
-            // The rewriting process needs to know this in order to identify whether
-            //  a given method call needs to be wrapped in a try block.
 
             foreach (var m in Analyzer.Methods.Values) {
                 if (!m.ShouldRewrite)
                     continue;
-
-                // Create empty backing method definitions for each method, so that
-                //  we can reference them when modifying other methods.
-                m.BackingMethod = CloneMethod(m.Method);
-                m.Method.DeclaringType.Methods.Add(m.BackingMethod);
 
                 queue.Add(m);
             }
@@ -71,27 +58,7 @@ namespace ExceptionRewriter {
             }
         }
 
-        private MethodReference GetCapture (ModuleDefinition module) {
-            var tDispatchInfo = GetExceptionDispatchInfo(module);
-            MethodReference mCapture = new MethodReference(
-                "Capture", tDispatchInfo, tDispatchInfo
-            ) {
-                Parameters = {
-                    new ParameterDefinition("source", ParameterAttributes.None, GetException(module))
-                },
-                HasThis = false
-            };
-            return module.ImportReference(mCapture);
-        }
-
-        private MethodReference GetThrow (ModuleDefinition module) {
-            var tDispatchInfo = GetExceptionDispatchInfo(module);
-            return module.ImportReference(new MethodReference(
-                "Throw", module.TypeSystem.Void, tDispatchInfo
-            ) {
-                HasThis = true
-            });
-        }
+        /*
 
         private TypeDefinition CreateRewriterUtilType () {
             var mod = Assembly.MainModule;
@@ -147,49 +114,11 @@ namespace ExceptionRewriter {
             return td;
         }
 
+        */
+
         private void Rewrite (AnalyzedMethod am) {
             var method = am.Method;
-            var backing = am.BackingMethod;
-            ConvertToOutException(backing);
-            ReplaceWithBackingCall(method, backing);
-        }
-
-        private void ReplaceWithBackingCall (
-            MethodDefinition method, MethodDefinition target
-        ) {
-            var body = method.Body.Instructions;
-            body.Clear();
-            method.Body.ExceptionHandlers.Clear();
-
-            var ediType = GetExceptionDispatchInfo(method.Module);
-            var refType = new ByReferenceType(ediType);
-
-            var excVariable = new VariableDefinition(ediType);
-            method.Body.Variables.Add(excVariable);
-
-            // Null-init the exc outvar (is this necessary?)
-            body.Add(Instruction.Create(OpCodes.Ldnull));
-            body.Add(Instruction.Create(OpCodes.Stloc, excVariable));
-
-            // Push the arguments onto the stack
-            for (int i = 0; i < method.Parameters.Count; i++)
-                body.Add(Instruction.Create(OpCodes.Ldarg, method.Parameters[i]));
-            // Push address of our exc local for the out exc parameter
-            body.Add(Instruction.Create(OpCodes.Ldloca, excVariable));
-            // Now invoke, leaving retval on the stack.
-            body.Add(Instruction.Create(OpCodes.Call, target));
-
-            var ret = Instruction.Create(OpCodes.Ret);
-
-            // Now read exc local and throw if != null
-            body.Add(Instruction.Create(OpCodes.Ldloc, excVariable));
-            body.Add(Instruction.Create(OpCodes.Ldnull));
-            body.Add(Instruction.Create(OpCodes.Ceq));
-            body.Add(Instruction.Create(OpCodes.Brtrue, ret));
-            body.Add(Instruction.Create(OpCodes.Ldloc, excVariable));
-            body.Add(Instruction.Create(OpCodes.Call, GetThrow(method.Module)));
-
-            body.Add(ret);
+            ExtractExceptionFilters(method);
         }
 
         private Instruction[] MakeDefault (
@@ -200,13 +129,13 @@ namespace ExceptionRewriter {
                 return new Instruction[0];
 
             if (t.IsByReference || !t.IsValueType)
-                return new [] { Instruction.Create(OpCodes.Ldnull) };
+                return new[] { Instruction.Create(OpCodes.Ldnull) };
 
             switch (t.FullName) {
                 case "System.Int32":
                 case "System.UInt32":
                 case "System.Boolean":
-                    return new [] { Instruction.Create(OpCodes.Ldc_I4_0) };
+                    return new[] { Instruction.Create(OpCodes.Ldc_I4_0) };
                 default:
                     VariableDefinition tempLocal;
                     if (!tempLocals.TryGetValue(t, out tempLocal)) {
@@ -251,129 +180,63 @@ namespace ExceptionRewriter {
                 body.Insert(offset, ops[i]);
         }
 
-        private void InsertErrorCheck (
-            Mono.Collections.Generic.Collection<Instruction> body, int offset, ModuleDefinition module, 
-            ParameterDefinition outParam, Instruction exitPoint, ExceptionHandler tryBlock
-        ) {
-            var skipTarget = Instruction.Create(OpCodes.Nop);
-            var onError = (tryBlock != null) ? tryBlock.HandlerStart : exitPoint;
-            InsertOps(body, offset, new[] {
-                Instruction.Create(OpCodes.Ldarg, outParam),
-                Instruction.Create(OpCodes.Ldind_Ref),
-                Instruction.Create(OpCodes.Ldnull),
-                Instruction.Create(OpCodes.Ceq),
-                Instruction.Create(OpCodes.Brtrue, skipTarget),
-                Instruction.Create(OpCodes.Br, onError),
-                skipTarget
-                /*
-                Instruction.Create(OpCodes.Ldarg, outParam),
-                Instruction.Create(OpCodes.Ldind_Ref),
-                Instruction.Create(OpCodes.Call, GetThrow(module)),
-                */
-            });
-        }
-
-        private void ConvertToOutException (MethodDefinition method) {
+        private void ExtractExceptionFilters (MethodDefinition method) {
             var tempStructLocals = new Dictionary<TypeReference, VariableDefinition>();
             var excType = GetException(method.Module);
-            var ediType = GetExceptionDispatchInfo(method.Module);
-            var refType = new ByReferenceType(ediType);
-            var outParam = new ParameterDefinition("_error", ParameterAttributes.Out, refType);
             var tempExceptionLocal = new VariableDefinition(excType);
-            var tempEdiLocal = new VariableDefinition(ediType);
-            var resultLocal = method.ReturnType.FullName != "System.Void" 
-                ? new VariableDefinition(method.ReturnType) : null;
-            if (resultLocal != null)
-                method.Body.Variables.Add(resultLocal);
             method.Body.Variables.Add(tempExceptionLocal);
-            method.Body.Variables.Add(tempEdiLocal);
-            method.Parameters.Add(outParam);
 
             var defaultException = Instruction.Create(OpCodes.Ldnull);
             var insns = method.Body.Instructions;
-            var tryBlocksByInsn = new Dictionary<Instruction, ExceptionHandler>();
-
             insns.Insert(0, Instruction.Create(OpCodes.Nop));
 
-            // At method body entry we always initialize out parameters to ensure that 
-            //  all rets will be valid
-            for (int i = 0; i < method.Parameters.Count; i++) {
-                var param = method.Parameters[i];
-                if (!param.Attributes.HasFlag(ParameterAttributes.Out))
-                    continue;
-                if (!param.ParameterType.IsByReference)
-                    continue;
-
-                var valueType = param.ParameterType.GetElementType();
-
-                InsertOps(insns, 1, 
-                    (new[] { Instruction.Create(OpCodes.Ldarg, param) })
-                    .Concat(MakeDefault(valueType, tempStructLocals))
-                    .Concat(new [] { Instruction.Create(OpCodes.Stind_Ref)})
-                    .ToArray()
-                );
-            }
-
-            if (resultLocal != null) {
-                InsertOps(insns, 1, 
-                    MakeDefault(method.ReturnType, tempStructLocals)
-                    .Concat(new[] { Instruction.Create(OpCodes.Stloc, resultLocal) })
-                    .ToArray()
-                );
-            }
+            var handlersByExit = method.Body.ExceptionHandlers.ToLookup((eh => eh.HandlerEnd));
+            var exceptionFilters = (from eh in method.Body.ExceptionHandlers where eh.FilterStart != null select eh).ToList();
 
             var deadExceptionHandlers = new HashSet<ExceptionHandler>();
+            var filterIndex = 0;
 
+            foreach (var group in handlersByExit) {
+                foreach (var eh in group) {
+                    if (eh.FilterStart == null)
+                        continue;
+
+                    method.Body.ExceptionHandlers.Remove(eh);
+
+                    var filterMethod = new MethodDefinition(
+                        method.Name + "__filter" + (filterIndex++),
+                        MethodAttributes.Static | MethodAttributes.Public,
+                        this.ImportCorlibType(method.Module, "System", "Int32")
+                    );
+
+                    Instruction filter = null;
+                    var filterReplacement = Instruction.Create(OpCodes.Ret);
+
+                    foreach (var loc in method.Body.Variables)
+                        filterMethod.Body.Variables.Add(loc);
+
+                    method.DeclaringType.Methods.Add(filterMethod);
+
+                    int i1 = insns.IndexOf(eh.FilterStart), i2 = -1;
+                    for (int i = i1; i < insns.Count; i++) {
+                        var insn = insns[i];
+                        if (insn.OpCode == OpCodes.Endfilter) {
+                            i2 = i;
+                            break;
+                        }
+                    }
+
+                    CloneInstructions(insns, i1, i2 - i1 + 1, filterMethod.Body.Instructions, 0);
+                }
+            }
+
+            /*
             foreach (var eh in method.Body.ExceptionHandlers) {
-                if (eh.HandlerStart == null)
-                    continue;
-                if (eh.HandlerType != ExceptionHandlerType.Catch)
+                if (eh.FilterStart == null)
                     continue;
 
                 Instruction catchStart = eh.HandlerStart, catchEnd = eh.HandlerEnd, tryStart = eh.TryStart;
                 int i = insns.IndexOf(eh.HandlerStart), i2 = insns.IndexOf(eh.HandlerEnd), i0 = insns.IndexOf(tryStart);
-
-                if (ShouldPreserveTryBlock(eh)) {
-                    // Store a copy of the exception at entry. We need this to implement rethrow
-                    // We also want to erase the current error value here since the catch is handling
-                    //  it and is either erasing it or writing something new into it by throw/rethrow
-                    insns[i] = Instruction.Create(OpCodes.Dup);
-                    Patch(method, catchStart, insns[i]);
-                    InsertOps(insns, i + 1, new[] {
-                        Instruction.Create(OpCodes.Stloc, tempExceptionLocal),
-                        Instruction.Create(OpCodes.Ldarg, outParam),
-                        Instruction.Create(OpCodes.Ldnull),
-                        Instruction.Create(OpCodes.Stind_Ref),
-                        catchStart,
-                    });
-                } else {
-                    // Replace leaves with branches to the end of the catch block.
-                    for (int j = i0; j < i2; j++) {
-                        var insn = insns[j];
-                        tryBlocksByInsn[insn] = eh;
-
-                        if ((insn.OpCode != OpCodes.Leave) && (insn.OpCode != OpCodes.Leave_S))
-                            continue;
-
-                        // We unconditionally use leave here even though the EH is gone
-                        //  because it clears the stack.
-                        insns[j] = Instruction.Create(OpCodes.Leave, catchEnd);
-                        Patch(method, insn, insns[j]);
-                    }
-
-                    // Push the current contents of the error arg onto the stack, then zero it.
-                    // This matches try blocks where the ex is on the stack at entry.
-                    insns[i] = Instruction.Create(OpCodes.Ldarg, outParam);
-                    Patch(method, catchStart, insns[i]);
-                    InsertOps(insns, i + 1, new[] {
-                        Instruction.Create(OpCodes.Ldind_Ref),
-                        Instruction.Create(OpCodes.Ldarg, outParam),
-                        Instruction.Create(OpCodes.Ldnull),
-                        Instruction.Create(OpCodes.Stind_Ref),
-                    });
-
-                    deadExceptionHandlers.Add(eh);
-                }
             }
 
             foreach (var eh in deadExceptionHandlers)
@@ -390,6 +253,7 @@ namespace ExceptionRewriter {
                 var insn = insns[i];
 
                 switch (insn.OpCode.Code) {
+                    /*
                     case Code.Call:
                         var target = (MethodReference)insn.Operand;
                         var am = Analyzer.GetResult(target);
@@ -464,14 +328,12 @@ namespace ExceptionRewriter {
                         continue;
                 }
             }
+            */
 
             foreach (var kvp in tempStructLocals)
                 method.Body.Variables.Add(kvp.Value);
 
             insns.Add(Instruction.Create(OpCodes.Nop));
-            if (exitLoad != null)
-                insns.Add(exitLoad);
-            insns.Add(exitRet);
         }
 
         private bool ShouldPreserveTryBlock (
@@ -484,18 +346,77 @@ namespace ExceptionRewriter {
 
         private Instruction RemapInstruction (
             Instruction old,
-            MethodBody oldBody, Mono.Collections.Generic.Collection<Instruction> newBody
+            Mono.Collections.Generic.Collection<Instruction> oldBody, 
+            Mono.Collections.Generic.Collection<Instruction> newBody,
+            int offset = 0
         ) {
             if (old == null)
                 return null;
 
-            int idx = oldBody.Instructions.IndexOf(old);
-            return newBody[idx];
+            int idx = oldBody.IndexOf(old);
+            var newIdx = idx + offset;
+            return newBody[newIdx];
+        }
+
+        private Instruction CloneInstruction (Instruction i) {
+            object operand = i.Operand;
+            if (operand == null)
+                return Instruction.Create(i.OpCode);
+
+            if (operand is FieldReference) {
+                FieldReference fref = operand as FieldReference;
+                return Instruction.Create(i.OpCode, fref);
+            } else if (operand is TypeReference) {
+                TypeReference tref = operand as TypeReference;
+                return Instruction.Create(i.OpCode, tref);
+            } else if (operand is TypeDefinition) {
+                TypeDefinition tdef = operand as TypeDefinition;
+                return Instruction.Create(i.OpCode, tdef);
+            } else if (operand is MethodReference) {
+                // FIXME: Swap around if this is a reference to a rewritten method
+                MethodReference mref = operand as MethodReference;
+                return Instruction.Create(i.OpCode, mref);
+            } else if (operand is Instruction) {
+                var insn = operand as Instruction;
+                return Instruction.Create(i.OpCode, insn);
+            } else if (operand is string) {
+                var insn = operand as string;
+                return Instruction.Create(i.OpCode, insn);
+            } else {
+                throw new NotImplementedException(i.OpCode.ToString());
+            }
+        }
+
+        private void CloneInstructions (
+            Mono.Collections.Generic.Collection<Instruction> source,
+            int sourceIndex, int count,
+            Mono.Collections.Generic.Collection<Instruction> target,
+            int targetIndex
+        ) {
+            for (int n = 0; n < count; n++) {
+                var i = source[n + sourceIndex];
+                var newInsn = CloneInstruction(i);
+
+                // FIXME: Cecil doesn't let you clone Instruction objects
+                target.Add(i);
+            }
+
+            // Fixup branches
+            for (int i = 0; i < target.Count; i++) {
+                var insn = target[i];
+                var operand = insn.Operand as Instruction;
+                if (operand == null)
+                    continue;
+
+                var newOperand = RemapInstruction(operand, source, target, targetIndex - sourceIndex);
+                var newInsn = Instruction.Create(insn.OpCode, newOperand);
+                target[i] = newInsn;
+            }
         }
 
         private MethodDefinition CloneMethod (MethodDefinition source) {
             MethodDefinition targetMethod = new MethodDefinition(
-                source.Name + "_impl", source.Attributes, 
+                source.Name + "_impl", source.Attributes,
                 source.ReturnType
             );
 
@@ -518,76 +439,27 @@ namespace ExceptionRewriter {
             }
 
             // copy the IL; we only need to take care of reference and method definitions
-            Mono.Collections.Generic.Collection<Instruction> col = 
+            Mono.Collections.Generic.Collection<Instruction> col =
 nBody.Instructions;
-            foreach (Instruction i in oldBody.Instructions)
-            {
-                object operand = i.Operand;
-                if (operand == null)
-                {
-                    col.Add(Instruction.Create(i.OpCode));
-                    continue;
-                }
 
-                if (operand is FieldReference)
-                {
-                    FieldReference fref = operand as FieldReference;
-                    col.Add(Instruction.Create(i.OpCode, fref));
-                    continue;
-                }
-                else if (operand is TypeReference)
-                {
-                    TypeReference tref = operand as TypeReference;
-                    col.Add(Instruction.Create(i.OpCode, tref));
-                    continue;
-                }
-                else if (operand is TypeDefinition)
-                {
-                    TypeDefinition tdef = operand as TypeDefinition;
-                    col.Add(Instruction.Create(i.OpCode, tdef));
-                    continue;
-                }
-                else if (operand is MethodReference)
-                {
-                    // FIXME: Swap around if this is a reference to a rewritten method
-                    MethodReference mref = operand as MethodReference;
-                    col.Add(Instruction.Create(i.OpCode, mref));
-                    continue;
-                }
-
-                // FIXME: Cecil doesn't let you clone Instruction objects
-                col.Add(i);
-            }
-
-            // Fixup branches
-            for (int i = 0; i < col.Count; i++) {
-                var insn = col[i];
-                var operand = insn.Operand as Instruction;
-                if (operand == null)
-                    continue;
-
-                var newOperand = RemapInstruction(operand, oldBody, col);
-                var newInsn = Instruction.Create(insn.OpCode, newOperand);
-                col[i] = newInsn;
-            }
+            CloneInstructions(oldBody.Instructions, 0, oldBody.Instructions.Count, nBody.Instructions, 0);
 
             // copy the exception handler blocks
 
-            foreach (ExceptionHandler eh in oldBody.ExceptionHandlers)
-            {
+            foreach (ExceptionHandler eh in oldBody.ExceptionHandlers) {
                 ExceptionHandler neh = new ExceptionHandler(eh.HandlerType);
                 neh.CatchType = eh.CatchType;
                 neh.HandlerType = eh.HandlerType;
 
-                neh.TryStart = RemapInstruction(eh.TryStart, oldBody, col);
-                neh.TryEnd = RemapInstruction(eh.TryEnd, oldBody, col);
-                neh.HandlerStart = RemapInstruction(eh.HandlerStart, oldBody, col);
-                neh.HandlerEnd = RemapInstruction(eh.HandlerEnd, oldBody, col);
-                neh.FilterStart = RemapInstruction(eh.FilterStart, oldBody, col);
+                neh.TryStart = RemapInstruction(eh.TryStart, oldBody.Instructions, col);
+                neh.TryEnd = RemapInstruction(eh.TryEnd, oldBody.Instructions, col);
+                neh.HandlerStart = RemapInstruction(eh.HandlerStart, oldBody.Instructions, col);
+                neh.HandlerEnd = RemapInstruction(eh.HandlerEnd, oldBody.Instructions, col);
+                neh.FilterStart = RemapInstruction(eh.FilterStart, oldBody.Instructions, col);
 
                 nBody.ExceptionHandlers.Add(neh);
             }
-            
+
             targetMethod.DeclaringType = source.DeclaringType;
             return targetMethod;
         }
