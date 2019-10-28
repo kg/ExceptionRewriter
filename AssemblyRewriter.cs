@@ -13,6 +13,8 @@ namespace ExceptionRewriter {
 
         private TypeDefinition ExceptionFilter;
 
+        private int ClosureIndex, FilterIndex;
+
         public AssemblyRewriter (AssemblyAnalyzer analyzer) {
             Assembly = analyzer.Input;
             Analyzer = analyzer;
@@ -160,6 +162,8 @@ namespace ExceptionRewriter {
         private void Patch (MethodDefinition method, Instruction old, Instruction replacement) {
             var body = method.Body.Instructions;
             for (int i = 0; i < body.Count; i++) {
+                if (body[i].OpCode.Code == Code.Brtrue_S)
+                    ;
                 if (body[i].Operand == old)
                     body[i] = Instruction.Create(body[i].OpCode, replacement);
             }
@@ -180,160 +184,515 @@ namespace ExceptionRewriter {
                 body.Insert(offset, ops[i]);
         }
 
-        private void ExtractExceptionFilters (MethodDefinition method) {
-            var tempStructLocals = new Dictionary<TypeReference, VariableDefinition>();
-            var excType = GetException(method.Module);
-            var tempExceptionLocal = new VariableDefinition(excType);
-            method.Body.Variables.Add(tempExceptionLocal);
+        private Instruction ExtractExceptionHandlerExitTarget (ExceptionHandler eh) {
+            var leave = eh.HandlerEnd.Previous;
+            if (leave.OpCode == OpCodes.Rethrow)
+                return leave;
 
-            var defaultException = Instruction.Create(OpCodes.Ldnull);
+            var leaveTarget = leave.Operand as Instruction;
+            if (leaveTarget == null)
+                throw new Exception("Exception handler did not end with a 'leave'");
+            return leaveTarget;
+        }
+
+        private bool IsStoreOperation (Code opcode) {
+            switch (opcode) {
+                case Code.Stloc:
+                case Code.Stloc_S:
+                case Code.Stloc_0:
+                case Code.Stloc_1:
+                case Code.Stloc_2:
+                case Code.Stloc_3:
+                case Code.Starg:
+                case Code.Starg_S:
+                    return true;
+
+                case Code.Ldloca:
+                case Code.Ldloca_S:
+                case Code.Ldloc:
+                case Code.Ldloc_S:
+                case Code.Ldloc_0:
+                case Code.Ldloc_1:
+                case Code.Ldloc_2:
+                case Code.Ldloc_3:
+                case Code.Ldarg:
+                case Code.Ldarg_S:
+                case Code.Ldarga:
+                case Code.Ldarga_S:
+                case Code.Ldarg_0:
+                case Code.Ldarg_1:
+                case Code.Ldarg_2:
+                case Code.Ldarg_3:
+                    return false;
+            }
+
+            throw new NotImplementedException(opcode.ToString());
+        }
+
+        private VariableDefinition LookupNumberedVariable (
+            Code opcode, Mono.Collections.Generic.Collection<VariableDefinition> variables
+        ) {
+            switch (opcode) {
+                case Code.Ldloc_0:
+                case Code.Stloc_0:
+                    return variables[0];
+                case Code.Ldloc_1:
+                case Code.Stloc_1:
+                    return variables[1];
+                case Code.Ldloc_2:
+                case Code.Stloc_2:
+                    return variables[2];
+                case Code.Ldloc_3:
+                case Code.Stloc_3:
+                    return variables[3];
+            }
+
+            return null;
+        }
+
+        private ParameterDefinition LookupNumberedArgument (
+            Code opcode, ParameterDefinition fakeThis, Mono.Collections.Generic.Collection<ParameterDefinition> parameters
+        ) {
+            int staticOffset = fakeThis == null ? 0 : 1;
+            switch (opcode) {
+                case Code.Ldarg_0:
+                    if (fakeThis == null)
+                        return parameters[0];
+                    else
+                        return fakeThis;
+                case Code.Ldarg_1:
+                    return parameters[1 - staticOffset];
+                case Code.Ldarg_2:
+                    return parameters[2 - staticOffset];
+                case Code.Ldarg_3:
+                    return parameters[3 - staticOffset];
+            }
+
+            return null;
+        }
+
+        private VariableDefinition ConvertToClosure (MethodDefinition method, out TypeDefinition closureType) {
             var insns = method.Body.Instructions;
-            insns.Insert(0, Instruction.Create(OpCodes.Nop));
+            closureType = new TypeDefinition(
+                method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString("X4"), 
+                TypeAttributes.Class | TypeAttributes.NestedPrivate
+            );
+            closureType.BaseType = method.Module.TypeSystem.Object;
+            method.DeclaringType.NestedTypes.Add(closureType);
 
-            var handlersByExit = method.Body.ExceptionHandlers.ToLookup((eh => eh.HandlerEnd));
-            var exceptionFilters = (from eh in method.Body.ExceptionHandlers where eh.FilterStart != null select eh).ToList();
+            var ctorMethod = new MethodDefinition(
+                ".ctor", MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, 
+                method.Module.TypeSystem.Void
+            );
+            closureType.Methods.Add(ctorMethod);
+            InsertOps(ctorMethod.Body.Instructions, 0, new[] {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Call, 
+                    new MethodReference(
+                        ".ctor", method.Module.TypeSystem.Void, 
+                        closureType.BaseType
+                    ) { HasThis = true }),
+                Instruction.Create(OpCodes.Nop),
+                Instruction.Create(OpCodes.Ret)
+            });
 
-            var deadExceptionHandlers = new HashSet<ExceptionHandler>();
-            var filterIndex = 0;
+            var isStatic = method.IsStatic;
 
-            foreach (var group in handlersByExit) {
-                foreach (var eh in group) {
-                    if (eh.FilterStart == null)
-                        continue;
+            var localCount = 0;
+            var closureVar = new VariableDefinition(closureType);
 
-                    method.Body.ExceptionHandlers.Remove(eh);
+            var extractedVariables = method.Body.Variables.ToDictionary(
+                v => (object)v, 
+                v => new FieldDefinition("local" + localCount++, FieldAttributes.Public, v.VariableType)
+            );
 
-                    var filterMethod = new MethodDefinition(
-                        method.Name + "__filter" + (filterIndex++),
-                        MethodAttributes.Static | MethodAttributes.Public,
-                        this.ImportCorlibType(method.Module, "System", "Int32")
-                    );
+            method.Body.Variables.Add(closureVar);
 
-                    Instruction filter = null;
-                    var filterReplacement = Instruction.Create(OpCodes.Ret);
-
-                    foreach (var loc in method.Body.Variables)
-                        filterMethod.Body.Variables.Add(loc);
-
-                    method.DeclaringType.Methods.Add(filterMethod);
-
-                    int i1 = insns.IndexOf(eh.FilterStart), i2 = -1;
-                    for (int i = i1; i < insns.Count; i++) {
-                        var insn = insns[i];
-                        if (insn.OpCode == OpCodes.Endfilter) {
-                            i2 = i;
-                            break;
-                        }
-                    }
-
-                    CloneInstructions(insns, i1, i2 - i1 + 1, filterMethod.Body.Instructions, 0);
-                }
+            for (int i = 0; i < method.Parameters.Count; i++) {
+                var p = method.Parameters[i];
+                var name = (p.Name != null) ? "arg_" + p.Name : "arg" + i;
+                extractedVariables[p] = new FieldDefinition(name, FieldAttributes.Public, p.ParameterType);
             }
 
-            /*
-            foreach (var eh in method.Body.ExceptionHandlers) {
-                if (eh.FilterStart == null)
-                    continue;
+            var fakeThis = new ParameterDefinition("__this", ParameterAttributes.None, method.DeclaringType);
+            if (!isStatic)
+                extractedVariables[fakeThis] = new FieldDefinition("__this", FieldAttributes.Public, method.DeclaringType);
 
-                Instruction catchStart = eh.HandlerStart, catchEnd = eh.HandlerEnd, tryStart = eh.TryStart;
-                int i = insns.IndexOf(eh.HandlerStart), i2 = insns.IndexOf(eh.HandlerEnd), i0 = insns.IndexOf(tryStart);
-            }
-
-            foreach (var eh in deadExceptionHandlers)
-                method.Body.ExceptionHandlers.Remove(eh);
-
-            // We generate an exit point at the end of the function where the result local is
-            //  loaded and returned + any finally blocks are run
-            var exitLoad = resultLocal != null ? Instruction.Create(OpCodes.Ldloc, resultLocal) : null;
-            var exitRet = Instruction.Create(OpCodes.Ret);
-            var exitPoint = exitLoad ?? exitRet;
-            ExceptionHandler tryBlock;
+            foreach (var kvp in extractedVariables)
+                closureType.Fields.Add(kvp.Value);
 
             for (int i = 0; i < insns.Count; i++) {
                 var insn = insns[i];
 
-                switch (insn.OpCode.Code) {
-                    /*
-                    case Code.Call:
-                        var target = (MethodReference)insn.Operand;
-                        var am = Analyzer.GetResult(target);
-                        if ((am == null) || !am.ShouldRewrite)
-                            continue;
-                        var newTarget = am.BackingMethod;
-                        insns[i] = Instruction.Create(OpCodes.Call, newTarget);
-                        Patch(method, insn, insns[i]);
-                        // Generate an error check immediately after the call
-                        tryBlocksByInsn.TryGetValue(insn, out tryBlock);
-                        InsertErrorCheck(insns, i + 1, method.Module, outParam, exitPoint, tryBlock);
-                        // Push the out param onto the args list since we're now calling the backing method
-                        //  which takes an out param
-                        insns.Insert(i, Instruction.Create(OpCodes.Ldarg, outParam));
-                        break;
-                    case Code.Rethrow:
-                        // FIXME
-                        if (!tryBlocksByInsn.TryGetValue(insn, out tryBlock)) {
-                            insns[i] = Instruction.Create(OpCodes.Nop);
-                            Patch(method, insn, insns[i]);
-                            continue;
-                        }
+                var variable = (insn.Operand as VariableDefinition) 
+                    ?? LookupNumberedVariable(insn.OpCode.Code, method.Body.Variables);
+                var arg = (insn.Operand as ParameterDefinition)
+                    ?? LookupNumberedArgument(insn.OpCode.Code, isStatic ? null : fakeThis, method.Parameters);
 
-                        if (deadExceptionHandlers.Contains(tryBlock)) {
-                            insns[i] = Instruction.Create(OpCodes.Nop);
-                            Patch(method, insn, insns[i]);
-                        } else {
-                            // Load the address of the output before doing the rethrow conversion
-                            insns[i] = Instruction.Create(OpCodes.Ldarg, outParam);
-                            Patch(method, insn, insns[i]);
-                            InsertOps(insns, i + 1, new[] {
-                                // Load the exception we're rethrowing (we stored it at try entry) and convert it
-                                Instruction.Create(OpCodes.Ldloc, tempExceptionLocal),
-                                Instruction.Create(OpCodes.Call, CaptureStackImpl),
-                                // Write the info into the output
-                                Instruction.Create(OpCodes.Stind_Ref),
-                                // Branch to exit, clearing the stack.
-                                Instruction.Create(OpCodes.Leave, exitPoint)
-                            });
-                        }
-                        break;
-                    case Code.Throw:
-                        // Pass the exc through capture to store the stack trace on it
-                        insns[i] = Instruction.Create(OpCodes.Call, CaptureStackImpl);
-                        Patch(method, insn, insns[i]);
-                        tryBlocksByInsn.TryGetValue(insn, out tryBlock);
-                        // If this throw is inside a try/catch then we need to clear the stack w/leave
-                        var exitOpcode = tryBlock != null ? OpCodes.Leave : OpCodes.Br;
-                        InsertOps(insns, i + 1, new[] {
-                            // Store it into a temp exception local
-                            Instruction.Create(OpCodes.Stloc, tempEdiLocal),
-                            // Prepare to store the output
-                            Instruction.Create(OpCodes.Ldarg, outParam),
-                            // Now convert it into an ExceptionDispatchInfo
-                            Instruction.Create(OpCodes.Ldloc, tempEdiLocal),
-                            // Write the info into the output
-                            Instruction.Create(OpCodes.Stind_Ref),
-                            // Branch to exit
-                            Instruction.Create(exitOpcode, exitPoint)
-                        });
-                        break;
-                    case Code.Ret:
-                        // Jump to the exit point where we will run finally blocks
-                        insns[i] = Instruction.Create(OpCodes.Br, exitPoint);
-                        Patch(method, insn, insns[i]);
-                        if (resultLocal != null) {
-                            // Stash the retval from the stack into the result local
-                            insns.Insert(i, Instruction.Create(OpCodes.Stloc, resultLocal));
-                        }
-                        break;
-                    default:
-                        continue;
+                // FIXME
+                if (variable == closureVar)
+                    continue;
+
+                if ((variable == null) && (arg == null))
+                    continue;
+
+                var matchingField = extractedVariables[(object)variable ?? arg];
+
+                if (IsStoreOperation(insn.OpCode.Code)) {
+                    // HACK: Because we have no way to swap values on the stack, we have to keep the
+                    //  existing local but use it as a temporary store point before flushing into the
+                    //  closure
+                    Instruction reload;
+                    if (variable != null)
+                        reload = Instruction.Create(OpCodes.Ldloc, variable);
+                    else
+                        reload = Instruction.Create(OpCodes.Ldarg, arg);
+
+                    InsertOps(insns, i + 1, new[] {
+                        Instruction.Create(OpCodes.Ldloc, closureVar),
+                        reload,
+                        Instruction.Create(OpCodes.Stfld, matchingField)
+                    });
+                    i += 3;
+                } else {
+                    var newInsn = Instruction.Create(OpCodes.Ldloc, closureVar);
+                    insns[i] = newInsn;
+                    Patch(method, insn, newInsn);
+                    var loadOp =
+                        ((insn.OpCode.Code == Code.Ldloca) ||
+                        (insn.OpCode.Code == Code.Ldloca_S))
+                            ? OpCodes.Ldflda
+                            : OpCodes.Ldfld;
+                    insns.Insert(i + 1, Instruction.Create(loadOp, matchingField));
+                    i++;
                 }
             }
-            */
 
-            foreach (var kvp in tempStructLocals)
-                method.Body.Variables.Add(kvp.Value);
+            var toInject = new List<Instruction>() {
+                Instruction.Create(OpCodes.Newobj, closureType.Methods.First(m => m.Name == ".ctor")),
+                Instruction.Create(OpCodes.Stloc, closureVar)
+            };
 
-            insns.Add(Instruction.Create(OpCodes.Nop));
+            if (!isStatic) {
+                toInject.AddRange(new[] {
+                    Instruction.Create(OpCodes.Ldloc, closureVar),
+                    Instruction.Create(OpCodes.Ldarg_0),
+                    Instruction.Create(OpCodes.Stfld, extractedVariables[fakeThis])
+                });
+            }
+
+            foreach (var p in method.Parameters) {
+                toInject.AddRange(new[] {
+                    Instruction.Create(OpCodes.Ldloc, closureVar),
+                    Instruction.Create(OpCodes.Ldarg, p),
+                    Instruction.Create(OpCodes.Stfld, extractedVariables[p])
+                });
+            }
+
+            InsertOps(insns, 0, toInject.ToArray());
+
+            return closureVar;
+        }
+
+        private int CatchCount;
+
+        private ExcHandler ExtractCatch (
+            MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ExcGroup group
+        ) {
+            var insns = method.Body.Instructions;
+            var closureType = closure.VariableType;
+
+            var catchMethod = new MethodDefinition(
+                method.Name + "__catch" + (CatchCount++),
+                MethodAttributes.Static | MethodAttributes.Private,
+                method.Module.TypeSystem.Int32
+            );
+            var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
+            var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, this.GetException(method.Module));
+            // Exc goes first because catch blocks start with it on the stack and this makes it convenient to spam dup
+            catchMethod.Parameters.Add(excParam);
+            catchMethod.Parameters.Add(closureParam);
+
+            var catchInsns = catchMethod.Body.Instructions;
+
+            var newVariables = ExtractRangeToMethod(
+                method, catchMethod, 
+                insns.IndexOf(eh.HandlerStart), insns.IndexOf(eh.HandlerEnd) - 1,
+                false, 
+                (insn, operand) => {
+                    switch (insn.OpCode.Code) {
+                        case Code.Leave:
+                        case Code.Leave_S:
+                            return insn;
+                        default:
+                            return null;
+                    }
+                }
+            );
+
+            InsertOps(
+                catchInsns, 0, new[] {
+                    Instruction.Create(OpCodes.Ldarg, closureParam),
+                    Instruction.Create(OpCodes.Stloc, newVariables[closure]),
+                    // WHY? This code isn't following the semantics of usual catch blocks!!
+                    (catchInsns[0].OpCode.Code == Code.Pop)
+                        ? Instruction.Create(OpCodes.Ldarg, excParam)
+                        : Instruction.Create(OpCodes.Nop)
+                }
+            );
+
+            for (int i = 0; i < catchInsns.Count; i++) {
+                var insn = catchInsns[i];
+                switch (insn.OpCode.Code) {
+                    case Code.Leave:
+                    case Code.Leave_S: {
+                        catchInsns[i] = Instruction.Create(OpCodes.Ldc_I4_0);
+                        Patch(catchMethod, insn, catchInsns[i]);
+                        InsertOps(catchInsns, i + 1, new[] {
+                            Instruction.Create(OpCodes.Ret)
+                        });
+                        i += 1;
+                    }
+                        break;
+                    case Code.Rethrow: {
+                        catchInsns[i] = Instruction.Create(OpCodes.Ldc_I4_1);
+                        Patch(catchMethod, insn, catchInsns[i]);
+                        InsertOps(catchInsns, i + 1, new[] {
+                            Instruction.Create(OpCodes.Ret)
+                        });
+                        i += 1;
+                    }
+                        break;
+                }
+            }
+
+            method.DeclaringType.Methods.Add(catchMethod);
+
+            var handler = new ExcHandler {
+                Handler = eh,
+                Method = catchMethod
+            };
+            group.Handlers.Add(handler);
+            return handler;
+        }
+
+        private void ExtractFilterAndCatch (
+            MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ExcGroup group
+        ) {
+            var insns = method.Body.Instructions;
+            var closureType = closure.VariableType;
+            var filterType = new TypeDefinition(
+                method.DeclaringType.Namespace, method.Name + "__filter" + (FilterIndex++).ToString("X4"),
+                TypeAttributes.NestedPublic | TypeAttributes.Class,
+                ExceptionFilter
+            );
+
+            var closureField = new FieldDefinition(
+                "closure", FieldAttributes.Public, closureType
+            );
+            filterType.Fields.Add(closureField);
+
+            var filterMethod = new MethodDefinition(
+                "Evaluate",
+                MethodAttributes.Virtual | MethodAttributes.Public,
+                method.Module.TypeSystem.Int32
+            );
+
+            filterType.Methods.Add(filterMethod);
+            method.DeclaringType.NestedTypes.Add(filterType);
+
+            var filterReplacement = Instruction.Create(OpCodes.Ret);
+
+            int i1 = insns.IndexOf(eh.FilterStart), i2 = -1;
+            Instruction endfilter = null;
+
+            for (int i = i1; i < insns.Count; i++) {
+                var insn = insns[i];
+                if (insn.OpCode == OpCodes.Endfilter) {
+                    endfilter = insn;
+                    i2 = i;
+                    break;
+                }
+            }
+
+            var excArg = new ParameterDefinition("exc", default(ParameterAttributes), method.Module.TypeSystem.Object);
+            filterMethod.Parameters.Add(excArg);
+
+            var newVariables = ExtractRangeToMethod(method, filterMethod, i1, i2, false);
+
+            // HACK: Filtered exception handlers start with a pop for some reason
+            var filterInsns = filterMethod.Body.Instructions;
+            var oldInsn = eh.HandlerStart;
+            var oldStartIdx = insns.IndexOf(eh.HandlerStart);
+            insns[oldStartIdx] = Instruction.Create(OpCodes.Nop);
+            Patch(method, oldInsn, insns[oldStartIdx]);
+
+            var oldFilterInsn = filterInsns[filterInsns.Count - 1];
+            filterInsns[filterInsns.Count - 1] = filterReplacement;
+            Patch(filterMethod, oldFilterInsn, filterReplacement);
+
+            InsertOps(
+                filterInsns, 0, new[] {
+                    // Load the exception from arg1 since exception handlers are entered with it on the stack
+                    Instruction.Create(OpCodes.Ldarg, excArg)
+                }
+            );
+
+            for (int i = 0; i < filterInsns.Count; i++) {
+                var insn = filterInsns[i];
+                if (insn.Operand != closure)
+                    continue;
+
+                filterInsns[i] = Instruction.Create(OpCodes.Ldarg_0);
+                Patch(filterMethod, insn, filterInsns[i]);
+                filterInsns.Insert(i + 1, Instruction.Create(OpCodes.Ldfld, closureField));
+            }
+
+            var handler = ExtractCatch(method, eh, closure, group);
+
+            handler.FilterMethod = filterMethod;
+            handler.FilterType = filterType;
+            handler.FirstFilterInsn = eh.FilterStart;
+            handler.LastFilterInsn = endfilter;
+        }
+
+        private Dictionary<VariableDefinition, VariableDefinition> ExtractRangeToMethod (
+            MethodDefinition sourceMethod, MethodDefinition targetMethod, 
+            int firstIndex, int lastIndex, bool deleteThem,
+            Func<Instruction, Instruction, Instruction> onFailedRemap = null
+        ) {
+            var insns = sourceMethod.Body.Instructions;
+            var filterInsns = targetMethod.Body.Instructions;
+
+            var variables = new Dictionary<VariableDefinition, VariableDefinition>();
+            foreach (var loc in sourceMethod.Body.Variables) {
+                var newLoc = new VariableDefinition(loc.VariableType);
+                targetMethod.Body.Variables.Add(newLoc);
+                variables[loc] = newLoc;
+            }
+
+            CloneInstructions(
+                insns, firstIndex, lastIndex - firstIndex + 1, filterInsns, 0, variables, onFailedRemap
+            );
+
+            var oldInsn = insns[firstIndex];
+            insns[firstIndex] = Instruction.Create(OpCodes.Nop);
+            // FIXME: This should not be necessary
+            Patch(sourceMethod, oldInsn, insns[firstIndex]);
+
+            if (deleteThem)
+                RemoveRange(insns, firstIndex, lastIndex);
+
+            return variables;
+        }
+
+        private void RemoveRange<T> (Mono.Collections.Generic.Collection<T> coll, T first, T last, bool inclusive) {
+            RemoveRange(coll, coll.IndexOf(first), coll.IndexOf(last) - (inclusive ? 0 : 1));
+        }
+
+        private void RemoveRange<T> (Mono.Collections.Generic.Collection<T> coll, int firstIndex, int lastIndex) {
+            for (int i = lastIndex; i > firstIndex; i--)
+                coll.RemoveAt(i);
+        }
+
+        public class ExcGroup {
+            public Instruction tryStart, tryEnd;
+            public List<ExcHandler> Handlers = new List<ExcHandler>();
+        }
+
+        public class ExcHandler {
+            public ExceptionHandler Handler;
+            public TypeDefinition FilterType;
+            public MethodDefinition Method, FilterMethod;
+
+            public Instruction FirstFilterInsn, LastFilterInsn;
+        }
+
+        private void ExtractExceptionFilters (MethodDefinition method) {
+            var excType = GetException(method.Module);
+            TypeDefinition closureType;
+            var closure = ConvertToClosure(method, out closureType);
+
+            var insns = method.Body.Instructions;
+            insns.Insert(0, Instruction.Create(OpCodes.Nop));
+
+            var handlersByTry = method.Body.ExceptionHandlers.ToLookup(eh => (eh.TryStart, eh.TryEnd));
+
+            var newGroups = new List<ExcGroup>();
+            var filterIndex = 0;
+            var filtersToInsert = new List<(TypeDefinition, ExceptionHandler)>();
+
+            foreach (var group in handlersByTry) {
+                var excGroup = new ExcGroup {
+                    tryStart = group.Key.Item1,
+                    tryEnd = insns[insns.IndexOf(group.Key.Item2) - 1],
+                };
+
+                foreach (var eh in group) {
+                    if (eh.FilterStart != null)
+                        ExtractFilterAndCatch(method, eh, closure, excGroup);
+                    else
+                        ExtractCatch(method, eh, closure, excGroup);
+                }
+
+                newGroups.Add(excGroup);
+            }
+
+            foreach (var eg in newGroups) {
+                foreach (var h in eg.Handlers) {
+                    if (h.LastFilterInsn != null)
+                        RemoveRange(insns, h.FirstFilterInsn, h.LastFilterInsn, true);
+
+                    RemoveRange(insns, h.Handler.HandlerStart, h.Handler.HandlerEnd, false);
+
+                    method.Body.ExceptionHandlers.Remove(h.Handler);
+                }
+
+                var tryExit = insns[insns.IndexOf(eg.tryEnd) + 1];
+                var newHandlerStart = Instruction.Create(OpCodes.Nop);
+                var newHandlerEnd = Instruction.Create(OpCodes.Leave, tryExit);
+                var newHandlerOffset = insns.IndexOf(eg.tryEnd);
+                if (newHandlerOffset < 0)
+                    throw new Exception();
+
+                var handlerBody = new List<Instruction> {
+                    newHandlerStart
+                };
+
+                foreach (var h in eg.Handlers)
+                    handlerBody.Add(Instruction.Create(OpCodes.Dup));
+
+                foreach (var h in eg.Handlers) {
+                    handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
+                    handlerBody.Add(Instruction.Create(OpCodes.Call, h.Method));
+                    handlerBody.Add(Instruction.Create(OpCodes.Pop));
+                }
+
+                handlerBody.Add(newHandlerEnd);
+
+                InsertOps(insns, newHandlerOffset + 1, handlerBody.ToArray());
+
+                Renumber(insns);
+
+                var newEh = new ExceptionHandler(ExceptionHandlerType.Catch) {
+                    TryStart = eg.tryStart,
+                    // this does not make any damn sense
+                    TryEnd = newHandlerStart,
+                    HandlerStart = newHandlerStart,
+                    HandlerEnd = insns[insns.IndexOf(newHandlerEnd) + 1],
+                    CatchType = method.Module.TypeSystem.Object
+                };
+                method.Body.ExceptionHandlers.Add(newEh);
+            }
+
+            foreach (var toInsert in filtersToInsert) {
+            }
+
+        }
+
+        private void Renumber (Mono.Collections.Generic.Collection<Instruction> insns) {
+            foreach (var i in insns)
+                i.Offset = insns.IndexOf(i);
         }
 
         private bool ShouldPreserveTryBlock (
@@ -344,21 +703,40 @@ namespace ExceptionRewriter {
             return false;
         }
 
+        private bool TryRemapInstruction (
+            Instruction old,
+            Mono.Collections.Generic.Collection<Instruction> oldBody, 
+            Mono.Collections.Generic.Collection<Instruction> newBody,
+            int offset,
+            out Instruction result
+        ) {
+            result = null;
+            if (old == null)
+                return false;
+
+            int idx = oldBody.IndexOf(old);
+            var newIdx = idx + offset;
+            if ((newIdx < 0) || (newIdx >= newBody.Count))
+                return false;
+
+            result = newBody[newIdx];
+            return true;
+        }
+
         private Instruction RemapInstruction (
             Instruction old,
             Mono.Collections.Generic.Collection<Instruction> oldBody, 
             Mono.Collections.Generic.Collection<Instruction> newBody,
             int offset = 0
         ) {
-            if (old == null)
+            Instruction result;
+            if (!TryRemapInstruction(old, oldBody, newBody, offset, out result))
                 return null;
 
-            int idx = oldBody.IndexOf(old);
-            var newIdx = idx + offset;
-            return newBody[newIdx];
+            return result;
         }
 
-        private Instruction CloneInstruction (Instruction i) {
+        private Instruction CloneInstruction (Instruction i, Dictionary<VariableDefinition, VariableDefinition> variables) {
             object operand = i.Operand;
             if (operand == null)
                 return Instruction.Create(i.OpCode);
@@ -380,8 +758,13 @@ namespace ExceptionRewriter {
                 var insn = operand as Instruction;
                 return Instruction.Create(i.OpCode, insn);
             } else if (operand is string) {
-                var insn = operand as string;
-                return Instruction.Create(i.OpCode, insn);
+                var s = operand as string;
+                return Instruction.Create(i.OpCode, s);
+            } else if (operand is VariableDefinition) {
+                var v = operand as VariableDefinition;
+                if (variables != null)
+                    v = variables[v];
+                return Instruction.Create(i.OpCode, v);
             } else {
                 throw new NotImplementedException(i.OpCode.ToString());
             }
@@ -391,11 +774,16 @@ namespace ExceptionRewriter {
             Mono.Collections.Generic.Collection<Instruction> source,
             int sourceIndex, int count,
             Mono.Collections.Generic.Collection<Instruction> target,
-            int targetIndex
+            int targetIndex,
+            Dictionary<VariableDefinition, VariableDefinition> variables = null,
+            Func<Instruction, Instruction, Instruction> onFailedRemap = null
         ) {
+            if (sourceIndex < 0)
+                throw new ArgumentOutOfRangeException("sourceIndex");
+
             for (int n = 0; n < count; n++) {
                 var i = source[n + sourceIndex];
-                var newInsn = CloneInstruction(i);
+                var newInsn = CloneInstruction(i, variables);
 
                 // FIXME: Cecil doesn't let you clone Instruction objects
                 target.Add(i);
@@ -408,8 +796,15 @@ namespace ExceptionRewriter {
                 if (operand == null)
                     continue;
 
-                var newOperand = RemapInstruction(operand, source, target, targetIndex - sourceIndex);
-                var newInsn = Instruction.Create(insn.OpCode, newOperand);
+                Instruction newOperand, newInsn;
+                if (!TryRemapInstruction(operand, source, target, targetIndex - sourceIndex, out newOperand)) {
+                    if (onFailedRemap != null)
+                        newInsn = onFailedRemap(insn, operand);
+                    else
+                        throw new Exception("Could not remap instruction operand for " + insn);
+                } else {
+                    newInsn = Instruction.Create(insn.OpCode, newOperand);
+                }
                 target[i] = newInsn;
             }
         }
