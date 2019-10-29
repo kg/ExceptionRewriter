@@ -412,6 +412,7 @@ namespace ExceptionRewriter {
                 MethodAttributes.Static | MethodAttributes.Private,
                 method.Module.TypeSystem.Int32
             );
+            catchMethod.Body.InitLocals = true;
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
             var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, method.Module.TypeSystem.Object);
             // Exc goes first because catch blocks start with it on the stack and this makes it convenient to spam dup
@@ -439,7 +440,7 @@ namespace ExceptionRewriter {
                 catchInsns, 0, new[] {
                     Instruction.Create(OpCodes.Ldarg, closureParam),
                     Instruction.Create(OpCodes.Stloc, newVariables[closure]),
-                    // WHY? This code isn't following the semantics of usual catch blocks!!
+                    // HACK: Compensate for weird generated code from roslyn
                     (catchInsns[0].OpCode.Code == Code.Pop)
                         ? Instruction.Create(OpCodes.Ldarg, excParam)
                         : Instruction.Create(OpCodes.Nop)
@@ -505,6 +506,7 @@ namespace ExceptionRewriter {
                 MethodAttributes.Virtual | MethodAttributes.Public,
                 method.Module.TypeSystem.Int32
             );
+            filterMethod.Body.InitLocals = true;
 
             filterType.Methods.Add(filterMethod);
 
@@ -527,7 +529,6 @@ namespace ExceptionRewriter {
 
             var newVariables = ExtractRangeToMethod(method, filterMethod, i1, i2, false);
 
-            // HACK: Filtered exception handlers start with a pop for some reason
             var filterInsns = filterMethod.Body.Instructions;
             var oldInsn = eh.HandlerStart;
             var oldStartIdx = insns.IndexOf(eh.HandlerStart);
@@ -591,18 +592,31 @@ namespace ExceptionRewriter {
             Patch(sourceMethod, oldInsn, insns[firstIndex]);
 
             if (deleteThem)
-                RemoveRange(insns, firstIndex, lastIndex);
+                RemoveRange(sourceMethod, firstIndex, lastIndex);
 
             return variables;
         }
 
-        private void RemoveRange<T> (Mono.Collections.Generic.Collection<T> coll, T first, T last, bool inclusive) {
-            RemoveRange(coll, coll.IndexOf(first), coll.IndexOf(last) - (inclusive ? 0 : 1));
+        private void RemoveRange (
+            MethodDefinition method, 
+            Instruction first, Instruction last, bool inclusive
+        ) {
+            var coll = method.Body.Instructions;
+            RemoveRange(method, coll.IndexOf(first), coll.IndexOf(last) - (inclusive ? 0 : 1));
         }
 
-        private void RemoveRange<T> (Mono.Collections.Generic.Collection<T> coll, int firstIndex, int lastIndex) {
-            for (int i = lastIndex; i > firstIndex; i--)
-                coll.RemoveAt(i);
+        private void RemoveRange (MethodDefinition method, int firstIndex, int lastIndex) {
+            var coll = method.Body.Instructions;
+            var lastOne = coll[lastIndex];
+            var newLast = Instruction.Create(OpCodes.Nop);
+
+            for (int i = lastIndex; i > firstIndex; i--) {
+                Patch(method, coll[i], newLast);
+                if (i == lastIndex)
+                    coll[lastIndex] = newLast;
+                else
+                    coll.RemoveAt(i);
+            }
         }
 
         public class ExcGroup {
@@ -676,9 +690,9 @@ namespace ExceptionRewriter {
                     }
 
                     if (h.LastFilterInsn != null)
-                        RemoveRange(insns, h.FirstFilterInsn, h.LastFilterInsn, true);
+                        RemoveRange(method, h.FirstFilterInsn, h.LastFilterInsn, true);
 
-                    RemoveRange(insns, h.Handler.HandlerStart, h.Handler.HandlerEnd, false);
+                    RemoveRange(method, h.Handler.HandlerStart, h.Handler.HandlerEnd, false);
 
                     method.Body.ExceptionHandlers.Remove(h.Handler);
                 }
@@ -737,8 +751,7 @@ namespace ExceptionRewriter {
                     handlerEnd = originalExitPoint;
 
                 var newEh = new ExceptionHandler(ExceptionHandlerType.Catch) {
-                    TryStart = eg.tryStart,
-                    // this does not make any damn sense
+                    TryStart = eg.tryStart,                    
                     TryEnd = newHandlerStart,
                     HandlerStart = newHandlerStart,
                     HandlerEnd = handlerEnd,
@@ -769,14 +782,6 @@ namespace ExceptionRewriter {
         private void Renumber (Mono.Collections.Generic.Collection<Instruction> insns) {
             foreach (var i in insns)
                 i.Offset = insns.IndexOf(i);
-        }
-
-        private bool ShouldPreserveTryBlock (
-            ExceptionHandler eh
-        ) {
-            // FIXME: Detect whether the try block contains any operations that can throw,
-            //  and if it does, preserve it.
-            return false;
         }
 
         private bool TryRemapInstruction (
@@ -827,7 +832,6 @@ namespace ExceptionRewriter {
                 TypeDefinition tdef = operand as TypeDefinition;
                 return Instruction.Create(i.OpCode, tdef);
             } else if (operand is MethodReference) {
-                // FIXME: Swap around if this is a reference to a rewritten method
                 MethodReference mref = operand as MethodReference;
                 return Instruction.Create(i.OpCode, mref);
             } else if (operand is Instruction) {
@@ -860,8 +864,6 @@ namespace ExceptionRewriter {
             for (int n = 0; n < count; n++) {
                 var i = source[n + sourceIndex];
                 var newInsn = CloneInstruction(i, variables);
-
-                // FIXME: Cecil doesn't let you clone Instruction objects
                 target.Add(i);
             }
 
@@ -883,56 +885,6 @@ namespace ExceptionRewriter {
                 }
                 target[i] = newInsn;
             }
-        }
-
-        private MethodDefinition CloneMethod (MethodDefinition source) {
-            MethodDefinition targetMethod = new MethodDefinition(
-                source.Name + "_impl", source.Attributes,
-                source.ReturnType
-            );
-
-            // Copy the parameters; 
-            foreach (var p in source.Parameters) {
-                ParameterDefinition nP = new ParameterDefinition(p.Name, p.Attributes, p.ParameterType);
-                targetMethod.Parameters.Add(nP);
-            }
-
-            // copy the body
-            var nBody = targetMethod.Body;
-            var oldBody = source.Body;
-
-            nBody.InitLocals = oldBody.InitLocals;
-
-            // copy the local variable definition
-            foreach (var v in oldBody.Variables) {
-                var nv = new VariableDefinition(v.VariableType);
-                nBody.Variables.Add(nv);
-            }
-
-            // copy the IL; we only need to take care of reference and method definitions
-            Mono.Collections.Generic.Collection<Instruction> col =
-nBody.Instructions;
-
-            CloneInstructions(oldBody.Instructions, 0, oldBody.Instructions.Count, nBody.Instructions, 0);
-
-            // copy the exception handler blocks
-
-            foreach (ExceptionHandler eh in oldBody.ExceptionHandlers) {
-                ExceptionHandler neh = new ExceptionHandler(eh.HandlerType);
-                neh.CatchType = eh.CatchType;
-                neh.HandlerType = eh.HandlerType;
-
-                neh.TryStart = RemapInstruction(eh.TryStart, oldBody.Instructions, col);
-                neh.TryEnd = RemapInstruction(eh.TryEnd, oldBody.Instructions, col);
-                neh.HandlerStart = RemapInstruction(eh.HandlerStart, oldBody.Instructions, col);
-                neh.HandlerEnd = RemapInstruction(eh.HandlerEnd, oldBody.Instructions, col);
-                neh.FilterStart = RemapInstruction(eh.FilterStart, oldBody.Instructions, col);
-
-                nBody.ExceptionHandlers.Add(neh);
-            }
-
-            targetMethod.DeclaringType = source.DeclaringType;
-            return targetMethod;
         }
     }
 }

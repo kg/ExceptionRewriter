@@ -47,14 +47,6 @@ namespace ExceptionRewriter {
             };
 
             var body = method.Body;
-            var ilp = method.Body.GetILProcessor();
-            foreach (var insn in body.Instructions) {
-                if (
-                    (insn.OpCode == OpCodes.Throw) ||
-                    (insn.OpCode == OpCodes.Rethrow)
-                )
-                    result.HasThrowStatement = true;
-            }
 
             foreach (var eh in body.ExceptionHandlers) {
                 if (eh.FilterStart != null)
@@ -74,10 +66,8 @@ namespace ExceptionRewriter {
 
             if (result.SuppressRewriting)
                 result.MayNeedRewriting = false;
-
-            result.CanThrow = result.HasThrowStatement || result.HasExceptionFilter || result.HasCalls;
-
-            Console.WriteLine($"{type.Name}::{method.Name} try={result.HasTryBlock} filter={result.HasExceptionFilter} throw={result.HasThrowStatement} rewrite={!result.SuppressRewriting} calls={result.HasCalls} mayneedrewrite={result.MayNeedRewriting}");
+            
+            Console.WriteLine($"{type.Name}::{method.Name} try={result.HasTryBlock} filter={result.HasExceptionFilter} rewrite={!result.SuppressRewriting} mayneedrewrite={result.MayNeedRewriting}");
             Methods.Add(method, result);
         }
 
@@ -94,13 +84,10 @@ namespace ExceptionRewriter {
         public Dictionary<ExceptionHandler, MethodDefinition> Filters = 
             new Dictionary<ExceptionHandler, MethodDefinition>();
 
-        public bool HasCalls;
         public bool HasTryBlock;
         public bool HasExceptionFilter;
-        public bool HasThrowStatement;
         public bool SuppressRewriting;
         public bool MayNeedRewriting;
-        public bool CanThrow;
 
         public bool ShouldRewrite;
     }
