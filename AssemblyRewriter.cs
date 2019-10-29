@@ -271,30 +271,35 @@ namespace ExceptionRewriter {
             return null;
         }
 
+        private MethodDefinition CreateConstructor (TypeDefinition type) {
+            var ctorMethod = new MethodDefinition(
+                ".ctor", MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, 
+                type.Module.TypeSystem.Void
+            );
+            type.Methods.Add(ctorMethod);
+            InsertOps(ctorMethod.Body.Instructions, 0, new[] {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Call, 
+                    new MethodReference(
+                        ".ctor", type.Module.TypeSystem.Void, 
+                        type.BaseType
+                    ) { HasThis = true }),
+                Instruction.Create(OpCodes.Nop),
+                Instruction.Create(OpCodes.Ret)
+            });
+            return ctorMethod;
+        }
+
         private VariableDefinition ConvertToClosure (MethodDefinition method, out TypeDefinition closureType) {
             var insns = method.Body.Instructions;
             closureType = new TypeDefinition(
-                method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString("X4"), 
+                method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString("X4"),
                 TypeAttributes.Class | TypeAttributes.NestedPrivate
             );
             closureType.BaseType = method.Module.TypeSystem.Object;
             method.DeclaringType.NestedTypes.Add(closureType);
 
-            var ctorMethod = new MethodDefinition(
-                ".ctor", MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, 
-                method.Module.TypeSystem.Void
-            );
-            closureType.Methods.Add(ctorMethod);
-            InsertOps(ctorMethod.Body.Instructions, 0, new[] {
-                Instruction.Create(OpCodes.Ldarg_0),
-                Instruction.Create(OpCodes.Call, 
-                    new MethodReference(
-                        ".ctor", method.Module.TypeSystem.Void, 
-                        closureType.BaseType
-                    ) { HasThis = true }),
-                Instruction.Create(OpCodes.Nop),
-                Instruction.Create(OpCodes.Ret)
-            });
+            var ctorMethod = CreateConstructor(closureType);
 
             var isStatic = method.IsStatic;
 
@@ -408,7 +413,7 @@ namespace ExceptionRewriter {
                 method.Module.TypeSystem.Int32
             );
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
-            var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, this.GetException(method.Module));
+            var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, method.Module.TypeSystem.Object);
             // Exc goes first because catch blocks start with it on the stack and this makes it convenient to spam dup
             catchMethod.Parameters.Add(excParam);
             catchMethod.Parameters.Add(closureParam);
@@ -476,7 +481,7 @@ namespace ExceptionRewriter {
             return handler;
         }
 
-        private void ExtractFilterAndCatch (
+        private ExcHandler ExtractFilterAndCatch (
             MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ExcGroup group
         ) {
             var insns = method.Body.Instructions;
@@ -486,6 +491,9 @@ namespace ExceptionRewriter {
                 TypeAttributes.NestedPublic | TypeAttributes.Class,
                 ExceptionFilter
             );
+            filterType.BaseType = method.Module.TypeSystem.Object;
+            method.DeclaringType.NestedTypes.Add(filterType);
+            CreateConstructor(filterType);
 
             var closureField = new FieldDefinition(
                 "closure", FieldAttributes.Public, closureType
@@ -499,7 +507,6 @@ namespace ExceptionRewriter {
             );
 
             filterType.Methods.Add(filterMethod);
-            method.DeclaringType.NestedTypes.Add(filterType);
 
             var filterReplacement = Instruction.Create(OpCodes.Ret);
 
@@ -552,8 +559,11 @@ namespace ExceptionRewriter {
 
             handler.FilterMethod = filterMethod;
             handler.FilterType = filterType;
+            handler.FilterVariable = new VariableDefinition(filterType);
             handler.FirstFilterInsn = eh.FilterStart;
             handler.LastFilterInsn = endfilter;
+
+            return handler;
         }
 
         private Dictionary<VariableDefinition, VariableDefinition> ExtractRangeToMethod (
@@ -603,6 +613,7 @@ namespace ExceptionRewriter {
         public class ExcHandler {
             public ExceptionHandler Handler;
             public TypeDefinition FilterType;
+            public VariableDefinition FilterVariable;
             public MethodDefinition Method, FilterMethod;
 
             public Instruction FirstFilterInsn, LastFilterInsn;
@@ -612,6 +623,8 @@ namespace ExceptionRewriter {
             var excType = GetException(method.Module);
             TypeDefinition closureType;
             var closure = ConvertToClosure(method, out closureType);
+            var excVar = new VariableDefinition(excType);
+            method.Body.Variables.Add(excVar);
 
             var insns = method.Body.Instructions;
             insns.Insert(0, Instruction.Create(OpCodes.Nop));
@@ -639,7 +652,29 @@ namespace ExceptionRewriter {
             }
 
             foreach (var eg in newGroups) {
+                var finallyInsns = new List<Instruction>();
+
                 foreach (var h in eg.Handlers) {
+                    var fv = h.FilterVariable;
+                    if (fv != null) {
+                        method.Body.Variables.Add(fv);
+                        var filterInitInsns = new Instruction[] {
+                            Instruction.Create(OpCodes.Newobj, h.FilterType.Methods.First(m => m.Name == ".ctor")),
+                            Instruction.Create(OpCodes.Stloc, fv),
+                            Instruction.Create(OpCodes.Ldloc, fv),
+                            Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "Push")),
+                            h.Handler.TryStart,
+                        };
+
+                        var oldIndex = insns.IndexOf(h.Handler.TryStart);
+                        insns[oldIndex] = Instruction.Create(OpCodes.Nop);
+                        Patch(method, h.Handler.TryStart, insns[oldIndex]);
+                        InsertOps(insns, oldIndex + 1, filterInitInsns);
+
+                        finallyInsns.Add(Instruction.Create(OpCodes.Ldloc, fv));
+                        finallyInsns.Add(Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "Pop")));
+                    }
+
                     if (h.LastFilterInsn != null)
                         RemoveRange(insns, h.FirstFilterInsn, h.LastFilterInsn, true);
 
@@ -659,13 +694,33 @@ namespace ExceptionRewriter {
                     newHandlerStart
                 };
 
-                foreach (var h in eg.Handlers)
-                    handlerBody.Add(Instruction.Create(OpCodes.Dup));
+                handlerBody.Add(Instruction.Create(OpCodes.Stloc, excVar));
+
+                var breakOut = Instruction.Create(OpCodes.Nop);
 
                 foreach (var h in eg.Handlers) {
+                    var skip = Instruction.Create(OpCodes.Nop);
+
+                    var fv = h.FilterVariable;
+                    if (fv != null) {
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, fv));
+                        handlerBody.Add(Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "get_Result")));
+                        handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
+                    }
+
+                    if ((h.Handler.CatchType != null) && (h.Handler.CatchType.FullName != "System.Object")) {
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
+                        handlerBody.Add(Instruction.Create(OpCodes.Isinst, h.Handler.CatchType));
+                        handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
+                    }
+
+                    handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                     handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                     handlerBody.Add(Instruction.Create(OpCodes.Call, h.Method));
-                    handlerBody.Add(Instruction.Create(OpCodes.Pop));
+                    handlerBody.Add(Instruction.Create(OpCodes.Brfalse, newHandlerEnd));
+                    handlerBody.Add(Instruction.Create(OpCodes.Rethrow));
+
+                    handlerBody.Add(skip);
                 }
 
                 handlerBody.Add(newHandlerEnd);
@@ -674,15 +729,36 @@ namespace ExceptionRewriter {
 
                 Renumber(insns);
 
+                var originalExitPoint = insns[insns.IndexOf(newHandlerEnd) + 1];
+                Instruction handlerEnd;
+                if (finallyInsns.Count > 0)
+                    handlerEnd = finallyInsns[0];
+                else
+                    handlerEnd = originalExitPoint;
+
                 var newEh = new ExceptionHandler(ExceptionHandlerType.Catch) {
                     TryStart = eg.tryStart,
                     // this does not make any damn sense
                     TryEnd = newHandlerStart,
                     HandlerStart = newHandlerStart,
-                    HandlerEnd = insns[insns.IndexOf(newHandlerEnd) + 1],
-                    CatchType = method.Module.TypeSystem.Object
+                    HandlerEnd = handlerEnd,
+                    CatchType = method.Module.TypeSystem.Object,
                 };
                 method.Body.ExceptionHandlers.Add(newEh);
+
+                if (finallyInsns.Count > 0) {
+                    finallyInsns.Add(Instruction.Create(OpCodes.Leave, originalExitPoint));
+
+                    InsertOps(insns, insns.IndexOf(originalExitPoint), finallyInsns.ToArray());
+
+                    var newFinally = new ExceptionHandler(ExceptionHandlerType.Finally) {
+                        TryStart = newEh.TryStart,
+                        TryEnd = newEh.TryEnd,
+                        HandlerStart = finallyInsns[0],
+                        HandlerEnd = originalExitPoint
+                    };
+                    method.Body.ExceptionHandlers.Add(newFinally);
+                }
             }
 
             foreach (var toInsert in filtersToInsert) {
