@@ -15,9 +15,22 @@ namespace ExceptionRewriter {
 
         private int ClosureIndex, FilterIndex;
 
+        private readonly Dictionary<Code, OpCode> ShortFormRemappings = new Dictionary<Code, OpCode>();
+
         public AssemblyRewriter (AssemblyAnalyzer analyzer) {
             Assembly = analyzer.Input;
             Analyzer = analyzer;
+
+            var tOpcodes = typeof(OpCodes);
+
+            foreach (var n in typeof(Code).GetEnumNames()) {
+                if (!n.EndsWith("_S"))
+                    continue;
+
+                var full = n.Replace("_S", "");
+                var m = tOpcodes.GetField(full);
+                ShortFormRemappings[Enum.Parse<Code>(n)] = (OpCode)m.GetValue(null);
+            }
         }
 
         // The encouraged typeof() based import isn't valid because it will import
@@ -396,6 +409,8 @@ namespace ExceptionRewriter {
 
             InsertOps(insns, 0, toInject.ToArray());
 
+            CleanMethodBody(method);
+
             return closureVar;
         }
 
@@ -487,8 +502,9 @@ namespace ExceptionRewriter {
         ) {
             var insns = method.Body.Instructions;
             var closureType = closure.VariableType;
+            var filterIndex = FilterIndex++;
             var filterType = new TypeDefinition(
-                method.DeclaringType.Namespace, method.Name + "__filter" + (FilterIndex++).ToString("X4"),
+                method.DeclaringType.Namespace, method.Name + "__filter" + filterIndex.ToString("X4"),
                 TypeAttributes.NestedPublic | TypeAttributes.Class,
                 ExceptionFilter
             );
@@ -560,7 +576,11 @@ namespace ExceptionRewriter {
 
             handler.FilterMethod = filterMethod;
             handler.FilterType = filterType;
-            handler.FilterVariable = new VariableDefinition(filterType);
+            handler.FilterField = new FieldDefinition(
+                "__filter" + filterIndex.ToString("X4"), 
+                FieldAttributes.Public, filterType
+            );
+            ((TypeDefinition)closureType).Fields.Add(handler.FilterField);
             handler.FirstFilterInsn = eh.FilterStart;
             handler.LastFilterInsn = endfilter;
 
@@ -622,18 +642,22 @@ namespace ExceptionRewriter {
         public class ExcGroup {
             public Instruction tryStart, tryEnd;
             public List<ExcHandler> Handlers = new List<ExcHandler>();
+            internal Instruction FirstPushInstruction;
         }
 
         public class ExcHandler {
             public ExceptionHandler Handler;
             public TypeDefinition FilterType;
-            public VariableDefinition FilterVariable;
+            public FieldDefinition FilterField;
             public MethodDefinition Method, FilterMethod;
 
             public Instruction FirstFilterInsn, LastFilterInsn;
+            internal Instruction FirstPushInstruction;
         }
 
         private void ExtractExceptionFilters (MethodDefinition method) {
+            CleanMethodBody(method);
+
             var excType = GetException(method.Module);
             TypeDefinition closureType;
             var closure = ConvertToClosure(method, out closureType);
@@ -669,23 +693,37 @@ namespace ExceptionRewriter {
                 var finallyInsns = new List<Instruction>();
 
                 foreach (var h in eg.Handlers) {
-                    var fv = h.FilterVariable;
-                    if (fv != null) {
-                        method.Body.Variables.Add(fv);
+                    var ff = h.FilterField;
+                    if (ff != null) {
                         var filterInitInsns = new Instruction[] {
+                            Instruction.Create(OpCodes.Ldloc, closure),
                             Instruction.Create(OpCodes.Newobj, h.FilterType.Methods.First(m => m.Name == ".ctor")),
-                            Instruction.Create(OpCodes.Stloc, fv),
-                            Instruction.Create(OpCodes.Ldloc, fv),
+                            Instruction.Create(OpCodes.Stfld, h.FilterField),
+                            Instruction.Create(OpCodes.Ldloc, closure),
+                            Instruction.Create(OpCodes.Ldfld, h.FilterField),
+                            Instruction.Create(OpCodes.Castclass, ExceptionFilter),
                             Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "Push")),
                             h.Handler.TryStart,
                         };
 
                         var oldIndex = insns.IndexOf(h.Handler.TryStart);
-                        insns[oldIndex] = Instruction.Create(OpCodes.Nop);
+                        var nop = Instruction.Create(OpCodes.Nop);
+                        insns[oldIndex] = nop;
                         Patch(method, h.Handler.TryStart, insns[oldIndex]);
                         InsertOps(insns, oldIndex + 1, filterInitInsns);
 
-                        finallyInsns.Add(Instruction.Create(OpCodes.Ldloc, fv));
+                        int lowestIndex = int.MaxValue;
+                        if (eg.FirstPushInstruction != null)
+                            lowestIndex = insns.IndexOf(eg.FirstPushInstruction);
+                        int newIndex = insns.IndexOf(nop);
+                        eg.FirstPushInstruction = (newIndex < lowestIndex)
+                            ? nop
+                            : eg.FirstPushInstruction;
+                        eg.FirstPushInstruction = insns[oldIndex];
+
+                        finallyInsns.Add(Instruction.Create(OpCodes.Ldloc, closure));
+                        finallyInsns.Add(Instruction.Create(OpCodes.Ldfld, ff));
+                        finallyInsns.Add(Instruction.Create(OpCodes.Castclass, ExceptionFilter));
                         finallyInsns.Add(Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "Pop")));
                     }
 
@@ -715,9 +753,10 @@ namespace ExceptionRewriter {
                 foreach (var h in eg.Handlers) {
                     var skip = Instruction.Create(OpCodes.Nop);
 
-                    var fv = h.FilterVariable;
-                    if (fv != null) {
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, fv));
+                    var ff = h.FilterField;
+                    if (ff != null) {
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldfld, ff));
                         handlerBody.Add(Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "get_Result")));
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
                     }
@@ -741,8 +780,6 @@ namespace ExceptionRewriter {
 
                 InsertOps(insns, newHandlerOffset + 1, handlerBody.ToArray());
 
-                Renumber(insns);
-
                 var originalExitPoint = insns[insns.IndexOf(newHandlerEnd) + 1];
                 Instruction handlerEnd;
                 if (finallyInsns.Count > 0)
@@ -751,7 +788,7 @@ namespace ExceptionRewriter {
                     handlerEnd = originalExitPoint;
 
                 var newEh = new ExceptionHandler(ExceptionHandlerType.Catch) {
-                    TryStart = eg.tryStart,                    
+                    TryStart = eg.tryStart,
                     TryEnd = newHandlerStart,
                     HandlerStart = newHandlerStart,
                     HandlerEnd = handlerEnd,
@@ -760,26 +797,40 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Add(newEh);
 
                 if (finallyInsns.Count > 0) {
-                    finallyInsns.Add(Instruction.Create(OpCodes.Leave, originalExitPoint));
-
-                    InsertOps(insns, insns.IndexOf(originalExitPoint), finallyInsns.ToArray());
+                    var newLeave = Instruction.Create(OpCodes.Leave, originalExitPoint);
+                    insns.Insert(insns.IndexOf(handlerEnd) + 1, newLeave);
+                    var originalExitIndex = insns.IndexOf(originalExitPoint);
+                    InsertOps(insns, originalExitIndex, finallyInsns.ToArray());
 
                     var newFinally = new ExceptionHandler(ExceptionHandlerType.Finally) {
-                        TryStart = newEh.TryStart,
-                        TryEnd = newEh.TryEnd,
+                        TryStart = eg.FirstPushInstruction,
+                        TryEnd = finallyInsns[0],
                         HandlerStart = finallyInsns[0],
                         HandlerEnd = originalExitPoint
                     };
                     method.Body.ExceptionHandlers.Add(newFinally);
                 }
-            }
 
-            foreach (var toInsert in filtersToInsert) {
+                CleanMethodBody(method);
             }
-
         }
 
-        private void Renumber (Mono.Collections.Generic.Collection<Instruction> insns) {
+        private void CleanMethodBody (MethodDefinition method) {
+            var insns = method.Body.Instructions;
+            foreach (var i in insns)
+                i.Offset = insns.IndexOf(i);
+
+            foreach (var i in insns) {
+                OpCode newOpcode;
+                if (ShortFormRemappings.TryGetValue(i.OpCode.Code, out newOpcode))
+                    i.OpCode = newOpcode;
+
+                if (i.Operand is Instruction) {
+                    if (insns.IndexOf((Instruction)i.Operand) < 0)
+                        throw new Exception("Invalid instruction operand");
+                }
+            }
+
             foreach (var i in insns)
                 i.Offset = insns.IndexOf(i);
         }
