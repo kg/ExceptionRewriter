@@ -725,9 +725,16 @@ namespace ExceptionRewriter {
                     var ff = h.FilterField;
                     if (ff != null) {
                         var filterInitInsns = new Instruction[] {
+                            // Construct a filter instance and store it into the closure
                             Instruction.Create(OpCodes.Ldloc, closure),
                             Instruction.Create(OpCodes.Newobj, h.FilterType.Methods.First(m => m.Name == ".ctor")),
                             Instruction.Create(OpCodes.Stfld, h.FilterField),
+                            // Then store the closure into the filter instance so it can access locals
+                            Instruction.Create(OpCodes.Ldloc, closure),
+                            Instruction.Create(OpCodes.Ldfld, h.FilterField),
+                            Instruction.Create(OpCodes.Ldloc, closure),
+                            Instruction.Create(OpCodes.Stfld, h.FilterType.Fields.First(m => m.Name == "closure")),
+                            // Then call Push on the filter instance
                             Instruction.Create(OpCodes.Ldloc, closure),
                             Instruction.Create(OpCodes.Ldfld, h.FilterField),
                             Instruction.Create(OpCodes.Castclass, efilt),
@@ -754,6 +761,8 @@ namespace ExceptionRewriter {
                             : eg.FirstPushInstruction;
                         eg.FirstPushInstruction = insns[oldIndex];
 
+                        // At the end of the scope remove all our filters.
+                        // FIXME: Should we do this earlier?
                         finallyInsns.Add(Instruction.Create(OpCodes.Ldloc, closure));
                         finallyInsns.Add(Instruction.Create(OpCodes.Ldfld, ff));
                         finallyInsns.Add(Instruction.Create(OpCodes.Castclass, efilt));
@@ -781,6 +790,7 @@ namespace ExceptionRewriter {
 
                 var handlerBody = new List<Instruction> {
                     newHandlerStart,
+                    // Automatically execute active exception filters for this exception
                     Instruction.Create(OpCodes.Stloc, excVar),
                     Instruction.Create(OpCodes.Ldloc, excVar),
                     Instruction.Create(OpCodes.Call, new MethodReference(
@@ -797,6 +807,7 @@ namespace ExceptionRewriter {
 
                     var ff = h.FilterField;
                     if (ff != null) {
+                        // If we have a filter, check the Result to see if the filter returned execute_handler
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                         handlerBody.Add(Instruction.Create(OpCodes.Ldfld, ff));
                         handlerBody.Add(Instruction.Create(OpCodes.Castclass, efilt));
@@ -807,11 +818,13 @@ namespace ExceptionRewriter {
                     }
 
                     if ((h.Handler.CatchType != null) && (h.Handler.CatchType.FullName != "System.Object")) {
+                        // If the handler has a type check do an isinst to check whether it should run
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                         handlerBody.Add(Instruction.Create(OpCodes.Isinst, h.Handler.CatchType));
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
                     }
 
+                    // All the previous filtered/typed handlers failed so run the fallback
                     handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                     handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                     handlerBody.Add(Instruction.Create(OpCodes.Call, h.Method));
