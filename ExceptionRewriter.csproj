@@ -6,6 +6,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="ExceptionFilterSupport\**" />
+    <EmbeddedResource Remove="ExceptionFilterSupport\**" />
+    <None Remove="ExceptionFilterSupport\**" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Mono.Cecil" Version="0.11.0" />
   </ItemGroup>
 

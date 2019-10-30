@@ -11,8 +11,6 @@ namespace ExceptionRewriter {
         public readonly AssemblyDefinition Assembly;
         public readonly AssemblyAnalyzer Analyzer;
 
-        private TypeDefinition ExceptionFilter;
-
         private int ClosureIndex, FilterIndex;
 
         private readonly Dictionary<Code, OpCode> ShortFormRemappings = new Dictionary<Code, OpCode>();
@@ -47,6 +45,37 @@ namespace ExceptionRewriter {
             return null;
         }
 
+        private TypeReference ImportReferencedType (ModuleDefinition module, string assemblyName, string @namespace, string name) {
+            var s = module.TypeSystem.String;
+
+            foreach (var m in Assembly.Modules) {
+                foreach (var ar in m.AssemblyReferences) {
+                    if (!ar.FullName.Contains(assemblyName))
+                        continue;
+
+                    var ad = Assembly.MainModule.AssemblyResolver.Resolve(ar);
+
+                    var result = new TypeReference(
+                        @namespace, name, ad.MainModule, ad.MainModule
+                    );
+                    return module.ImportReference(result);
+                    /*
+                    var result = new TypeReference(
+                        @namespace, name
+                    );
+                    if (result != null)
+                        return module.ImportReference((TypeReference)result);
+                        */
+                }
+            }
+
+            return null;
+        }
+
+        private TypeReference GetExceptionFilter (ModuleDefinition module) {
+            return ImportReferencedType(module, "ExceptionFilterSupport", "Mono.Runtime.Internal", "ExceptionFilter");
+        }
+
         private TypeReference GetException (ModuleDefinition module) {
             return ImportCorlibType(module, "System", "Exception");
         }
@@ -56,8 +85,6 @@ namespace ExceptionRewriter {
         }
 
         public void Rewrite () {
-            ExceptionFilter = Assembly.MainModule.GetType("Mono.Runtime.Internal.ExceptionFilter");
-
             var queue = new HashSet<AnalyzedMethod>();
 
             foreach (var m in Analyzer.Methods.Values) {
@@ -506,9 +533,9 @@ namespace ExceptionRewriter {
             var filterType = new TypeDefinition(
                 method.DeclaringType.Namespace, method.Name + "__filter" + filterIndex.ToString("X4"),
                 TypeAttributes.NestedPublic | TypeAttributes.Class,
-                ExceptionFilter
+                GetExceptionFilter(method.Module)
             );
-            filterType.BaseType = method.Module.TypeSystem.Object;
+            filterType.BaseType = GetExceptionFilter(method.Module);
             method.DeclaringType.NestedTypes.Add(filterType);
             CreateConstructor(filterType);
 
@@ -658,9 +685,11 @@ namespace ExceptionRewriter {
         private void ExtractExceptionFilters (MethodDefinition method) {
             CleanMethodBody(method);
 
+            var efilt = GetExceptionFilter(method.Module);
             var excType = GetException(method.Module);
             TypeDefinition closureType;
             var closure = ConvertToClosure(method, out closureType);
+
             var excVar = new VariableDefinition(method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
 
@@ -701,8 +730,12 @@ namespace ExceptionRewriter {
                             Instruction.Create(OpCodes.Stfld, h.FilterField),
                             Instruction.Create(OpCodes.Ldloc, closure),
                             Instruction.Create(OpCodes.Ldfld, h.FilterField),
-                            Instruction.Create(OpCodes.Castclass, ExceptionFilter),
-                            Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "Push")),
+                            Instruction.Create(OpCodes.Castclass, efilt),
+                            Instruction.Create(OpCodes.Call, new MethodReference(
+                                    "Push", method.Module.TypeSystem.Void, efilt
+                            ) { HasThis = false, Parameters = {
+                                    new ParameterDefinition(efilt)
+                            } }),
                             h.Handler.TryStart,
                         };
 
@@ -723,8 +756,12 @@ namespace ExceptionRewriter {
 
                         finallyInsns.Add(Instruction.Create(OpCodes.Ldloc, closure));
                         finallyInsns.Add(Instruction.Create(OpCodes.Ldfld, ff));
-                        finallyInsns.Add(Instruction.Create(OpCodes.Castclass, ExceptionFilter));
-                        finallyInsns.Add(Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "Pop")));
+                        finallyInsns.Add(Instruction.Create(OpCodes.Castclass, efilt));
+                        finallyInsns.Add(Instruction.Create(OpCodes.Call, new MethodReference(
+                                "Pop", method.Module.TypeSystem.Void, efilt
+                        ) { HasThis = false, Parameters = {
+                                new ParameterDefinition(efilt)
+                        }}));
                     }
 
                     if (h.LastFilterInsn != null)
@@ -743,10 +780,15 @@ namespace ExceptionRewriter {
                     throw new Exception();
 
                 var handlerBody = new List<Instruction> {
-                    newHandlerStart
+                    newHandlerStart,
+                    Instruction.Create(OpCodes.Stloc, excVar),
+                    Instruction.Create(OpCodes.Ldloc, excVar),
+                    Instruction.Create(OpCodes.Call, new MethodReference(
+                        "PerformEvaluate", method.Module.TypeSystem.Void, efilt
+                    ) { HasThis = false, Parameters = {
+                        new ParameterDefinition(method.Module.TypeSystem.Object)
+                    } })
                 };
-
-                handlerBody.Add(Instruction.Create(OpCodes.Stloc, excVar));
 
                 var breakOut = Instruction.Create(OpCodes.Nop);
 
@@ -757,8 +799,10 @@ namespace ExceptionRewriter {
                     if (ff != null) {
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                         handlerBody.Add(Instruction.Create(OpCodes.Ldfld, ff));
-                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, ExceptionFilter));
-                        handlerBody.Add(Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "get_Result")));
+                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, efilt));
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldfld, new FieldReference(
+                            "Result", method.Module.TypeSystem.Int32, efilt
+                        )));
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
                     }
 
@@ -800,10 +844,12 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Add(newEh);
 
                 if (finallyInsns.Count > 0) {
+                    finallyInsns.Insert(0, Instruction.Create(OpCodes.Call, new MethodReference(
+                        "Reset", method.Module.TypeSystem.Void, efilt
+                    ) { HasThis = false }));
                     finallyInsns.Add(Instruction.Create(OpCodes.Endfinally));
 
                     var newLeave = Instruction.Create(OpCodes.Leave, originalExitPoint);
-                    insns.Insert(insns.IndexOf(handlerEnd) + 1, newLeave);
                     var originalExitIndex = insns.IndexOf(originalExitPoint);
                     InsertOps(insns, originalExitIndex, finallyInsns.ToArray());
 
@@ -816,6 +862,12 @@ namespace ExceptionRewriter {
                     method.Body.ExceptionHandlers.Add(newFinally);
 
                     insns.Insert(insns.IndexOf(finallyInsns[0]), preFinallyBr);
+
+                    var handlerEndIndex = insns.IndexOf(handlerEnd);
+                    if (handlerEndIndex < 0)
+                        throw new Exception();
+
+                    insns.Insert(handlerEndIndex + 1, newLeave);
                 }
 
                 CleanMethodBody(method);

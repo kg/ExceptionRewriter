@@ -14,12 +14,17 @@ namespace ExceptionRewriter {
                     return 1;
                 }
 
+                var assemblyResolver = new DefaultAssemblyResolver();
+                assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(argv[0]));
+
                 File.Delete(argv[1] + ".tmp");
                 File.Copy(argv[0], argv[1] + ".tmp", true);
+                // File.Copy(argv[0].Replace(".dll", ".pdb"), argv[1] + ".pdb", true);
 
                 using (var def = AssemblyDefinition.ReadAssembly(argv[1] + ".tmp", new ReaderParameters {
                     ReadWrite = true,
-                    ReadingMode = ReadingMode.Immediate
+                    ReadingMode = ReadingMode.Immediate,
+                    AssemblyResolver = assemblyResolver
                 })) {
                     var aa = new AssemblyAnalyzer(def);
                     aa.Analyze();
