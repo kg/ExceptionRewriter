@@ -661,7 +661,7 @@ namespace ExceptionRewriter {
             var excType = GetException(method.Module);
             TypeDefinition closureType;
             var closure = ConvertToClosure(method, out closureType);
-            var excVar = new VariableDefinition(excType);
+            var excVar = new VariableDefinition(method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
 
             var insns = method.Body.Instructions;
@@ -757,6 +757,7 @@ namespace ExceptionRewriter {
                     if (ff != null) {
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                         handlerBody.Add(Instruction.Create(OpCodes.Ldfld, ff));
+                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, ExceptionFilter));
                         handlerBody.Add(Instruction.Create(OpCodes.Call, ExceptionFilter.Methods.First(m => m.Name == "get_Result")));
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
                     }
@@ -782,8 +783,10 @@ namespace ExceptionRewriter {
 
                 var originalExitPoint = insns[insns.IndexOf(newHandlerEnd) + 1];
                 Instruction handlerEnd;
+
+                var preFinallyBr = Instruction.Create(OpCodes.Leave, originalExitPoint);
                 if (finallyInsns.Count > 0)
-                    handlerEnd = finallyInsns[0];
+                    handlerEnd = preFinallyBr;
                 else
                     handlerEnd = originalExitPoint;
 
@@ -797,6 +800,8 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Add(newEh);
 
                 if (finallyInsns.Count > 0) {
+                    finallyInsns.Add(Instruction.Create(OpCodes.Endfinally));
+
                     var newLeave = Instruction.Create(OpCodes.Leave, originalExitPoint);
                     insns.Insert(insns.IndexOf(handlerEnd) + 1, newLeave);
                     var originalExitIndex = insns.IndexOf(originalExitPoint);
@@ -809,6 +814,8 @@ namespace ExceptionRewriter {
                         HandlerEnd = originalExitPoint
                     };
                     method.Body.ExceptionHandlers.Add(newFinally);
+
+                    insns.Insert(insns.IndexOf(finallyInsns[0]), preFinallyBr);
                 }
 
                 CleanMethodBody(method);
