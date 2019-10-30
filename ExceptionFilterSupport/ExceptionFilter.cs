@@ -89,9 +89,6 @@ namespace Mono.Runtime.Internal {
                     break;
                 }
             }
-
-            if (!hasLocatedValidHandler)
-                Console.WriteLine("Located no valid filtered handler for exception");
         }
     }
 }
