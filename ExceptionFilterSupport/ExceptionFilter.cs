@@ -13,7 +13,6 @@ namespace Mono.Runtime.Internal {
             new ThreadLocal<List<ExceptionFilter>>(() => new List<ExceptionFilter>(128));
 
         private static object LastEvaluatedException = null;
-        private static bool HasEvaluatedFiltersAlready = false;
 
         public abstract int Evaluate (object exc);
 
@@ -38,10 +37,10 @@ namespace Mono.Runtime.Internal {
         ///  exception.
         /// </summary>
         public static void Reset () {
+            LastEvaluatedException = null;
             var ef = ExceptionFilters.Value;
             foreach (var filter in ef)
                 filter.Result = exception_continue_search;
-            LastEvaluatedException = null;
         }
 
         /// <summary>
@@ -70,8 +69,6 @@ namespace Mono.Runtime.Internal {
         /// </summary>
         /// <param name="exc">The exception filters are being run for.</param>
         public static void PerformEvaluate (object exc) {
-            if (HasEvaluatedFiltersAlready)
-                return;
             // FIXME: Attempt to avoid running filters multiple times when unwinding.
             // I think this doesn't work right for rethrow?
             if (LastEvaluatedException == exc)
@@ -84,7 +81,6 @@ namespace Mono.Runtime.Internal {
             // These two state variables allow us to early out in the case where Evaluate() is triggered
             //  in multiple stack frames while unwinding even though filters have already run.
             LastEvaluatedException = exc;
-            HasEvaluatedFiltersAlready = true;
 
             for (int i = ef.Count - 1; i >= 0; i--) {
                 var filter = ef[i];
