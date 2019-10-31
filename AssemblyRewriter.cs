@@ -366,52 +366,52 @@ namespace ExceptionRewriter {
             foreach (var kvp in extractedVariables)
                 closureType.Fields.Add(kvp.Value);
 
-            for (int i = 0; i < insns.Count; i++) {
-                var insn = insns[i];
-
-                var variable = (insn.Operand as VariableDefinition) 
+            FilterRange(
+                method, 0, insns.Count - 1, (insn) => {
+                    var variable = (insn.Operand as VariableDefinition) 
                     ?? LookupNumberedVariable(insn.OpCode.Code, method.Body.Variables);
-                var arg = (insn.Operand as ParameterDefinition)
-                    ?? LookupNumberedArgument(insn.OpCode.Code, isStatic ? null : fakeThis, method.Parameters);
+                    var arg = (insn.Operand as ParameterDefinition)
+                        ?? LookupNumberedArgument(insn.OpCode.Code, isStatic ? null : fakeThis, method.Parameters);
 
-                // FIXME
-                if (variable == closureVar)
-                    continue;
+                    // FIXME
+                    if (variable == closureVar)
+                        return null;
 
-                if ((variable == null) && (arg == null))
-                    continue;
+                    if ((variable == null) && (arg == null))
+                        return null;
 
-                var matchingField = extractedVariables[(object)variable ?? arg];
+                    var matchingField = extractedVariables[(object)variable ?? arg];
 
-                if (IsStoreOperation(insn.OpCode.Code)) {
-                    // HACK: Because we have no way to swap values on the stack, we have to keep the
-                    //  existing local but use it as a temporary store point before flushing into the
-                    //  closure
-                    Instruction reload;
-                    if (variable != null)
-                        reload = Instruction.Create(OpCodes.Ldloc, variable);
-                    else
-                        reload = Instruction.Create(OpCodes.Ldarg, arg);
+                    if (IsStoreOperation(insn.OpCode.Code)) {
+                        // HACK: Because we have no way to swap values on the stack, we have to keep the
+                        //  existing local but use it as a temporary store point before flushing into the
+                        //  closure
+                        Instruction reload;
+                        if (variable != null)
+                            reload = Instruction.Create(OpCodes.Ldloc, variable);
+                        else
+                            reload = Instruction.Create(OpCodes.Ldarg, arg);
 
-                    InsertOps(insns, i + 1, new[] {
-                        Instruction.Create(OpCodes.Ldloc, closureVar),
-                        reload,
-                        Instruction.Create(OpCodes.Stfld, matchingField)
-                    });
-                    i += 3;
-                } else {
-                    var newInsn = Instruction.Create(OpCodes.Ldloc, closureVar);
-                    insns[i] = newInsn;
-                    Patch(method, insn, newInsn);
-                    var loadOp =
-                        ((insn.OpCode.Code == Code.Ldloca) ||
-                        (insn.OpCode.Code == Code.Ldloca_S))
-                            ? OpCodes.Ldflda
-                            : OpCodes.Ldfld;
-                    insns.Insert(i + 1, Instruction.Create(loadOp, matchingField));
-                    i++;
+                        return new[] {
+                            insn, 
+                            Instruction.Create(OpCodes.Ldloc, closureVar),
+                            reload,
+                            Instruction.Create(OpCodes.Stfld, matchingField)
+                        };
+                    } else {
+                        var newInsn = Instruction.Create(OpCodes.Ldloc, closureVar);
+                        var loadOp =
+                            ((insn.OpCode.Code == Code.Ldloca) ||
+                            (insn.OpCode.Code == Code.Ldloca_S))
+                                ? OpCodes.Ldflda
+                                : OpCodes.Ldfld;
+                        return new[] {
+                            newInsn, 
+                            Instruction.Create(loadOp, matchingField)
+                        };
+                    }
                 }
-            }
+            );
 
             var toInject = new List<Instruction>() {
                 Instruction.Create(OpCodes.Newobj, closureType.Methods.First(m => m.Name == ".ctor")),
@@ -443,6 +443,66 @@ namespace ExceptionRewriter {
 
         private int CatchCount;
 
+        private Instruction PostFilterRange (
+            Dictionary<Instruction, Instruction> remapTable, Instruction oldValue
+        ) {
+            if (oldValue == null)
+                return null;
+
+            Instruction result;
+            if (remapTable.TryGetValue(oldValue, out result))
+                return result;
+
+            return oldValue;
+        }
+
+        private void FilterRange (
+            MethodDefinition method,
+            int firstIndex, int lastIndex, Func<Instruction, Instruction[]> filter
+        ) {
+            var remapTable = new Dictionary<Instruction, Instruction>();
+            var instructions = method.Body.Instructions;
+
+            for (int i = firstIndex; i <= lastIndex; i++) {
+                var insn = instructions[i];
+                var result = filter(insn);
+                if (result == null)
+                    continue;
+                if (result.Length == 1 && result[0] == insn)
+                    continue;
+
+                if (insn != result[0]) {
+                    remapTable[insn] = result[0];
+                    instructions[i] = result[0];
+                }
+                for (int j = result.Length - 1; j >= 1; j--)
+                    instructions.Insert(i + 1, result[j]);
+
+                lastIndex += (result.Length - 1);
+                i += (result.Length - 1);
+            }
+
+            for (int i = 0; i < instructions.Count; i++) {
+                var insn = instructions[i];
+                var operand = insn.Operand as Instruction;
+                if (operand == null)
+                    continue;
+                Instruction newOperand;
+                if (!remapTable.TryGetValue(operand, out newOperand))
+                    continue;
+
+                insn.Operand = newOperand;
+            }
+
+            foreach (var eh in method.Body.ExceptionHandlers) {
+                eh.FilterStart = PostFilterRange(remapTable, eh.FilterStart);
+                eh.TryStart = PostFilterRange(remapTable, eh.TryStart);
+                eh.TryEnd = PostFilterRange(remapTable, eh.TryEnd);
+                eh.HandlerStart = PostFilterRange(remapTable, eh.HandlerStart);
+                eh.HandlerEnd = PostFilterRange(remapTable, eh.HandlerEnd);
+            }
+        }
+
         private ExcHandler ExtractCatch (
             MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ExcGroup group
         ) {
@@ -463,55 +523,51 @@ namespace ExceptionRewriter {
 
             var catchInsns = catchMethod.Body.Instructions;
 
-            var newVariables = ExtractRangeToMethod(
-                method, catchMethod, 
-                insns.IndexOf(eh.HandlerStart), insns.IndexOf(eh.HandlerEnd) - 1,
-                false, 
-                (insn, operand) => {
+            var handlerFirstIndex = insns.IndexOf(eh.HandlerStart);
+            var handlerLastIndex = insns.IndexOf(eh.HandlerEnd) - 1;
+            FilterRange(
+                method, handlerFirstIndex, handlerLastIndex,
+                (insn) => {
                     switch (insn.OpCode.Code) {
                         case Code.Leave:
                         case Code.Leave_S:
-                            return insn;
+                            return new[] {
+                                Instruction.Create(OpCodes.Ldc_I4_0),
+                                Instruction.Create(OpCodes.Ret)
+                            };
+                        case Code.Rethrow:
+                            return new[] {
+                                Instruction.Create(OpCodes.Ldc_I4_1),
+                                Instruction.Create(OpCodes.Ret)
+                            };
                         default:
                             return null;
                     }
                 }
             );
 
+            var newVariables = ExtractRangeToMethod(
+                method, catchMethod, 
+                handlerFirstIndex, handlerLastIndex,
+                true, 
+                (insn, operand) => {
+                    ;
+                    return null;
+                }
+            );
+
+            var first = catchInsns[0];
+
             InsertOps(
                 catchInsns, 0, new[] {
                     Instruction.Create(OpCodes.Ldarg, closureParam),
                     Instruction.Create(OpCodes.Stloc, newVariables[closure]),
-                    // HACK: Compensate for weird generated code from roslyn
-                    (catchInsns[0].OpCode.Code == Code.Pop)
-                        ? Instruction.Create(OpCodes.Ldarg, excParam)
-                        : Instruction.Create(OpCodes.Nop)
+                    Instruction.Create(OpCodes.Ldarg, excParam)
                 }
             );
 
             for (int i = 0; i < catchInsns.Count; i++) {
                 var insn = catchInsns[i];
-                switch (insn.OpCode.Code) {
-                    case Code.Leave:
-                    case Code.Leave_S: {
-                        catchInsns[i] = Instruction.Create(OpCodes.Ldc_I4_0);
-                        Patch(catchMethod, insn, catchInsns[i]);
-                        InsertOps(catchInsns, i + 1, new[] {
-                            Instruction.Create(OpCodes.Ret)
-                        });
-                        i += 1;
-                    }
-                        break;
-                    case Code.Rethrow: {
-                        catchInsns[i] = Instruction.Create(OpCodes.Ldc_I4_1);
-                        Patch(catchMethod, insn, catchInsns[i]);
-                        InsertOps(catchInsns, i + 1, new[] {
-                            Instruction.Create(OpCodes.Ret)
-                        });
-                        i += 1;
-                    }
-                        break;
-                }
             }
 
             method.DeclaringType.Methods.Add(catchMethod);
@@ -570,7 +626,7 @@ namespace ExceptionRewriter {
             var excArg = new ParameterDefinition("exc", default(ParameterAttributes), method.Module.TypeSystem.Object);
             filterMethod.Parameters.Add(excArg);
 
-            var newVariables = ExtractRangeToMethod(method, filterMethod, i1, i2, false);
+            var newVariables = ExtractRangeToMethod(method, filterMethod, i1, i2, true);
 
             var filterInsns = filterMethod.Body.Instructions;
             var oldInsn = eh.HandlerStart;
@@ -633,13 +689,17 @@ namespace ExceptionRewriter {
                 insns, firstIndex, lastIndex - firstIndex + 1, filterInsns, 0, variables, onFailedRemap
             );
 
+            CleanMethodBody(targetMethod);
+
             var oldInsn = insns[firstIndex];
             insns[firstIndex] = Instruction.Create(OpCodes.Nop);
             // FIXME: This should not be necessary
             Patch(sourceMethod, oldInsn, insns[firstIndex]);
 
-            if (deleteThem)
+            if (deleteThem) {
                 RemoveRange(sourceMethod, firstIndex, lastIndex);
+                CleanMethodBody(sourceMethod);
+            }
 
             return variables;
         }
@@ -649,7 +709,13 @@ namespace ExceptionRewriter {
             Instruction first, Instruction last, bool inclusive
         ) {
             var coll = method.Body.Instructions;
-            RemoveRange(method, coll.IndexOf(first), coll.IndexOf(last) - (inclusive ? 0 : 1));
+            var firstIndex = coll.IndexOf(first);
+            var lastIndex = coll.IndexOf(last);
+            if (firstIndex < 0)
+                throw new Exception($"Instruction {first} not found in method");
+            if (lastIndex < 0)
+                throw new Exception($"Instruction {last} not found in method");
+            RemoveRange(method, firstIndex, lastIndex - (inclusive ? 0 : 1));
         }
 
         private void RemoveRange (MethodDefinition method, int firstIndex, int lastIndex) {
@@ -772,9 +838,6 @@ namespace ExceptionRewriter {
                                 new ParameterDefinition(efilt)
                         }}));
                     }
-
-                    if (h.LastFilterInsn != null)
-                        RemoveRange(method, h.FirstFilterInsn, h.LastFilterInsn, true);
 
                     RemoveRange(method, h.Handler.HandlerStart, h.Handler.HandlerEnd, false);
 
@@ -899,7 +962,7 @@ namespace ExceptionRewriter {
 
                 if (i.Operand is Instruction) {
                     if (insns.IndexOf((Instruction)i.Operand) < 0)
-                        throw new Exception("Invalid instruction operand");
+                        throw new Exception($"Branch target {i.Operand} of opcode {i} is missing");
                 }
             }
 
