@@ -551,8 +551,7 @@ namespace ExceptionRewriter {
                 handlerFirstIndex, handlerLastIndex,
                 true, 
                 (insn, operand) => {
-                    ;
-                    return null;
+                    throw new Exception();
                 }
             );
 
@@ -676,7 +675,7 @@ namespace ExceptionRewriter {
             Func<Instruction, Instruction, Instruction> onFailedRemap = null
         ) {
             var insns = sourceMethod.Body.Instructions;
-            var filterInsns = targetMethod.Body.Instructions;
+            var targetInsns = targetMethod.Body.Instructions;
 
             var variables = new Dictionary<VariableDefinition, VariableDefinition>();
             foreach (var loc in sourceMethod.Body.Variables) {
@@ -686,19 +685,20 @@ namespace ExceptionRewriter {
             }
 
             CloneInstructions(
-                insns, firstIndex, lastIndex - firstIndex + 1, filterInsns, 0, variables, onFailedRemap
+                insns, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, variables, onFailedRemap
             );
 
             CleanMethodBody(targetMethod);
 
-            var oldInsn = insns[firstIndex];
-            insns[firstIndex] = Instruction.Create(OpCodes.Nop);
-            // FIXME: This should not be necessary
-            Patch(sourceMethod, oldInsn, insns[firstIndex]);
-
             if (deleteThem) {
-                RemoveRange(sourceMethod, firstIndex, lastIndex);
+                for (int i = lastIndex; i >= firstIndex; i--)
+                    insns.RemoveAt(i);
                 CleanMethodBody(sourceMethod);
+            } else {
+                var oldInsn = insns[firstIndex];
+                insns[firstIndex] = Instruction.Create(OpCodes.Nop);
+                // FIXME: This should not be necessary
+                Patch(sourceMethod, oldInsn, insns[firstIndex]);
             }
 
             return variables;
@@ -838,8 +838,6 @@ namespace ExceptionRewriter {
                                 new ParameterDefinition(efilt)
                         }}));
                     }
-
-                    RemoveRange(method, h.Handler.HandlerStart, h.Handler.HandlerEnd, false);
 
                     method.Body.ExceptionHandlers.Remove(h.Handler);
                 }
