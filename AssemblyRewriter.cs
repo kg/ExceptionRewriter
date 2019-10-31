@@ -460,8 +460,11 @@ namespace ExceptionRewriter {
             MethodDefinition method,
             int firstIndex, int lastIndex, Func<Instruction, Instruction[]> filter
         ) {
-            var remapTable = new Dictionary<Instruction, Instruction>();
+            var remapTableFirst = new Dictionary<Instruction, Instruction>();
+            var remapTableLast = new Dictionary<Instruction, Instruction>();
             var instructions = method.Body.Instructions;
+
+            var firstRemovedInstruction = instructions[firstIndex];
 
             for (int i = firstIndex; i <= lastIndex; i++) {
                 var insn = instructions[i];
@@ -472,11 +475,13 @@ namespace ExceptionRewriter {
                     continue;
 
                 if (insn != result[0]) {
-                    remapTable[insn] = result[0];
+                    remapTableFirst[insn] = result[0];
                     instructions[i] = result[0];
                 }
                 for (int j = result.Length - 1; j >= 1; j--)
                     instructions.Insert(i + 1, result[j]);
+
+                remapTableLast[insn] = result[result.Length - 1];
 
                 lastIndex += (result.Length - 1);
                 i += (result.Length - 1);
@@ -488,18 +493,20 @@ namespace ExceptionRewriter {
                 if (operand == null)
                     continue;
                 Instruction newOperand;
-                if (!remapTable.TryGetValue(operand, out newOperand))
+                if (!remapTableFirst.TryGetValue(operand, out newOperand))
                     continue;
 
                 insn.Operand = newOperand;
             }
 
+            CleanMethodBody(method);
+
             foreach (var eh in method.Body.ExceptionHandlers) {
-                eh.FilterStart = PostFilterRange(remapTable, eh.FilterStart);
-                eh.TryStart = PostFilterRange(remapTable, eh.TryStart);
-                eh.TryEnd = PostFilterRange(remapTable, eh.TryEnd);
-                eh.HandlerStart = PostFilterRange(remapTable, eh.HandlerStart);
-                eh.HandlerEnd = PostFilterRange(remapTable, eh.HandlerEnd);
+                eh.FilterStart = PostFilterRange(remapTableFirst, eh.FilterStart);
+                eh.TryStart = PostFilterRange(remapTableFirst, eh.TryStart);
+                eh.TryEnd = PostFilterRange(remapTableFirst, eh.TryEnd);
+                eh.HandlerStart = PostFilterRange(remapTableFirst, eh.HandlerStart);
+                eh.HandlerEnd = PostFilterRange(remapTableFirst, eh.HandlerEnd);
             }
         }
 
@@ -548,7 +555,8 @@ namespace ExceptionRewriter {
 
             var newVariables = ExtractRangeToMethod(
                 method, catchMethod, 
-                handlerFirstIndex, handlerLastIndex,
+                insns.IndexOf(eh.HandlerStart), 
+                insns.IndexOf(eh.HandlerEnd) - 1,
                 true, 
                 (insn, operand) => {
                     throw new Exception();
@@ -610,28 +618,17 @@ namespace ExceptionRewriter {
 
             var filterReplacement = Instruction.Create(OpCodes.Ret);
 
-            int i1 = insns.IndexOf(eh.FilterStart), i2 = -1;
-            Instruction endfilter = null;
-
-            for (int i = i1; i < insns.Count; i++) {
-                var insn = insns[i];
-                if (insn.OpCode == OpCodes.Endfilter) {
-                    endfilter = insn;
-                    i2 = i;
-                    break;
-                }
-            }
-
             var excArg = new ParameterDefinition("exc", default(ParameterAttributes), method.Module.TypeSystem.Object);
             filterMethod.Parameters.Add(excArg);
+
+            int i1 = insns.IndexOf(eh.FilterStart), i2 = insns.IndexOf(eh.HandlerStart);
+            if (i2 < 0)
+                throw new Exception();
+            i2--;
 
             var newVariables = ExtractRangeToMethod(method, filterMethod, i1, i2, true);
 
             var filterInsns = filterMethod.Body.Instructions;
-            var oldInsn = eh.HandlerStart;
-            var oldStartIdx = insns.IndexOf(eh.HandlerStart);
-            insns[oldStartIdx] = Instruction.Create(OpCodes.Nop);
-            Patch(method, oldInsn, insns[oldStartIdx]);
 
             var oldFilterInsn = filterInsns[filterInsns.Count - 1];
             filterInsns[filterInsns.Count - 1] = filterReplacement;
@@ -664,7 +661,6 @@ namespace ExceptionRewriter {
             );
             ((TypeDefinition)closureType).Fields.Add(handler.FilterField);
             handler.FirstFilterInsn = eh.FilterStart;
-            handler.LastFilterInsn = endfilter;
 
             return handler;
         }
@@ -690,15 +686,16 @@ namespace ExceptionRewriter {
 
             CleanMethodBody(targetMethod);
 
+            var oldInsn = insns[firstIndex];
+            var newInsn = Instruction.Create(OpCodes.Nop);
+            insns[firstIndex] = newInsn;
+            // FIXME: This should not be necessary
+            Patch(sourceMethod, oldInsn, newInsn);
+
             if (deleteThem) {
-                for (int i = lastIndex; i >= firstIndex; i--)
+                for (int i = lastIndex; i > firstIndex; i--)
                     insns.RemoveAt(i);
                 CleanMethodBody(sourceMethod);
-            } else {
-                var oldInsn = insns[firstIndex];
-                insns[firstIndex] = Instruction.Create(OpCodes.Nop);
-                // FIXME: This should not be necessary
-                Patch(sourceMethod, oldInsn, insns[firstIndex]);
             }
 
             return variables;
@@ -744,7 +741,7 @@ namespace ExceptionRewriter {
             public FieldDefinition FilterField;
             public MethodDefinition Method, FilterMethod;
 
-            public Instruction FirstFilterInsn, LastFilterInsn;
+            public Instruction FirstFilterInsn;
             internal Instruction FirstPushInstruction;
         }
 

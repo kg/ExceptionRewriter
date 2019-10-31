@@ -51,8 +51,6 @@ namespace ExceptionRewriter {
             foreach (var eh in body.ExceptionHandlers) {
                 if (eh.FilterStart != null)
                     result.HasExceptionFilter = true;
-                else
-                    result.HasTryBlock = true;
             }
 
             // FIXME: Extract filter into method, extract referenced locals into a
@@ -67,7 +65,7 @@ namespace ExceptionRewriter {
             if (result.SuppressRewriting)
                 result.MayNeedRewriting = false;
             
-            Console.WriteLine($"{type.Name}::{method.Name} try={result.HasTryBlock} filter={result.HasExceptionFilter} rewrite={!result.SuppressRewriting} mayneedrewrite={result.MayNeedRewriting}");
+            Console.WriteLine($"{type.Name}::{method.Name} filter={result.HasExceptionFilter} rewrite={!result.SuppressRewriting} mayneedrewrite={result.MayNeedRewriting}");
             Methods.Add(method, result);
         }
 
@@ -84,7 +82,6 @@ namespace ExceptionRewriter {
         public Dictionary<ExceptionHandler, MethodDefinition> Filters = 
             new Dictionary<ExceptionHandler, MethodDefinition>();
 
-        public bool HasTryBlock;
         public bool HasExceptionFilter;
         public bool SuppressRewriting;
         public bool MayNeedRewriting;
