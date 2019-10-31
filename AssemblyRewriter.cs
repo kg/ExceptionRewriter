@@ -523,7 +523,7 @@ namespace ExceptionRewriter {
             );
             catchMethod.Body.InitLocals = true;
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
-            var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, method.Module.TypeSystem.Object);
+            var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, eh.CatchType ?? method.Module.TypeSystem.Object);
             // Exc goes first because catch blocks start with it on the stack and this makes it convenient to spam dup
             catchMethod.Parameters.Add(excParam);
             catchMethod.Parameters.Add(closureParam);
@@ -880,10 +880,14 @@ namespace ExceptionRewriter {
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                         handlerBody.Add(Instruction.Create(OpCodes.Isinst, h.Handler.CatchType));
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
+                        // If the isinst passed we need to cast the exception value to the appropriate type
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
+                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, h.Handler.CatchType));
+                    } else {
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                     }
 
                     // All the previous filtered/typed handlers failed so run the fallback
-                    handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                     handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                     handlerBody.Add(Instruction.Create(OpCodes.Call, h.Method));
                     handlerBody.Add(Instruction.Create(OpCodes.Brfalse, newHandlerEnd));
