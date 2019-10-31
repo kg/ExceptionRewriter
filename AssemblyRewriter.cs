@@ -848,14 +848,7 @@ namespace ExceptionRewriter {
 
                 var handlerBody = new List<Instruction> {
                     newHandlerStart,
-                    // Automatically execute active exception filters for this exception
-                    Instruction.Create(OpCodes.Stloc, excVar),
-                    Instruction.Create(OpCodes.Ldloc, excVar),
-                    Instruction.Create(OpCodes.Call, new MethodReference(
-                        "PerformEvaluate", method.Module.TypeSystem.Void, efilt
-                    ) { HasThis = false, Parameters = {
-                        new ParameterDefinition(method.Module.TypeSystem.Object)
-                    } })
+                    Instruction.Create(OpCodes.Stloc, excVar)
                 };
 
                 var breakOut = Instruction.Create(OpCodes.Nop);
@@ -869,9 +862,13 @@ namespace ExceptionRewriter {
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                         handlerBody.Add(Instruction.Create(OpCodes.Ldfld, ff));
                         handlerBody.Add(Instruction.Create(OpCodes.Castclass, efilt));
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldfld, new FieldReference(
-                            "Result", method.Module.TypeSystem.Int32, efilt
-                        )));
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
+                        var mref = new MethodReference(
+                            "ShouldRunHandler", method.Module.TypeSystem.Boolean, efilt
+                        ) { HasThis = true, Parameters = {
+                            new ParameterDefinition(method.Module.TypeSystem.Object)
+                        } };
+                        handlerBody.Add(Instruction.Create(OpCodes.Call, method.Module.ImportReference(mref)));
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
                     }
 

@@ -49,16 +49,13 @@ namespace Mono.Runtime.Internal {
         ///  should run.
         /// </summary>
         /// <param name="exc">The exception to pass to the filters</param>
-        /// <param name="filter">The exception filter for the current exception handler</param>
         /// <returns>true if this filter selected the exception handler to run</returns>
-        public static bool ShouldRunHandler (object exc, ExceptionFilter filter) {
+        public bool ShouldRunHandler (object exc) {
             if (exc == null)
                 throw new ArgumentNullException("exc");
-            if (filter == null)
-                throw new ArgumentNullException("filter");
 
             PerformEvaluate(exc);
-            return filter.Result == exception_execute_handler;
+            return Result == exception_execute_handler;
         }
 
         /// <summary>
