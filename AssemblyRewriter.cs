@@ -579,9 +579,11 @@ namespace ExceptionRewriter {
 
             method.DeclaringType.Methods.Add(catchMethod);
 
+            var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
             var handler = new ExcHandler {
                 Handler = eh,
-                Method = catchMethod
+                Method = catchMethod,
+                IsCatchAll = isCatchAll
             };
             group.Handlers.Add(handler);
             return handler;
@@ -736,6 +738,8 @@ namespace ExceptionRewriter {
         }
 
         public class ExcHandler {
+            public bool IsCatchAll;
+
             public ExceptionHandler Handler;
             public TypeDefinition FilterType;
             public FieldDefinition FilterField;
@@ -783,6 +787,8 @@ namespace ExceptionRewriter {
 
             foreach (var eg in newGroups) {
                 var finallyInsns = new List<Instruction>();
+
+                var hasAnyCatchAll = eg.Handlers.Any(h => h.IsCatchAll);
 
                 foreach (var h in eg.Handlers) {
                     var ff = h.FilterField;
@@ -841,7 +847,10 @@ namespace ExceptionRewriter {
 
                 var tryExit = insns[insns.IndexOf(eg.tryEnd) + 1];
                 var newHandlerStart = Instruction.Create(OpCodes.Nop);
-                var newHandlerEnd = Instruction.Create(OpCodes.Leave, tryExit);
+                Instruction newHandlerEnd, handlerFallthroughRethrow;
+                handlerFallthroughRethrow = hasAnyCatchAll ? Instruction.Create(OpCodes.Nop) : Instruction.Create(OpCodes.Rethrow);
+                newHandlerEnd = Instruction.Create(OpCodes.Leave, tryExit);
+
                 var newHandlerOffset = insns.IndexOf(eg.tryEnd);
                 if (newHandlerOffset < 0)
                     throw new Exception();
@@ -884,15 +893,16 @@ namespace ExceptionRewriter {
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                     }
 
-                    // All the previous filtered/typed handlers failed so run the fallback
+                    // Run the handler, then if it returns true, throw.
+                    // If it returned false, we leave the entire handler.
                     handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
                     handlerBody.Add(Instruction.Create(OpCodes.Call, h.Method));
                     handlerBody.Add(Instruction.Create(OpCodes.Brfalse, newHandlerEnd));
                     handlerBody.Add(Instruction.Create(OpCodes.Rethrow));
-
                     handlerBody.Add(skip);
                 }
 
+                handlerBody.Add(handlerFallthroughRethrow);
                 handlerBody.Add(newHandlerEnd);
 
                 InsertOps(insns, newHandlerOffset + 1, handlerBody.ToArray());
@@ -900,7 +910,15 @@ namespace ExceptionRewriter {
                 var originalExitPoint = insns[insns.IndexOf(newHandlerEnd) + 1];
                 Instruction handlerEnd;
 
-                var preFinallyBr = Instruction.Create(OpCodes.Leave, originalExitPoint);
+                Instruction preFinallyBr;
+                // If there was a catch-all block we can jump to the original exit point, because
+                //  the catch-all block handler would have returned 1 to trigger a rethrow - it didn't.
+                // If no catch-all block existed we need to rethrow at the end of our coalesced handler.
+                if (hasAnyCatchAll)
+                    preFinallyBr = Instruction.Create(OpCodes.Leave, originalExitPoint);
+                else
+                    preFinallyBr = Instruction.Create(OpCodes.Rethrow);
+
                 if (finallyInsns.Count > 0)
                     handlerEnd = preFinallyBr;
                 else
@@ -922,6 +940,8 @@ namespace ExceptionRewriter {
                     finallyInsns.Add(Instruction.Create(OpCodes.Endfinally));
 
                     var newLeave = Instruction.Create(OpCodes.Leave, originalExitPoint);
+                    if (!hasAnyCatchAll)
+                        newLeave = Instruction.Create(OpCodes.Rethrow);
                     var originalExitIndex = insns.IndexOf(originalExitPoint);
                     InsertOps(insns, originalExitIndex, finallyInsns.ToArray());
 

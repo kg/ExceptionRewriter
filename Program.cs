@@ -17,11 +17,7 @@ namespace ExceptionRewriter {
                 var assemblyResolver = new DefaultAssemblyResolver();
                 assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(argv[0]));
 
-                File.Delete(argv[1] + ".tmp");
-                File.Copy(argv[0], argv[1] + ".tmp", true);
-                // File.Copy(argv[0].Replace(".dll", ".pdb"), argv[1] + ".pdb", true);
-
-                using (var def = AssemblyDefinition.ReadAssembly(argv[1] + ".tmp", new ReaderParameters {
+                using (var def = AssemblyDefinition.ReadAssembly(argv[0], new ReaderParameters {
                     ReadWrite = true,
                     ReadingMode = ReadingMode.Immediate,
                     AssemblyResolver = assemblyResolver
@@ -34,13 +30,14 @@ namespace ExceptionRewriter {
                     var arw = new AssemblyRewriter(aa);
                     arw.Rewrite();
 
-                    def.Write();
+                    def.Write(argv[1] + ".tmp");
                 }
 
                 File.Copy(argv[1] + ".tmp", argv[1], true);
+                File.Delete(argv[1] + ".tmp");
 
-                Console.WriteLine("Not implemented");
-                return 2;
+                Console.WriteLine("Done");
+                return 0;
             } finally {
                 if (Debugger.IsAttached) {
                     Console.WriteLine("Press enter to exit");

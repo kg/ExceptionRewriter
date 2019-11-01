@@ -65,7 +65,7 @@ namespace ExceptionRewriter {
             if (result.SuppressRewriting)
                 result.MayNeedRewriting = false;
             
-            Console.WriteLine($"{type.Name}::{method.Name} filter={result.HasExceptionFilter} rewrite={!result.SuppressRewriting} mayneedrewrite={result.MayNeedRewriting}");
+            // Console.WriteLine($"{type.Name}::{method.Name} filter={result.HasExceptionFilter} rewrite={!result.SuppressRewriting} mayneedrewrite={result.MayNeedRewriting}");
             Methods.Add(method, result);
         }
 

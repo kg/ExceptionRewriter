@@ -55,7 +55,10 @@ namespace Mono.Runtime.Internal {
                 throw new ArgumentNullException("exc");
 
             PerformEvaluate(exc);
-            return Result == exception_execute_handler;
+
+            var result = Result == exception_execute_handler;
+            // Console.WriteLine($"ShouldRunHandler for {this.GetType().Name} == {result}");
+            return result;
         }
 
         /// <summary>
@@ -81,10 +84,15 @@ namespace Mono.Runtime.Internal {
 
             for (int i = ef.Count - 1; i >= 0; i--) {
                 var filter = ef[i];
-                if ((filter.Result = filter.Evaluate(exc)) == exception_execute_handler) {
-                    hasLocatedValidHandler = true;
-                    break;
+                if (hasLocatedValidHandler) {
+                    filter.Result = exception_continue_search;
+                    continue;
                 }
+
+                var result = filter.Evaluate(exc);
+                filter.Result = result;
+                if (result == exception_execute_handler)
+                    hasLocatedValidHandler = true;
             }
         }
     }
