@@ -1,9 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Threading;
 
 namespace Mono.Runtime.Internal {
     public abstract class ExceptionFilter {
+        private class HasFilterRunTable : Dictionary<ExceptionFilter, bool> {
+        }
+
         public static readonly int exception_continue_search = 0;
         public static readonly int exception_execute_handler = 1;
 
@@ -13,6 +17,12 @@ namespace Mono.Runtime.Internal {
             new ThreadLocal<List<ExceptionFilter>>(() => new List<ExceptionFilter>(128));
 
         private static object LastEvaluatedException = null;
+        private static readonly object FilterHasRunSentinel = new object();
+
+        private static readonly ThreadLocal<ConditionalWeakTable<object, HasFilterRunTable>> HasFilterRun =
+            new ThreadLocal<ConditionalWeakTable<object, HasFilterRunTable>>(
+                () => new ConditionalWeakTable<object, HasFilterRunTable>()
+            );
 
         public abstract int Evaluate (object exc);
 
@@ -29,18 +39,6 @@ namespace Mono.Runtime.Internal {
             ef.RemoveAt(ef.Count - 1);
             if (current != filter)
                 throw new ThreadStateException("Corrupt exception filter stack");
-        }
-
-        /// <summary>
-        /// Resets the state of all valid exception filters so that we can handle any
-        ///  new exceptions. This is invoked when a filtered block finally processes an
-        ///  exception.
-        /// </summary>
-        public static void Reset () {
-            LastEvaluatedException = null;
-            var ef = ExceptionFilters.Value;
-            foreach (var filter in ef)
-                filter.Result = exception_continue_search;
         }
 
         /// <summary>
@@ -82,6 +80,13 @@ namespace Mono.Runtime.Internal {
             //  in multiple stack frames while unwinding even though filters have already run.
             LastEvaluatedException = exc;
 
+            var hfrByException = HasFilterRun.Value;
+            HasFilterRunTable hfrt;
+            if (!hfrByException.TryGetValue(exc, out hfrt)) {
+                hfrt = new HasFilterRunTable();
+                hfrByException.Add(exc, hfrt);
+            }
+
             for (int i = ef.Count - 1; i >= 0; i--) {
                 var filter = ef[i];
                 if (hasLocatedValidHandler) {
@@ -89,7 +94,13 @@ namespace Mono.Runtime.Internal {
                     continue;
                 }
 
+                if (hfrt.ContainsKey(filter)) {
+                    // Console.WriteLine($"Skipping filter {filter} because it already ran for exc {exc}");
+                    continue;
+                }
+
                 var result = filter.Evaluate(exc);
+                hfrt[filter] = result == exception_execute_handler;
                 filter.Result = result;
                 if (result == exception_execute_handler)
                     hasLocatedValidHandler = true;

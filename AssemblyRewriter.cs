@@ -934,9 +934,6 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Add(newEh);
 
                 if (finallyInsns.Count > 0) {
-                    finallyInsns.Insert(0, Instruction.Create(OpCodes.Call, new MethodReference(
-                        "Reset", method.Module.TypeSystem.Void, efilt
-                    ) { HasThis = false }));
                     finallyInsns.Add(Instruction.Create(OpCodes.Endfinally));
 
                     var newLeave = Instruction.Create(OpCodes.Leave, originalExitPoint);
