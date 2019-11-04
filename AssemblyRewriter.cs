@@ -341,7 +341,11 @@ namespace ExceptionRewriter {
             return ctorMethod;
         }
 
-        private VariableDefinition ConvertToClosure (MethodDefinition method, out TypeDefinition closureType) {
+        private VariableDefinition ConvertToClosure (
+            MethodDefinition method, HashSet<VariableDefinition> variables, 
+            HashSet<ParameterDefinition> parameters, out TypeDefinition closureType
+        ) {
+
             var insns = method.Body.Instructions;
             closureType = new TypeDefinition(
                 method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString("X4"),
@@ -357,7 +361,7 @@ namespace ExceptionRewriter {
             var localCount = 0;
             var closureVar = new VariableDefinition(closureType);
 
-            var extractedVariables = method.Body.Variables.ToDictionary(
+            var extractedVariables = variables.ToDictionary(
                 v => (object)v, 
                 v => new FieldDefinition("local" + localCount++, FieldAttributes.Public, v.VariableType)
             );
@@ -366,6 +370,9 @@ namespace ExceptionRewriter {
 
             for (int i = 0; i < method.Parameters.Count; i++) {
                 var p = method.Parameters[i];
+                if (!parameters.Contains(p))
+                    continue;
+
                 var name = (p.Name != null) ? "arg_" + p.Name : "arg" + i;
                 extractedVariables[p] = new FieldDefinition(name, FieldAttributes.Public, p.ParameterType);
             }
@@ -391,7 +398,9 @@ namespace ExceptionRewriter {
                     if ((variable == null) && (arg == null))
                         return null;
 
-                    var matchingField = extractedVariables[(object)variable ?? arg];
+                    FieldDefinition matchingField;
+                    if (!extractedVariables.TryGetValue((object)variable ?? arg, out matchingField))
+                        return null;
 
                     if (IsStoreOperation(insn.OpCode.Code)) {
                         // HACK: Because we have no way to swap values on the stack, we have to keep the
@@ -766,7 +775,12 @@ namespace ExceptionRewriter {
             var efilt = GetExceptionFilter(method.Module);
             var excType = GetException(method.Module);
             TypeDefinition closureType;
-            var closure = ConvertToClosure(method, out closureType);
+
+            var referencedVariables = new HashSet<VariableDefinition>();
+            var referencedArguments = new HashSet<ParameterDefinition>();
+            CollectReferencedLocals(method, referencedVariables, referencedArguments);
+
+            var closure = ConvertToClosure(method, referencedVariables, referencedArguments, out closureType);
 
             var excVar = new VariableDefinition(method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
@@ -972,6 +986,10 @@ namespace ExceptionRewriter {
 
                 CleanMethodBody(method);
             }
+        }
+
+        private void CollectReferencedLocals (MethodDefinition method, HashSet<VariableDefinition> referencedVariables, HashSet<ParameterDefinition> referencedArguments) {
+            throw new NotImplementedException();
         }
 
         private void CleanMethodBody (MethodDefinition method) {
