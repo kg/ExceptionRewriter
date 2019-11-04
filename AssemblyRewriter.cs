@@ -24,6 +24,8 @@ namespace ExceptionRewriter {
             foreach (var n in typeof(Code).GetEnumNames()) {
                 if (!n.EndsWith("_S"))
                     continue;
+                if (n.StartsWith("Ld") || n.StartsWith("St"))
+                    continue;
 
                 var full = n.Replace("_S", "");
                 var m = tOpcodes.GetField(full);
@@ -72,8 +74,17 @@ namespace ExceptionRewriter {
             return null;
         }
 
-        private TypeReference GetExceptionFilter (ModuleDefinition module) {
-            return ImportReferencedType(module, "ExceptionFilterSupport", "Mono.Runtime.Internal", "ExceptionFilter");
+        private TypeReference GetExceptionFilter (ModuleDefinition module, bool autoAddReference = true) {
+            var result = ImportReferencedType(module, "ExceptionFilterSupport", "Mono.Runtime.Internal", "ExceptionFilter");
+            if (result == null) {
+                if (!autoAddReference)
+                    throw new Exception("ExceptionFilterSupport is not referenced");
+
+                var anr = new AssemblyNameReference("ExceptionFilterSupport", new Version(1, 0, 0, 0));
+                module.AssemblyReferences.Add(anr);
+                return GetExceptionFilter(module, false);
+            }
+            return result;
         }
 
         private TypeReference GetException (ModuleDefinition module) {
