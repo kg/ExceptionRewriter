@@ -5,6 +5,7 @@ using System.Linq;
 using System.Text;
 using Mono.Cecil;
 using Mono.Cecil.Cil;
+using Mono.Collections.Generic;
 
 namespace ExceptionRewriter {
     public class AssemblyRewriter {
@@ -342,10 +343,9 @@ namespace ExceptionRewriter {
         }
 
         private VariableDefinition ConvertToClosure (
-            MethodDefinition method, HashSet<VariableDefinition> variables, 
-            HashSet<ParameterDefinition> parameters, out TypeDefinition closureType
+            MethodDefinition method, ParameterDefinition fakeThis, HashSet<VariableReference> variables, 
+            HashSet<ParameterReference> parameters, out TypeDefinition closureType
         ) {
-
             var insns = method.Body.Instructions;
             closureType = new TypeDefinition(
                 method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString("X4"),
@@ -377,7 +377,6 @@ namespace ExceptionRewriter {
                 extractedVariables[p] = new FieldDefinition(name, FieldAttributes.Public, p.ParameterType);
             }
 
-            var fakeThis = new ParameterDefinition("__this", ParameterAttributes.None, method.DeclaringType);
             if (!isStatic)
                 extractedVariables[fakeThis] = new FieldDefinition("__this", FieldAttributes.Public, method.DeclaringType);
 
@@ -399,7 +398,8 @@ namespace ExceptionRewriter {
                         return null;
 
                     FieldDefinition matchingField;
-                    if (!extractedVariables.TryGetValue((object)variable ?? arg, out matchingField))
+                    var lookupKey = (object)variable ?? arg;
+                    if (!extractedVariables.TryGetValue(lookupKey, out matchingField))
                         return null;
 
                     if (IsStoreOperation(insn.OpCode.Code)) {
@@ -447,6 +447,9 @@ namespace ExceptionRewriter {
             }
 
             foreach (var p in method.Parameters) {
+                if (!parameters.Contains(p))
+                    continue;
+
                 toInject.AddRange(new[] {
                     Instruction.Create(OpCodes.Ldloc, closureVar),
                     Instruction.Create(OpCodes.Ldarg, p),
@@ -776,11 +779,13 @@ namespace ExceptionRewriter {
             var excType = GetException(method.Module);
             TypeDefinition closureType;
 
-            var referencedVariables = new HashSet<VariableDefinition>();
-            var referencedArguments = new HashSet<ParameterDefinition>();
-            CollectReferencedLocals(method, referencedVariables, referencedArguments);
+            var fakeThis = new ParameterDefinition("__this", ParameterAttributes.None, method.DeclaringType);
 
-            var closure = ConvertToClosure(method, referencedVariables, referencedArguments, out closureType);
+            var referencedVariables = new HashSet<VariableReference>();
+            var referencedArguments = new HashSet<ParameterReference>();
+            CollectReferencedLocals(method, method.IsStatic ? null : fakeThis, referencedVariables, referencedArguments);
+
+            var closure = ConvertToClosure(method, fakeThis, referencedVariables, referencedArguments, out closureType);
 
             var excVar = new VariableDefinition(method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
@@ -988,8 +993,38 @@ namespace ExceptionRewriter {
             }
         }
 
-        private void CollectReferencedLocals (MethodDefinition method, HashSet<VariableDefinition> referencedVariables, HashSet<ParameterDefinition> referencedArguments) {
-            throw new NotImplementedException();
+        private void CollectReferencedLocals (MethodDefinition method, ParameterDefinition fakeThis, HashSet<VariableReference> referencedVariables, HashSet<ParameterReference> referencedArguments) {
+            foreach (var eh in method.Body.ExceptionHandlers) {
+                if (eh.FilterStart != null)
+                    CollectReferencedLocals(method, fakeThis, eh.FilterStart, eh.HandlerStart, referencedVariables, referencedArguments);
+                if (eh.HandlerStart != null)
+                    CollectReferencedLocals(method, fakeThis, eh.HandlerStart, eh.HandlerEnd, referencedVariables, referencedArguments);
+            }
+
+            ;
+        }
+
+        private void CollectReferencedLocals (
+            MethodDefinition method, ParameterDefinition fakeThis, Instruction first, Instruction last, 
+            HashSet<VariableReference> referencedVariables, HashSet<ParameterReference> referencedArguments
+        ) {
+            var insns = method.Body.Instructions;
+            int i = insns.IndexOf(first), i2 = insns.IndexOf(last);
+            if ((i < 0) || (i2 < 0))
+                throw new ArgumentException();
+
+            for (; i <= i2; i++) {
+                var insn = insns[i];
+                var vd = (insn.Operand as VariableReference) 
+                    ?? LookupNumberedVariable(insn.OpCode.Code, method.Body.Variables); 
+                var pd = insn.Operand as ParameterReference
+                    ?? LookupNumberedArgument(insn.OpCode.Code, fakeThis, method.Parameters);
+
+                if (vd != null)
+                    referencedVariables.Add(vd);
+                if (pd != null)
+                    referencedArguments.Add(pd);
+            }
         }
 
         private void CleanMethodBody (MethodDefinition method) {
@@ -1014,8 +1049,8 @@ namespace ExceptionRewriter {
 
         private bool TryRemapInstruction (
             Instruction old,
-            Mono.Collections.Generic.Collection<Instruction> oldBody, 
-            Mono.Collections.Generic.Collection<Instruction> newBody,
+            Collection<Instruction> oldBody, 
+            Collection<Instruction> newBody,
             int offset,
             out Instruction result
         ) {
@@ -1034,8 +1069,8 @@ namespace ExceptionRewriter {
 
         private Instruction RemapInstruction (
             Instruction old,
-            Mono.Collections.Generic.Collection<Instruction> oldBody, 
-            Mono.Collections.Generic.Collection<Instruction> newBody,
+            Collection<Instruction> oldBody, 
+            Collection<Instruction> newBody,
             int offset = 0
         ) {
             Instruction result;
