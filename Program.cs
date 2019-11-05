@@ -9,32 +9,39 @@ namespace ExceptionRewriter {
         public static int Main (string[] args) {
             try {
                 var argv = args.ToList();
-                if (argv.Count != 2) {
+                if (argv.Count < 2) {
                     Usage();
                     return 1;
                 }
 
-                var assemblyResolver = new DefaultAssemblyResolver();
-                assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(argv[0]));
+                for (int i = 0; i < args.Length; i += 2) {
+                    var src = args[i];
+                    var dst = args[i + 1];
 
-                using (var def = AssemblyDefinition.ReadAssembly(argv[0], new ReaderParameters {
-                    ReadWrite = true,
-                    ReadingMode = ReadingMode.Immediate,
-                    AssemblyResolver = assemblyResolver
-                })) {
-                    var aa = new AssemblyAnalyzer(def);
-                    aa.Analyze();
+                    Console.WriteLine($"{Path.GetFileName(src)} -> {Path.GetFileName(dst)}...");
 
-                    Console.WriteLine("====");
+                    var assemblyResolver = new DefaultAssemblyResolver();
+                    assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(src));
 
-                    var arw = new AssemblyRewriter(aa);
-                    arw.Rewrite();
+                    using (var def = AssemblyDefinition.ReadAssembly(src, new ReaderParameters {
+                        ReadWrite = true,
+                        ReadingMode = ReadingMode.Immediate,
+                        AssemblyResolver = assemblyResolver
+                    })) {
+                        var aa = new AssemblyAnalyzer(def);
+                        aa.Analyze();
 
-                    def.Write(argv[1] + ".tmp");
+                        Console.WriteLine("====");
+
+                        var arw = new AssemblyRewriter(aa);
+                        arw.Rewrite();
+
+                        def.Write(dst + ".tmp");
+                    }
+
+                    File.Copy(dst + ".tmp", dst, true);
+                    File.Delete(dst + ".tmp");
                 }
-
-                File.Copy(argv[1] + ".tmp", argv[1], true);
-                File.Delete(argv[1] + ".tmp");
 
                 Console.WriteLine("Done");
                 return 0;
@@ -47,7 +54,7 @@ namespace ExceptionRewriter {
         }
 
         static void Usage () {
-            Console.WriteLine("Expected: exceptionrewriter [input] [output]");
+            Console.WriteLine("Expected: exceptionrewriter [input] [output] ...");
         }
     }
 }

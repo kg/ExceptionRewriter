@@ -997,8 +997,10 @@ namespace ExceptionRewriter {
             foreach (var eh in method.Body.ExceptionHandlers) {
                 if (eh.FilterStart != null)
                     CollectReferencedLocals(method, fakeThis, eh.FilterStart, eh.HandlerStart, referencedVariables, referencedArguments);
+                /*
                 if (eh.HandlerStart != null)
                     CollectReferencedLocals(method, fakeThis, eh.HandlerStart, eh.HandlerEnd, referencedVariables, referencedArguments);
+                */
             }
 
             ;

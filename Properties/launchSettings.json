@@ -2,7 +2,7 @@
   "profiles": {
     "ExceptionRewriter": {
       "commandName": "Project",
-      "commandLineArgs": "\"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Debug\\NetFramework.exe\" C:\\Users\\Katelyn\\Desktop\\rewritten.exe"
+      "commandLineArgs": "\"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Debug\\NetFramework.exe\" \"C:\\Users\\Katelyn\\Desktop\\rewritten.exe\" \"C:\\Users\\Katelyn\\Desktop\\blazor-test\\bin\\Debug\\netstandard2.1\\System.Text.Json.dll\" \"C:\\Users\\Katelyn\\Desktop\\blazor-test\\bin\\Debug\\netstandard2.1\\System.Text.Json.rewritten.dll\""
     }
   }
 }
