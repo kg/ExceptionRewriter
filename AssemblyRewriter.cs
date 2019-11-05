@@ -547,7 +547,16 @@ namespace ExceptionRewriter {
             catchMethod.Body.InitLocals = true;
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
             var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, eh.CatchType ?? method.Module.TypeSystem.Object);
-            // Exc goes first because catch blocks start with it on the stack and this makes it convenient to spam dup
+            var paramMapping = new Dictionary<ParameterReference, ParameterDefinition>();
+            foreach (var p in method.Parameters) {
+                var newParamType =
+                    p.ParameterType.IsByReference
+                        ? p.ParameterType
+                        : new ByReferenceType(p.ParameterType);
+                var newParam = new ParameterDefinition(p.Name, p.Attributes, newParamType);
+                catchMethod.Parameters.Add(newParam);
+                paramMapping[p] = newParam;
+            }
             catchMethod.Parameters.Add(excParam);
             catchMethod.Parameters.Add(closureParam);
 
@@ -570,20 +579,19 @@ namespace ExceptionRewriter {
                                 Instruction.Create(OpCodes.Ldc_I4_1),
                                 Instruction.Create(OpCodes.Ret)
                             };
+                        case Code.Ldarg:
                         default:
                             return null;
                     }
                 }
             );
 
-            var newVariables = ExtractRangeToMethod(
+            var (newVariables, newParameters) = ExtractRangeToMethod(
                 method, catchMethod, 
                 insns.IndexOf(eh.HandlerStart), 
                 insns.IndexOf(eh.HandlerEnd) - 1,
-                true, 
-                (insn, operand) => {
-                    throw new Exception();
-                }
+                deleteThem: true,
+                parameters: paramMapping
             );
 
             var first = catchInsns[0];
@@ -690,23 +698,37 @@ namespace ExceptionRewriter {
             return handler;
         }
 
-        private Dictionary<VariableDefinition, VariableDefinition> ExtractRangeToMethod (
+        private (
+            Dictionary<VariableReference, VariableDefinition> variables,
+            Dictionary<ParameterReference, ParameterDefinition> parameters
+        ) ExtractRangeToMethod (
             MethodDefinition sourceMethod, MethodDefinition targetMethod, 
             int firstIndex, int lastIndex, bool deleteThem,
-            Func<Instruction, Instruction, Instruction> onFailedRemap = null
+            Func<Instruction, Instruction, Instruction> onFailedRemap = null,
+            Dictionary<ParameterReference, ParameterDefinition> parameters = null
         ) {
             var insns = sourceMethod.Body.Instructions;
             var targetInsns = targetMethod.Body.Instructions;
 
-            var variables = new Dictionary<VariableDefinition, VariableDefinition>();
+            var variables = new Dictionary<VariableReference, VariableDefinition>();
+
             foreach (var loc in sourceMethod.Body.Variables) {
                 var newLoc = new VariableDefinition(loc.VariableType);
                 targetMethod.Body.Variables.Add(newLoc);
                 variables[loc] = newLoc;
             }
 
+            if (parameters == null) {
+                parameters = new Dictionary<ParameterReference, ParameterDefinition>();
+                foreach (var param in sourceMethod.Parameters) {
+                    var newParam = new ParameterDefinition(param.Name, param.Attributes, param.ParameterType);
+                    targetMethod.Parameters.Add(param);
+                    parameters[param] = newParam;
+                }
+            }
+
             CloneInstructions(
-                insns, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, variables, onFailedRemap
+                insns, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, variables, parameters, onFailedRemap
             );
 
             CleanMethodBody(targetMethod);
@@ -723,7 +745,7 @@ namespace ExceptionRewriter {
                 CleanMethodBody(sourceMethod);
             }
 
-            return variables;
+            return (variables, parameters);
         }
 
         private void RemoveRange (
@@ -911,17 +933,27 @@ namespace ExceptionRewriter {
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
                     }
 
-                    if ((h.Handler.CatchType != null) && (h.Handler.CatchType.FullName != "System.Object")) {
+                    var needsTypeCheck = (h.Handler.CatchType != null) && (h.Handler.CatchType.FullName != "System.Object");
+                    if (needsTypeCheck) {
                         // If the handler has a type check do an isinst to check whether it should run
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                         handlerBody.Add(Instruction.Create(OpCodes.Isinst, h.Handler.CatchType));
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
-                        // If the isinst passed we need to cast the exception value to the appropriate type
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
-                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, h.Handler.CatchType));
-                    } else {
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                     }
+
+                    // Load all the parameters so we can pass them to the catch.
+                    foreach (var p in method.Parameters) {
+                        // If the parameter was not already a ref, we converted it to one.
+                        if (p.ParameterType.IsByReference)
+                            handlerBody.Add(Instruction.Create(OpCodes.Ldarg, p));
+                        else
+                            handlerBody.Add(Instruction.Create(OpCodes.Ldarga, p));
+                    }
+                    // Now load the exception
+                    handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
+                    // If the isinst passed we need to cast the exception value to the appropriate type
+                    if (needsTypeCheck)
+                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, h.Handler.CatchType));
 
                     // Run the handler, then if it returns true, throw.
                     // If it returned false, we leave the entire handler.
@@ -1082,7 +1114,11 @@ namespace ExceptionRewriter {
             return result;
         }
 
-        private Instruction CloneInstruction (Instruction i, Dictionary<VariableDefinition, VariableDefinition> variables) {
+        private Instruction CloneInstruction (
+            Instruction i, 
+            Dictionary<VariableReference, VariableDefinition> variables,
+            Dictionary<ParameterReference, ParameterDefinition> parameters
+        ) {
             object operand = i.Operand;
             if (operand == null)
                 return Instruction.Create(i.OpCode);
@@ -1105,11 +1141,16 @@ namespace ExceptionRewriter {
             } else if (operand is string) {
                 var s = operand as string;
                 return Instruction.Create(i.OpCode, s);
-            } else if (operand is VariableDefinition) {
-                var v = operand as VariableDefinition;
+            } else if (operand is VariableReference) {
+                var v = operand as VariableReference;
                 if (variables != null)
                     v = variables[v];
-                return Instruction.Create(i.OpCode, v);
+                return Instruction.Create(i.OpCode, (VariableDefinition)v);
+            } else if (operand is ParameterDefinition) {
+                var p = operand as ParameterDefinition;
+                if (parameters != null)
+                    p = parameters[p];
+                return Instruction.Create(i.OpCode, p);
             } else {
                 throw new NotImplementedException(i.OpCode.ToString());
             }
@@ -1120,7 +1161,8 @@ namespace ExceptionRewriter {
             int sourceIndex, int count,
             Mono.Collections.Generic.Collection<Instruction> target,
             int targetIndex,
-            Dictionary<VariableDefinition, VariableDefinition> variables = null,
+            Dictionary<VariableReference, VariableDefinition> variables = null,
+            Dictionary<ParameterReference, ParameterDefinition> parameters = null,
             Func<Instruction, Instruction, Instruction> onFailedRemap = null
         ) {
             if (sourceIndex < 0)
@@ -1128,7 +1170,7 @@ namespace ExceptionRewriter {
 
             for (int n = 0; n < count; n++) {
                 var i = source[n + sourceIndex];
-                var newInsn = CloneInstruction(i, variables);
+                var newInsn = CloneInstruction(i, variables, parameters);
                 target.Add(i);
             }
 
