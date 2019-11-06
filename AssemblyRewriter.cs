@@ -323,7 +323,7 @@ namespace ExceptionRewriter {
         ) {
             var insns = method.Body.Instructions;
             closureType = new TypeDefinition(
-                method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString("X4"),
+                method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString(),
                 TypeAttributes.Class | TypeAttributes.NestedPrivate
             );
             closureType.BaseType = method.Module.TypeSystem.Object;
@@ -520,7 +520,7 @@ namespace ExceptionRewriter {
                     vr.VariableType.IsByReference
                         ? vr.VariableType
                         : new ByReferenceType(vr.VariableType);
-                var newParam = new ParameterDefinition("loc_" + i++.ToString("X4"), ParameterAttributes.None, newParamType);
+                var newParam = new ParameterDefinition("loc_" + i++.ToString(), ParameterAttributes.None, newParamType);
                 newMethod.Parameters.Add(newParam);
                 mapping[vr] = newParam;
                 if (newParamType != vr.VariableType)
@@ -566,7 +566,7 @@ namespace ExceptionRewriter {
             var paramMapping = new Dictionary<object, object>();
             var closureVariable = new VariableDefinition(closureType);
             var needsLdind = new HashSet<object>();
-            paramMapping[closureParam] = closureVariable;
+            paramMapping[closure] = closureParam;
             GenerateParameters(catchMethod, catchReferencedArguments, paramMapping, needsLdind);
             GenerateParameters(catchMethod, catchReferencedVariables, paramMapping, needsLdind);
             catchMethod.Parameters.Add(excParam);
@@ -739,7 +739,7 @@ namespace ExceptionRewriter {
             var closureType = closure.VariableType;
             var filterIndex = FilterIndex++;
             var filterType = new TypeDefinition(
-                method.DeclaringType.Namespace, method.Name + "__filter" + filterIndex.ToString("X4"),
+                method.DeclaringType.Namespace, method.Name + "__filter" + filterIndex.ToString(),
                 TypeAttributes.NestedPublic | TypeAttributes.Class,
                 GetExceptionFilter(method.Module)
             );
@@ -771,7 +771,11 @@ namespace ExceptionRewriter {
                 throw new Exception();
             i2--;
 
-            var newVariables = ExtractRangeToMethod(method, filterMethod, fakeThis, i1, i2, true);
+            var mapping = new Dictionary<object, object> {
+                // FIXME
+                // {closure, closureField }
+            };
+            var newVariables = ExtractRangeToMethod(method, filterMethod, fakeThis, i1, i2, true, mapping);
 
             var filterInsns = filterMethod.Body.Instructions;
 
@@ -801,7 +805,7 @@ namespace ExceptionRewriter {
             handler.FilterMethod = filterMethod;
             handler.FilterType = filterType;
             handler.FilterField = new FieldDefinition(
-                "__filter" + filterIndex.ToString("X4"), 
+                "__filter" + filterIndex.ToString(), 
                 FieldAttributes.Public, filterType
             );
             ((TypeDefinition)closureType).Fields.Add(handler.FilterField);
@@ -814,26 +818,18 @@ namespace ExceptionRewriter {
             MethodDefinition sourceMethod, MethodDefinition targetMethod, 
             ParameterDefinition fakeThis,
             int firstIndex, int lastIndex, bool deleteThem,
-            Func<Instruction, Instruction, Instruction> onFailedRemap = null,
-            Dictionary<object, object> mapping = null
+            Dictionary<object, object> mapping,
+            Func<Instruction, Instruction, Instruction> onFailedRemap = null
         ) {
             var insns = sourceMethod.Body.Instructions;
             var targetInsns = targetMethod.Body.Instructions;
 
-            if (mapping == null) {
-                mapping = new Dictionary<object, object>();
-
-                foreach (var loc in sourceMethod.Body.Variables) {
-                    var newLoc = new VariableDefinition(loc.VariableType);
-                    targetMethod.Body.Variables.Add(newLoc);
-                    mapping[loc] = newLoc;
-                }
-
-                foreach (var param in sourceMethod.Parameters) {
-                    var newParam = new ParameterDefinition(param.Name, param.Attributes, param.ParameterType);
-                    targetMethod.Parameters.Add(newParam);
-                    mapping[param] = newParam;
-                }
+            foreach (var loc in sourceMethod.Body.Variables) {
+                if (mapping.ContainsKey(loc))
+                    continue;
+                var newLoc = new VariableDefinition(loc.VariableType);
+                targetMethod.Body.Variables.Add(newLoc);
+                mapping[loc] = newLoc;
             }
 
             CloneInstructions(
