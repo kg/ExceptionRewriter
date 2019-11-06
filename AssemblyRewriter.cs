@@ -28,6 +28,11 @@ namespace ExceptionRewriter {
             {Code.Stloc_1, OpCodes.Stloc },
             {Code.Stloc_2, OpCodes.Stloc },
             {Code.Stloc_3, OpCodes.Stloc },
+            {Code.Ldarg_S, OpCodes.Ldarg },
+            {Code.Ldarga_S, OpCodes.Ldarga },
+            {Code.Starg_S, OpCodes.Starg },
+            {Code.Ldloc_S, OpCodes.Ldloc },
+            {Code.Ldloca_S, OpCodes.Ldloca }
         };
         private readonly Dictionary<Code, OpCode> LocalParameterRemappings = new Dictionary<Code, OpCode> {
             {Code.Ldloc, OpCodes.Ldarg },
@@ -165,7 +170,7 @@ namespace ExceptionRewriter {
                     if (!tempLocals.TryGetValue(t, out tempLocal)) {
                         tempLocals[t] = tempLocal = new VariableDefinition(t);
                         return new[] {
-                            Instruction.Create(OpCodes.Ldloca_S, tempLocal),
+                            Instruction.Create(OpCodes.Ldloca, tempLocal),
                             Instruction.Create(OpCodes.Initobj, t),
                             Instruction.Create(OpCodes.Ldloc, tempLocal)
                         };
@@ -513,7 +518,7 @@ namespace ExceptionRewriter {
                     vr.VariableType.IsByReference
                         ? vr.VariableType
                         : new ByReferenceType(vr.VariableType);
-                var newParam = new ParameterDefinition("loc" + i++.ToString("X4"), ParameterAttributes.None, newParamType);
+                var newParam = new ParameterDefinition("loc_" + i++.ToString("X4"), ParameterAttributes.None, newParamType);
                 newMethod.Parameters.Add(newParam);
                 mapping[vr] = newParam;
                 if (newParamType != vr.VariableType)
@@ -530,7 +535,7 @@ namespace ExceptionRewriter {
                     pr.ParameterType.IsByReference
                         ? pr.ParameterType
                         : new ByReferenceType(pr.ParameterType);
-                var newParam = new ParameterDefinition(pr.Name, ParameterAttributes.None, newParamType);
+                var newParam = new ParameterDefinition("arg_" + pr.Name, ParameterAttributes.None, newParamType);
                 newMethod.Parameters.Add(newParam);
                 mapping[pr] = newParam;
                 if (newParamType != pr.ParameterType)
@@ -638,6 +643,8 @@ namespace ExceptionRewriter {
                 } else
                     return null;
             });
+
+            CleanMethodBody(catchMethod);
 
             method.DeclaringType.Methods.Add(catchMethod);
 
@@ -1173,11 +1180,19 @@ namespace ExceptionRewriter {
                 else
                     continue;
 
-                if (i.Operand is Instruction) {
-                    if (insns.IndexOf((Instruction)i.Operand) < 0)
+                var opInsn = i.Operand as Instruction;
+                var opArg = i.Operand as ParameterDefinition;
+                var opVar = i.Operand as VariableDefinition;
+
+                if (opInsn != null)
+                    if (insns.IndexOf(opInsn) < 0)
                         throw new Exception($"Branch target {i.Operand} of opcode {i} is missing");
-                } else
-                    throw new Exception();
+                else if (opArg != null)
+                    if (method.Parameters.IndexOf(opArg) < 0)
+                        throw new Exception($"Parameter {opArg.Name} for opcode {i} is missing");
+                else if (opVar != null)
+                    if (method.Body.Variables.IndexOf(opVar) < 0)
+                        throw new Exception($"Local {opVar} for opcode {i} is missing");
             }
 
             foreach (var i in insns)
