@@ -1140,6 +1140,14 @@ namespace ExceptionRewriter {
                 }
 
                 CleanMethodBody(method, null);
+                foreach (var g in newGroups) {
+                    foreach (var h in g.Handlers) {
+                        if (h.FilterMethod != null)
+                            CleanMethodBody(h.FilterMethod, method);
+                        if (h.Method != null)
+                            CleanMethodBody(h.Method, method);
+                    }
+                }
             }
         }
 
@@ -1164,6 +1172,12 @@ namespace ExceptionRewriter {
                     ?? LookupNumberedVariable(insn.OpCode.Code, method.Body.Variables); 
                 var pd = insn.Operand as ParameterReference
                     ?? LookupNumberedArgument(insn.OpCode.Code, fakeThis, method.Parameters);
+
+                // FIXME
+                if (vd?.VariableType.FullName.Contains("__closure") ?? false)
+                    continue;
+                if (pd?.Name.Contains("__closure") ?? false)
+                    continue;
 
                 if (vd != null)
                     referencedVariables.Add(vd);
@@ -1208,6 +1222,14 @@ namespace ExceptionRewriter {
 
             foreach (var i in insns)
                 i.Offset = insns.IndexOf(i);
+
+            foreach (var p in method.Parameters)
+                if (p.Index != method.Parameters.IndexOf(p))
+                    throw new Exception("parameter index mismatch");
+
+            foreach (var v in method.Body.Variables)
+                if (v.Index != method.Body.Variables.IndexOf(v))
+                    throw new Exception("variable index mismatch");
         }
 
         private bool TryRemapInstruction (
@@ -1305,14 +1327,14 @@ namespace ExceptionRewriter {
                 return Instruction.Create(code, s);
             } else if (operand is VariableReference) {
                 var v = operand as VariableReference;
-                var newOperand = (mapping != null) ? mapping[v] : v;
+                var newOperand = (mapping != null) && mapping.ContainsKey(v) ? mapping[v] : v;
                 if (newOperand.GetType() != v.GetType())
                     return CreateRemappedInstruction(operand, code, newOperand);
                 else
                     return Instruction.Create(code, (VariableDefinition)v);
             } else if (operand is ParameterDefinition) {
                 var p = operand as ParameterDefinition;
-                var newOperand = (mapping != null) ? mapping[p] : p;
+                var newOperand = (mapping != null) && mapping.ContainsKey(p) ? mapping[p] : p;
                 if (newOperand.GetType() != p.GetType())
                     return CreateRemappedInstruction(operand, code, newOperand);
                 else
