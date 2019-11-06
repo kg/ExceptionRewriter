@@ -507,12 +507,13 @@ namespace ExceptionRewriter {
             MethodDefinition newMethod, HashSet<VariableReference> variables, 
             Dictionary<object, object> mapping, HashSet<object> needsLdind
         ) {
+            int i = 0;
             foreach (var vr in variables) {
                 var newParamType =
                     vr.VariableType.IsByReference
                         ? vr.VariableType
                         : new ByReferenceType(vr.VariableType);
-                var newParam = new ParameterDefinition(newParamType);
+                var newParam = new ParameterDefinition("loc" + i++.ToString("X4"), ParameterAttributes.None, newParamType);
                 newMethod.Parameters.Add(newParam);
                 mapping[vr] = newParam;
                 if (newParamType != vr.VariableType)
@@ -1040,14 +1041,21 @@ namespace ExceptionRewriter {
                         handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
                     }
 
-                    // Load all the parameters so we can pass them to the catch.
-                    foreach (var p in method.Parameters) {
-                        // If the parameter was not already a ref, we converted it to one.
-                        if (p.ParameterType.IsByReference)
-                            handlerBody.Add(Instruction.Create(OpCodes.Ldarg, p));
+                    // Load anything the catch referenced onto the stack. If it wasn't a byref type,
+                    //  we need to load its address because we convert all referenced values into refs
+                    //  (so that the catch can modify them)
+                    foreach (var a in h.CatchReferencedArguments)
+                        if (a.ParameterType.IsByReference)
+                            handlerBody.Add(Instruction.Create(OpCodes.Ldarg, (ParameterDefinition)a));
                         else
-                            handlerBody.Add(Instruction.Create(OpCodes.Ldarga, p));
-                    }
+                            handlerBody.Add(Instruction.Create(OpCodes.Ldarga, (ParameterDefinition)a));
+
+                    foreach (var v in h.CatchReferencedVariables)
+                        if (v.VariableType.IsByReference)
+                            handlerBody.Add(Instruction.Create(OpCodes.Ldloc, (VariableDefinition)v));
+                        else
+                            handlerBody.Add(Instruction.Create(OpCodes.Ldloca, (VariableDefinition)v));
+
                     // Now load the exception
                     handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                     // If the isinst passed we need to cast the exception value to the appropriate type
