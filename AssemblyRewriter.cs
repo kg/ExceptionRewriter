@@ -563,10 +563,11 @@ namespace ExceptionRewriter {
             catchMethod.Body.InitLocals = true;
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
             var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, eh.CatchType ?? method.Module.TypeSystem.Object);
-            var paramMapping = new Dictionary<object, object>();
+            var paramMapping = new Dictionary<object, object> {
+                {closure, closureParam }
+            };
             var closureVariable = new VariableDefinition(closureType);
             var needsLdind = new HashSet<object>();
-            paramMapping[closure] = closureParam;
             GenerateParameters(catchMethod, catchReferencedArguments, paramMapping, needsLdind);
             GenerateParameters(catchMethod, catchReferencedVariables, paramMapping, needsLdind);
             catchMethod.Parameters.Add(excParam);
@@ -608,14 +609,10 @@ namespace ExceptionRewriter {
                 mapping: paramMapping
             );
 
-            catchMethod.Body.Variables.Add(closureVariable);
-
             var first = catchInsns[0];
 
             InsertOps(
                 catchInsns, 0, new[] {
-                    Instruction.Create(OpCodes.Ldarg, closureParam),
-                    Instruction.Create(OpCodes.Stloc, closureVariable),
                     Instruction.Create(OpCodes.Ldarg, excParam)
                 }
             );
