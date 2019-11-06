@@ -408,6 +408,8 @@ namespace ExceptionRewriter {
                 }
             );
 
+            CleanMethodBody(method, null);
+
             var toInject = new List<Instruction>() {
                 Instruction.Create(OpCodes.Newobj, closureType.Methods.First(m => m.Name == ".ctor")),
                 Instruction.Create(OpCodes.Stloc, closureVar)
@@ -434,7 +436,7 @@ namespace ExceptionRewriter {
 
             InsertOps(insns, 0, toInject.ToArray());
 
-            CleanMethodBody(method);
+            CleanMethodBody(method, null);
 
             return closureVar;
         }
@@ -497,7 +499,7 @@ namespace ExceptionRewriter {
                 insn.Operand = newOperand;
             }
 
-            CleanMethodBody(method);
+            CleanMethodBody(method, null);
 
             foreach (var eh in method.Body.ExceptionHandlers) {
                 eh.FilterStart = PostFilterRange(remapTableFirst, eh.FilterStart);
@@ -596,6 +598,8 @@ namespace ExceptionRewriter {
                 }
             );
 
+            CleanMethodBody(catchMethod, method);
+
             var newMapping = ExtractRangeToMethod(
                 method, catchMethod, fakeThis,
                 insns.IndexOf(eh.HandlerStart), 
@@ -644,7 +648,7 @@ namespace ExceptionRewriter {
                     return null;
             });
 
-            CleanMethodBody(catchMethod);
+            CleanMethodBody(catchMethod, method);
 
             method.DeclaringType.Methods.Add(catchMethod);
 
@@ -836,7 +840,7 @@ namespace ExceptionRewriter {
                 sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, mapping, onFailedRemap
             );
 
-            CleanMethodBody(targetMethod);
+            CleanMethodBody(targetMethod, sourceMethod);
 
             var oldInsn = insns[firstIndex];
             var newInsn = Instruction.Create(OpCodes.Nop);
@@ -847,7 +851,7 @@ namespace ExceptionRewriter {
             if (deleteThem) {
                 for (int i = lastIndex; i > firstIndex; i--)
                     insns.RemoveAt(i);
-                CleanMethodBody(sourceMethod);
+                CleanMethodBody(sourceMethod, null);
             }
 
             return mapping;
@@ -902,7 +906,7 @@ namespace ExceptionRewriter {
         }
 
         private void ExtractExceptionFilters (MethodDefinition method) {
-            CleanMethodBody(method);
+            CleanMethodBody(method, null);
 
             var efilt = GetExceptionFilter(method.Module);
             var excType = GetException(method.Module);
@@ -1135,7 +1139,7 @@ namespace ExceptionRewriter {
                     insns.Insert(handlerEndIndex + 1, newLeave);
                 }
 
-                CleanMethodBody(method);
+                CleanMethodBody(method, null);
             }
         }
 
@@ -1168,7 +1172,7 @@ namespace ExceptionRewriter {
             }
         }
 
-        private void CleanMethodBody (MethodDefinition method) {
+        private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod) {
             var insns = method.Body.Instructions;
             foreach (var i in insns)
                 i.Offset = insns.IndexOf(i);
@@ -1184,15 +1188,22 @@ namespace ExceptionRewriter {
                 var opArg = i.Operand as ParameterDefinition;
                 var opVar = i.Operand as VariableDefinition;
 
-                if (opInsn != null)
+                if (opInsn != null) {
                     if (insns.IndexOf(opInsn) < 0)
                         throw new Exception($"Branch target {i.Operand} of opcode {i} is missing");
-                else if (opArg != null)
+                    else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf(opInsn) >= 0)
+                        throw new Exception($"Branch target {i.Operand} of opcode {i} is present in old method");
+                } else if (opArg != null) {
                     if (method.Parameters.IndexOf(opArg) < 0)
                         throw new Exception($"Parameter {opArg.Name} for opcode {i} is missing");
-                else if (opVar != null)
+                    else if (oldMethod != null && oldMethod.Parameters.IndexOf(opArg) < 0)
+                        throw new Exception($"Parameter {opArg.Name} for opcode {i} is present in old method");
+                } else if (opVar != null) {
                     if (method.Body.Variables.IndexOf(opVar) < 0)
                         throw new Exception($"Local {opVar} for opcode {i} is missing");
+                    else if (oldMethod != null && oldMethod.Body.Variables.IndexOf(opVar) >= 0)
+                        throw new Exception($"Local {opVar} for opcode {i} is present in old method");
+                }
             }
 
             foreach (var i in insns)
@@ -1268,7 +1279,7 @@ namespace ExceptionRewriter {
                 operand;
 
             var code = i.OpCode;
-            if (operand != i.Operand)
+            if (Denumberings.ContainsKey(i.OpCode.Code))
                 code = Denumberings[i.OpCode.Code];
 
             if (operand == null)
@@ -1326,7 +1337,7 @@ namespace ExceptionRewriter {
             for (int n = 0; n < count; n++) {
                 var i = sourceMethod.Body.Instructions[n + sourceIndex];
                 var newInsn = CloneInstruction(i, fakeThis, sourceMethod, mapping);
-                if (newInsn.OpCode.Code == Code.Stloc_2)
+                if (newInsn.OpCode.Code == Code.Ldarg_S)
                     throw new Exception();
                 target.Add(newInsn);
             }
@@ -1348,6 +1359,8 @@ namespace ExceptionRewriter {
                     newInsn = Instruction.Create(insn.OpCode, newOperand);
                 }
 
+                if (newInsn.OpCode.Code == Code.Ldarg_S)
+                    throw new Exception();
                 target[i] = newInsn;
             }
         }
