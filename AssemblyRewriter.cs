@@ -15,6 +15,34 @@ namespace ExceptionRewriter {
         private int ClosureIndex, FilterIndex;
 
         private readonly Dictionary<Code, OpCode> ShortFormRemappings = new Dictionary<Code, OpCode>();
+        private readonly Dictionary<Code, OpCode> Denumberings = new Dictionary<Code, OpCode> {
+            {Code.Ldarg_0, OpCodes.Ldarg },
+            {Code.Ldarg_1, OpCodes.Ldarg },
+            {Code.Ldarg_2, OpCodes.Ldarg },
+            {Code.Ldarg_3, OpCodes.Ldarg },
+            {Code.Ldloc_0, OpCodes.Ldloc },
+            {Code.Ldloc_1, OpCodes.Ldloc },
+            {Code.Ldloc_2, OpCodes.Ldloc },
+            {Code.Ldloc_3, OpCodes.Ldloc },
+            {Code.Stloc_0, OpCodes.Stloc },
+            {Code.Stloc_1, OpCodes.Stloc },
+            {Code.Stloc_2, OpCodes.Stloc },
+            {Code.Stloc_3, OpCodes.Stloc },
+        };
+        private readonly Dictionary<Code, OpCode> LocalParameterRemappings = new Dictionary<Code, OpCode> {
+            {Code.Ldloc, OpCodes.Ldarg },
+            {Code.Ldloca, OpCodes.Ldarga },
+            {Code.Ldloc_S, OpCodes.Ldarg },
+            {Code.Ldloca_S, OpCodes.Ldarga },
+            {Code.Stloc, OpCodes.Starg },
+            {Code.Stloc_S, OpCodes.Starg },
+            {Code.Ldarg, OpCodes.Ldloc },
+            {Code.Ldarga, OpCodes.Ldloca },
+            {Code.Ldarg_S, OpCodes.Ldloc },
+            {Code.Ldarga_S, OpCodes.Ldloca },
+            {Code.Starg, OpCodes.Stloc },
+            {Code.Starg_S, OpCodes.Stloc }
+        };
 
         public AssemblyRewriter (AssemblyAnalyzer analyzer) {
             Assembly = analyzer.Input;
@@ -111,64 +139,6 @@ namespace ExceptionRewriter {
                 Rewrite(m);
             }
         }
-
-        /*
-
-        private TypeDefinition CreateRewriterUtilType () {
-            var mod = Assembly.MainModule;
-            var td = new TypeDefinition(
-                "Mono.AssemblyRewriter", "Internal",
-                TypeAttributes.Sealed | TypeAttributes.Public,
-                mod.TypeSystem.Object
-            );
-
-            var tException = GetException(mod);
-            var tDispatchInfo = GetExceptionDispatchInfo(mod);
-            var method = new MethodDefinition(
-                "CaptureStackTrace", MethodAttributes.Static | MethodAttributes.Public | MethodAttributes.Final, tDispatchInfo
-            );
-            var result = new VariableDefinition(tDispatchInfo);
-
-            var excParam = new ParameterDefinition("exc", ParameterAttributes.None, tException);
-            method.Parameters.Add(excParam);
-
-            var body = method.Body = new MethodBody(method);
-            body.Variables.Add(result);
-
-            var loadResult = Instruction.Create(OpCodes.Ldloc, result);
-
-            var tryStart = Instruction.Create(OpCodes.Ldarg_0);
-            body.Instructions.Add(tryStart);
-            body.Instructions.Add(Instruction.Create(OpCodes.Throw));
-            body.Instructions.Add(Instruction.Create(OpCodes.Leave, loadResult));
-
-            var catchOp = Instruction.Create(OpCodes.Ldnull);
-
-            // catch { result = ExceptionDispatchInfo.Capture(exc); }
-            body.Instructions.Add(catchOp);
-            body.Instructions.Add(Instruction.Create(OpCodes.Ldarg_0));
-            body.Instructions.Add(Instruction.Create(OpCodes.Call, GetCapture(mod)));
-            body.Instructions.Add(Instruction.Create(OpCodes.Stloc, result));
-            body.Instructions.Add(Instruction.Create(OpCodes.Leave, loadResult));
-
-            // return result;
-            body.Instructions.Add(loadResult);
-            body.Instructions.Add(Instruction.Create(OpCodes.Ret));
-
-            body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch) {
-                TryStart = tryStart,
-                TryEnd = catchOp,
-                HandlerStart = catchOp,
-                HandlerEnd = loadResult,
-                CatchType = tException
-            });
-
-            td.Methods.Add(method);
-            mod.Types.Add(td);
-            return td;
-        }
-
-        */
 
         private void Rewrite (AnalyzedMethod am) {
             var method = am.Method;
@@ -441,7 +411,7 @@ namespace ExceptionRewriter {
             if (!isStatic) {
                 toInject.AddRange(new[] {
                     Instruction.Create(OpCodes.Ldloc, closureVar),
-                    Instruction.Create(OpCodes.Ldarg_0),
+                    Instruction.Create(OpCodes.Ldarg, fakeThis),
                     Instruction.Create(OpCodes.Stfld, extractedVariables[fakeThis])
                 });
             }
@@ -533,11 +503,49 @@ namespace ExceptionRewriter {
             }
         }
 
+        private void GenerateParameters (
+            MethodDefinition newMethod, HashSet<VariableReference> variables, 
+            Dictionary<object, object> mapping, HashSet<object> needsLdind
+        ) {
+            foreach (var vr in variables) {
+                var newParamType =
+                    vr.VariableType.IsByReference
+                        ? vr.VariableType
+                        : new ByReferenceType(vr.VariableType);
+                var newParam = new ParameterDefinition(newParamType);
+                newMethod.Parameters.Add(newParam);
+                mapping[vr] = newParam;
+                if (newParamType != vr.VariableType)
+                    needsLdind.Add(newParam);
+            }
+        }
+
+        private void GenerateParameters (
+            MethodDefinition newMethod, HashSet<ParameterReference> parameters, 
+            Dictionary<object, object> mapping, HashSet<object> needsLdind
+        ) {
+            foreach (var pr in parameters) {
+                var newParamType =
+                    pr.ParameterType.IsByReference
+                        ? pr.ParameterType
+                        : new ByReferenceType(pr.ParameterType);
+                var newParam = new ParameterDefinition(pr.Name, ParameterAttributes.None, newParamType);
+                newMethod.Parameters.Add(newParam);
+                mapping[pr] = newParam;
+                if (newParamType != pr.ParameterType)
+                    needsLdind.Add(newParam);
+            }
+        }
+
         private ExcHandler ExtractCatch (
-            MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ExcGroup group
+            MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ParameterDefinition fakeThis, ExcGroup group
         ) {
             var insns = method.Body.Instructions;
             var closureType = closure.VariableType;
+
+            var catchReferencedVariables = new HashSet<VariableReference>();
+            var catchReferencedArguments = new HashSet<ParameterReference>();
+            CollectReferencedLocals(method, fakeThis, eh.HandlerStart, eh.HandlerEnd, catchReferencedVariables, catchReferencedArguments);
 
             var catchMethod = new MethodDefinition(
                 method.Name + "__catch" + (CatchCount++),
@@ -547,16 +555,12 @@ namespace ExceptionRewriter {
             catchMethod.Body.InitLocals = true;
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
             var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, eh.CatchType ?? method.Module.TypeSystem.Object);
-            var paramMapping = new Dictionary<ParameterReference, ParameterDefinition>();
-            foreach (var p in method.Parameters) {
-                var newParamType =
-                    p.ParameterType.IsByReference
-                        ? p.ParameterType
-                        : new ByReferenceType(p.ParameterType);
-                var newParam = new ParameterDefinition(p.Name, p.Attributes, newParamType);
-                catchMethod.Parameters.Add(newParam);
-                paramMapping[p] = newParam;
-            }
+            var paramMapping = new Dictionary<object, object>();
+            var closureVariable = new VariableDefinition(closureType);
+            var needsLdind = new HashSet<object>();
+            paramMapping[closureParam] = closureVariable;
+            GenerateParameters(catchMethod, catchReferencedArguments, paramMapping, needsLdind);
+            GenerateParameters(catchMethod, catchReferencedVariables, paramMapping, needsLdind);
             catchMethod.Parameters.Add(excParam);
             catchMethod.Parameters.Add(closureParam);
 
@@ -586,27 +590,53 @@ namespace ExceptionRewriter {
                 }
             );
 
-            var (newVariables, newParameters) = ExtractRangeToMethod(
-                method, catchMethod, 
+            var newMapping = ExtractRangeToMethod(
+                method, catchMethod, fakeThis,
                 insns.IndexOf(eh.HandlerStart), 
                 insns.IndexOf(eh.HandlerEnd) - 1,
                 deleteThem: true,
-                parameters: paramMapping
+                mapping: paramMapping
             );
+
+            catchMethod.Body.Variables.Add(closureVariable);
 
             var first = catchInsns[0];
 
             InsertOps(
                 catchInsns, 0, new[] {
                     Instruction.Create(OpCodes.Ldarg, closureParam),
-                    Instruction.Create(OpCodes.Stloc, newVariables[closure]),
+                    Instruction.Create(OpCodes.Stloc, closureVariable),
                     Instruction.Create(OpCodes.Ldarg, excParam)
                 }
             );
 
-            for (int i = 0; i < catchInsns.Count; i++) {
-                var insn = catchInsns[i];
-            }
+            FilterRange(catchMethod, 0, catchMethod.Body.Instructions.Count - 1, (i) => {
+                if (needsLdind.Contains(i.Operand)) {
+                    if (IsStoreOperation(i.OpCode.Code)) {
+                        var operandVariable = i.Operand as VariableReference;
+                        var operandParameter = i.Operand as ParameterReference;
+                        var operandType = operandVariable?.VariableType ?? operandParameter.ParameterType;
+
+                        // ugh
+                        var newTempLocal = new VariableDefinition(operandType.IsByReference ? operandType.GetElementType() : operandType);
+                        catchMethod.Body.Variables.Add(newTempLocal);
+
+                        return new[] {
+                            Instruction.Create(OpCodes.Stloc, newTempLocal),
+                            i.Operand is VariableReference
+                                ? Instruction.Create(OpCodes.Ldloc, (VariableDefinition)i.Operand)
+                                : Instruction.Create(OpCodes.Ldarg, (ParameterDefinition)i.Operand),
+                            Instruction.Create(OpCodes.Ldloc, newTempLocal),
+                            Instruction.Create(SelectStindForOperand(i.Operand))
+                        };
+                    } else
+                        return new[] {
+                            i,
+                            Instruction.Create(SelectLdindForOperand(i.Operand))
+                        };
+                } else
+                    return null;
+            });
 
             method.DeclaringType.Methods.Add(catchMethod);
 
@@ -614,14 +644,84 @@ namespace ExceptionRewriter {
             var handler = new ExcHandler {
                 Handler = eh,
                 Method = catchMethod,
-                IsCatchAll = isCatchAll
+                IsCatchAll = isCatchAll,
+                Mapping = newMapping,
+                CatchReferencedVariables = catchReferencedVariables,
+                CatchReferencedArguments = catchReferencedArguments
             };
             group.Handlers.Add(handler);
             return handler;
         }
 
+        private OpCode SelectStindForOperand (object operand) {
+            var vr = operand as VariableReference;
+            var pr = operand as ParameterReference;
+            var operandType = (vr != null) ? vr.VariableType : pr.ParameterType;
+
+            switch (operandType.FullName) {
+                case "System.Byte":
+                    // FIXME
+                    return OpCodes.Stind_I1;
+                case "System.UInt16":
+                    // FIXME
+                    return OpCodes.Stind_I2;
+                case "System.UInt32":
+                    // FIXME
+                    return OpCodes.Stind_I4;
+                case "System.UInt64":
+                    // FIXME
+                    return OpCodes.Stind_I8;
+                case "System.SByte":
+                    return OpCodes.Stind_I1;
+                case "System.Int16":
+                    return OpCodes.Stind_I2;
+                case "System.Int32":
+                    return OpCodes.Stind_I4;
+                case "System.Int64":
+                    return OpCodes.Stind_I8;
+                case "System.Single":
+                    return OpCodes.Stind_R4;
+                case "System.Double":
+                    return OpCodes.Stind_R8;
+                default:
+                    return OpCodes.Stind_Ref;
+            }
+        }
+
+        private OpCode SelectLdindForOperand (object operand) {
+            var vr = operand as VariableReference;
+            var pr = operand as ParameterReference;
+            var operandType = (vr != null) ? vr.VariableType : pr.ParameterType;
+
+            switch (operandType.FullName) {
+                case "System.Byte":
+                    return OpCodes.Ldind_U1;
+                case "System.UInt16":
+                    return OpCodes.Ldind_U2;
+                case "System.UInt32":
+                    return OpCodes.Ldind_U4;
+                case "System.UInt64":
+                    // FIXME
+                    return OpCodes.Ldind_I8;
+                case "System.SByte":
+                    return OpCodes.Ldind_I1;
+                case "System.Int16":
+                    return OpCodes.Ldind_I2;
+                case "System.Int32":
+                    return OpCodes.Ldind_I4;
+                case "System.Int64":
+                    return OpCodes.Ldind_I8;
+                case "System.Single":
+                    return OpCodes.Ldind_R4;
+                case "System.Double":
+                    return OpCodes.Ldind_R8;
+                default:
+                    return OpCodes.Ldind_Ref;
+            }
+        }
+
         private ExcHandler ExtractFilterAndCatch (
-            MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ExcGroup group
+            MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ParameterDefinition fakeThis, ExcGroup group
         ) {
             var insns = method.Body.Instructions;
             var closureType = closure.VariableType;
@@ -659,7 +759,7 @@ namespace ExceptionRewriter {
                 throw new Exception();
             i2--;
 
-            var newVariables = ExtractRangeToMethod(method, filterMethod, i1, i2, true);
+            var newVariables = ExtractRangeToMethod(method, filterMethod, fakeThis, i1, i2, true);
 
             var filterInsns = filterMethod.Body.Instructions;
 
@@ -679,12 +779,12 @@ namespace ExceptionRewriter {
                 if (insn.Operand != closure)
                     continue;
 
-                filterInsns[i] = Instruction.Create(OpCodes.Ldarg_0);
+                filterInsns[i] = Instruction.Create(OpCodes.Ldarg, fakeThis);
                 Patch(filterMethod, insn, filterInsns[i]);
                 filterInsns.Insert(i + 1, Instruction.Create(OpCodes.Ldfld, closureField));
             }
 
-            var handler = ExtractCatch(method, eh, closure, group);
+            var handler = ExtractCatch(method, eh, closure, fakeThis, group);
 
             handler.FilterMethod = filterMethod;
             handler.FilterType = filterType;
@@ -698,37 +798,34 @@ namespace ExceptionRewriter {
             return handler;
         }
 
-        private (
-            Dictionary<VariableReference, VariableDefinition> variables,
-            Dictionary<ParameterReference, ParameterDefinition> parameters
-        ) ExtractRangeToMethod (
+        private Dictionary<object, object> ExtractRangeToMethod (
             MethodDefinition sourceMethod, MethodDefinition targetMethod, 
+            ParameterDefinition fakeThis,
             int firstIndex, int lastIndex, bool deleteThem,
             Func<Instruction, Instruction, Instruction> onFailedRemap = null,
-            Dictionary<ParameterReference, ParameterDefinition> parameters = null
+            Dictionary<object, object> mapping = null
         ) {
             var insns = sourceMethod.Body.Instructions;
             var targetInsns = targetMethod.Body.Instructions;
 
-            var variables = new Dictionary<VariableReference, VariableDefinition>();
+            if (mapping == null) {
+                mapping = new Dictionary<object, object>();
 
-            foreach (var loc in sourceMethod.Body.Variables) {
-                var newLoc = new VariableDefinition(loc.VariableType);
-                targetMethod.Body.Variables.Add(newLoc);
-                variables[loc] = newLoc;
-            }
+                foreach (var loc in sourceMethod.Body.Variables) {
+                    var newLoc = new VariableDefinition(loc.VariableType);
+                    targetMethod.Body.Variables.Add(newLoc);
+                    mapping[loc] = newLoc;
+                }
 
-            if (parameters == null) {
-                parameters = new Dictionary<ParameterReference, ParameterDefinition>();
                 foreach (var param in sourceMethod.Parameters) {
                     var newParam = new ParameterDefinition(param.Name, param.Attributes, param.ParameterType);
-                    targetMethod.Parameters.Add(param);
-                    parameters[param] = newParam;
+                    targetMethod.Parameters.Add(newParam);
+                    mapping[param] = newParam;
                 }
             }
 
             CloneInstructions(
-                insns, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, variables, parameters, onFailedRemap
+                sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, mapping, onFailedRemap
             );
 
             CleanMethodBody(targetMethod);
@@ -745,7 +842,7 @@ namespace ExceptionRewriter {
                 CleanMethodBody(sourceMethod);
             }
 
-            return (variables, parameters);
+            return mapping;
         }
 
         private void RemoveRange (
@@ -791,7 +888,9 @@ namespace ExceptionRewriter {
             public MethodDefinition Method, FilterMethod;
 
             public Instruction FirstFilterInsn;
-            internal Instruction FirstPushInstruction;
+            internal HashSet<VariableReference> CatchReferencedVariables;
+            internal HashSet<ParameterReference> CatchReferencedArguments;
+            internal Dictionary<object, object> Mapping;
         }
 
         private void ExtractExceptionFilters (MethodDefinition method) {
@@ -803,11 +902,11 @@ namespace ExceptionRewriter {
 
             var fakeThis = new ParameterDefinition("__this", ParameterAttributes.None, method.DeclaringType);
 
-            var referencedVariables = new HashSet<VariableReference>();
-            var referencedArguments = new HashSet<ParameterReference>();
-            CollectReferencedLocals(method, method.IsStatic ? null : fakeThis, referencedVariables, referencedArguments);
+            var filterReferencedVariables = new HashSet<VariableReference>();
+            var filterReferencedArguments = new HashSet<ParameterReference>();
+            CollectReferencedLocals(method, method.IsStatic ? null : fakeThis, filterReferencedVariables, filterReferencedArguments);
 
-            var closure = ConvertToClosure(method, fakeThis, referencedVariables, referencedArguments, out closureType);
+            var closure = ConvertToClosure(method, fakeThis, filterReferencedVariables, filterReferencedArguments, out closureType);
 
             var excVar = new VariableDefinition(method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
@@ -829,9 +928,9 @@ namespace ExceptionRewriter {
 
                 foreach (var eh in group) {
                     if (eh.FilterStart != null)
-                        ExtractFilterAndCatch(method, eh, closure, excGroup);
+                        ExtractFilterAndCatch(method, eh, closure, fakeThis, excGroup);
                     else
-                        ExtractCatch(method, eh, closure, excGroup);
+                        ExtractCatch(method, eh, closure, fakeThis, excGroup);
                 }
 
                 newGroups.Add(excGroup);
@@ -1026,16 +1125,9 @@ namespace ExceptionRewriter {
         }
 
         private void CollectReferencedLocals (MethodDefinition method, ParameterDefinition fakeThis, HashSet<VariableReference> referencedVariables, HashSet<ParameterReference> referencedArguments) {
-            foreach (var eh in method.Body.ExceptionHandlers) {
+            foreach (var eh in method.Body.ExceptionHandlers)
                 if (eh.FilterStart != null)
                     CollectReferencedLocals(method, fakeThis, eh.FilterStart, eh.HandlerStart, referencedVariables, referencedArguments);
-                /*
-                if (eh.HandlerStart != null)
-                    CollectReferencedLocals(method, fakeThis, eh.HandlerStart, eh.HandlerEnd, referencedVariables, referencedArguments);
-                */
-            }
-
-            ;
         }
 
         private void CollectReferencedLocals (
@@ -1070,11 +1162,14 @@ namespace ExceptionRewriter {
                 OpCode newOpcode;
                 if (ShortFormRemappings.TryGetValue(i.OpCode.Code, out newOpcode))
                     i.OpCode = newOpcode;
+                else
+                    continue;
 
                 if (i.Operand is Instruction) {
                     if (insns.IndexOf((Instruction)i.Operand) < 0)
                         throw new Exception($"Branch target {i.Operand} of opcode {i} is missing");
-                }
+                } else
+                    throw new Exception();
             }
 
             foreach (var i in insns)
@@ -1114,64 +1209,103 @@ namespace ExceptionRewriter {
             return result;
         }
 
+        private Instruction CreateRemappedInstruction (
+            object oldOperand, OpCode oldCode, object operand
+        ) {
+            if (operand == null)
+                throw new ArgumentNullException();
+
+            OpCode code = oldCode;
+            if (
+                (operand != null) && 
+                (oldOperand != null) &&
+                (operand.GetType() != oldOperand.GetType())
+            ) {
+                if (!LocalParameterRemappings.TryGetValue(oldCode.Code, out code))
+                    throw new Exception(oldCode.ToString());
+            }
+
+            if (operand is ParameterDefinition)
+                return Instruction.Create(code, (ParameterDefinition)operand);
+            else if (operand is VariableDefinition)
+                return Instruction.Create(code, (VariableDefinition)operand);
+            else
+                throw new Exception(operand.ToString());
+        }
+
         private Instruction CloneInstruction (
             Instruction i, 
-            Dictionary<VariableReference, VariableDefinition> variables,
-            Dictionary<ParameterReference, ParameterDefinition> parameters
+            ParameterDefinition fakeThis,
+            MethodDefinition method,
+            Dictionary<object, object> mapping = null
         ) {
             object operand = i.Operand;
+            operand = LookupNumberedVariable(i.OpCode.Code, method.Body.Variables) ??
+                LookupNumberedArgument(i.OpCode.Code, fakeThis, method.Parameters) ??
+                operand;
+
+            var code = i.OpCode;
+            if (operand != i.Operand)
+                code = Denumberings[i.OpCode.Code];
+
             if (operand == null)
-                return Instruction.Create(i.OpCode);
+                return Instruction.Create(code);
 
             if (operand is FieldReference) {
                 FieldReference fref = operand as FieldReference;
-                return Instruction.Create(i.OpCode, fref);
+                return Instruction.Create(code, fref);
             } else if (operand is TypeReference) {
                 TypeReference tref = operand as TypeReference;
-                return Instruction.Create(i.OpCode, tref);
+                return Instruction.Create(code, tref);
             } else if (operand is TypeDefinition) {
                 TypeDefinition tdef = operand as TypeDefinition;
-                return Instruction.Create(i.OpCode, tdef);
+                return Instruction.Create(code, tdef);
             } else if (operand is MethodReference) {
                 MethodReference mref = operand as MethodReference;
-                return Instruction.Create(i.OpCode, mref);
+                return Instruction.Create(code, mref);
             } else if (operand is Instruction) {
                 var insn = operand as Instruction;
-                return Instruction.Create(i.OpCode, insn);
+                return Instruction.Create(code, insn);
             } else if (operand is string) {
                 var s = operand as string;
-                return Instruction.Create(i.OpCode, s);
+                return Instruction.Create(code, s);
             } else if (operand is VariableReference) {
                 var v = operand as VariableReference;
-                if (variables != null)
-                    v = variables[v];
-                return Instruction.Create(i.OpCode, (VariableDefinition)v);
+                var newOperand = (mapping != null) ? mapping[v] : v;
+                if (newOperand.GetType() != v.GetType())
+                    return CreateRemappedInstruction(operand, code, newOperand);
+                else
+                    return Instruction.Create(code, (VariableDefinition)v);
             } else if (operand is ParameterDefinition) {
                 var p = operand as ParameterDefinition;
-                if (parameters != null)
-                    p = parameters[p];
-                return Instruction.Create(i.OpCode, p);
+                var newOperand = (mapping != null) ? mapping[p] : p;
+                if (newOperand.GetType() != p.GetType())
+                    return CreateRemappedInstruction(operand, code, newOperand);
+                else
+                    return Instruction.Create(code, p);
             } else {
                 throw new NotImplementedException(i.OpCode.ToString());
             }
         }
 
         private void CloneInstructions (
-            Mono.Collections.Generic.Collection<Instruction> source,
+            MethodDefinition sourceMethod,
+            ParameterDefinition fakeThis,
             int sourceIndex, int count,
             Mono.Collections.Generic.Collection<Instruction> target,
             int targetIndex,
-            Dictionary<VariableReference, VariableDefinition> variables = null,
-            Dictionary<ParameterReference, ParameterDefinition> parameters = null,
+            Dictionary<object, object> mapping = null,
             Func<Instruction, Instruction, Instruction> onFailedRemap = null
         ) {
             if (sourceIndex < 0)
                 throw new ArgumentOutOfRangeException("sourceIndex");
 
             for (int n = 0; n < count; n++) {
-                var i = source[n + sourceIndex];
-                var newInsn = CloneInstruction(i, variables, parameters);
-                target.Add(i);
+                var i = sourceMethod.Body.Instructions[n + sourceIndex];
+                var newInsn = CloneInstruction(i, fakeThis, sourceMethod, mapping);
+                if (newInsn.OpCode.Code == Code.Stloc_2)
+                    throw new Exception();
+                target.Add(newInsn);
             }
 
             // Fixup branches
@@ -1182,7 +1316,7 @@ namespace ExceptionRewriter {
                     continue;
 
                 Instruction newOperand, newInsn;
-                if (!TryRemapInstruction(operand, source, target, targetIndex - sourceIndex, out newOperand)) {
+                if (!TryRemapInstruction(operand, sourceMethod.Body.Instructions, target, targetIndex - sourceIndex, out newOperand)) {
                     if (onFailedRemap != null)
                         newInsn = onFailedRemap(insn, operand);
                     else
@@ -1190,6 +1324,7 @@ namespace ExceptionRewriter {
                 } else {
                     newInsn = Instruction.Create(insn.OpCode, newOperand);
                 }
+
                 target[i] = newInsn;
             }
         }
