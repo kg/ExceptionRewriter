@@ -948,12 +948,13 @@ namespace ExceptionRewriter {
                 foreach (var h in eg.Handlers) {
                     var fv = h.FilterVariable;
                     if (fv != null) {
-                        var filterInitInsns = new Instruction[] {
-                            // Construct a filter instance and store it into the closure
-                            Instruction.Create(OpCodes.Ldloc, closure),
+                        InsertOps(insns, 0, new Instruction[] {
                             Instruction.Create(OpCodes.Newobj, h.FilterType.Methods.First(m => m.Name == ".ctor")),
                             Instruction.Create(OpCodes.Stloc, fv),
-                            // Then store the closure into the filter instance so it can access locals
+                        });
+
+                        var filterInitInsns = new Instruction[] {
+                            // Store the closure into the filter instance so it can access locals
                             Instruction.Create(OpCodes.Ldloc, fv),
                             Instruction.Create(OpCodes.Ldloc, closure),
                             Instruction.Create(OpCodes.Stfld, h.FilterType.Fields.First(m => m.Name == "closure")),
