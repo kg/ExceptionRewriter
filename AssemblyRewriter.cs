@@ -338,7 +338,7 @@ namespace ExceptionRewriter {
 
             var extractedVariables = variables.ToDictionary(
                 v => (object)v, 
-                v => new FieldDefinition("local" + localCount++, FieldAttributes.Public, v.VariableType)
+                v => new FieldDefinition("local_" + localCount++, FieldAttributes.Public, v.VariableType)
             );
 
             method.Body.Variables.Add(closureVar);
@@ -408,7 +408,7 @@ namespace ExceptionRewriter {
                 }
             );
 
-            CleanMethodBody(method, null);
+            CleanMethodBody(method, null, false);
 
             var toInject = new List<Instruction>() {
                 Instruction.Create(OpCodes.Newobj, closureType.Methods.First(m => m.Name == ".ctor")),
@@ -436,7 +436,7 @@ namespace ExceptionRewriter {
 
             InsertOps(insns, 0, toInject.ToArray());
 
-            CleanMethodBody(method, null);
+            CleanMethodBody(method, null, true);
 
             return closureVar;
         }
@@ -499,7 +499,7 @@ namespace ExceptionRewriter {
                 insn.Operand = newOperand;
             }
 
-            CleanMethodBody(method, null);
+            CleanMethodBody(method, null, false);
 
             foreach (var eh in method.Body.ExceptionHandlers) {
                 eh.FilterStart = PostFilterRange(remapTableFirst, eh.FilterStart);
@@ -599,7 +599,7 @@ namespace ExceptionRewriter {
                 }
             );
 
-            CleanMethodBody(catchMethod, method);
+            CleanMethodBody(catchMethod, method, false);
 
             var newMapping = ExtractRangeToMethod(
                 method, catchMethod, fakeThis,
@@ -645,7 +645,7 @@ namespace ExceptionRewriter {
                     return null;
             });
 
-            CleanMethodBody(catchMethod, method);
+            CleanMethodBody(catchMethod, method, true);
 
             method.DeclaringType.Methods.Add(catchMethod);
 
@@ -802,7 +802,7 @@ namespace ExceptionRewriter {
             handler.FilterMethod = filterMethod;
             handler.FilterType = filterType;
             handler.FilterField = new FieldDefinition(
-                "__filter" + filterIndex.ToString(), 
+                "filter_" + filterIndex.ToString(), 
                 FieldAttributes.Public, filterType
             );
             ((TypeDefinition)closureType).Fields.Add(handler.FilterField);
@@ -833,7 +833,7 @@ namespace ExceptionRewriter {
                 sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, mapping, onFailedRemap
             );
 
-            CleanMethodBody(targetMethod, sourceMethod);
+            CleanMethodBody(targetMethod, sourceMethod, false);
 
             var oldInsn = insns[firstIndex];
             var newInsn = Instruction.Create(OpCodes.Nop);
@@ -844,7 +844,7 @@ namespace ExceptionRewriter {
             if (deleteThem) {
                 for (int i = lastIndex; i > firstIndex; i--)
                     insns.RemoveAt(i);
-                CleanMethodBody(sourceMethod, null);
+                CleanMethodBody(sourceMethod, null, false);
             }
 
             return mapping;
@@ -899,7 +899,7 @@ namespace ExceptionRewriter {
         }
 
         private void ExtractExceptionFilters (MethodDefinition method) {
-            CleanMethodBody(method, null);
+            CleanMethodBody(method, null, false);
 
             var efilt = GetExceptionFilter(method.Module);
             var excType = GetException(method.Module);
@@ -1132,13 +1132,13 @@ namespace ExceptionRewriter {
                     insns.Insert(handlerEndIndex + 1, newLeave);
                 }
 
-                CleanMethodBody(method, null);
+                CleanMethodBody(method, null, true);
                 foreach (var g in newGroups) {
                     foreach (var h in g.Handlers) {
                         if (h.FilterMethod != null)
-                            CleanMethodBody(h.FilterMethod, method);
+                            CleanMethodBody(h.FilterMethod, method, true);
                         if (h.Method != null)
-                            CleanMethodBody(h.Method, method);
+                            CleanMethodBody(h.Method, method, true);
                     }
                 }
             }
@@ -1179,7 +1179,7 @@ namespace ExceptionRewriter {
             }
         }
 
-        private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod) {
+        private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify) {
             var insns = method.Body.Instructions;
             foreach (var i in insns)
                 i.Offset = insns.IndexOf(i);
@@ -1188,7 +1188,8 @@ namespace ExceptionRewriter {
                 OpCode newOpcode;
                 if (ShortFormRemappings.TryGetValue(i.OpCode.Code, out newOpcode))
                     i.OpCode = newOpcode;
-                else
+
+                if (!verify)
                     continue;
 
                 var opInsn = i.Operand as Instruction;
@@ -1203,7 +1204,7 @@ namespace ExceptionRewriter {
                 } else if (opArg != null) {
                     if (method.Parameters.IndexOf(opArg) < 0)
                         throw new Exception($"Parameter {opArg.Name} for opcode {i} is missing");
-                    else if (oldMethod != null && oldMethod.Parameters.IndexOf(opArg) < 0)
+                    else if (oldMethod != null && oldMethod.Parameters.IndexOf(opArg) >= 0)
                         throw new Exception($"Parameter {opArg.Name} for opcode {i} is present in old method");
                 } else if (opVar != null) {
                     if (method.Body.Variables.IndexOf(opVar) < 0)
@@ -1216,10 +1217,12 @@ namespace ExceptionRewriter {
             foreach (var i in insns)
                 i.Offset = insns.IndexOf(i);
 
+            if (verify)
             foreach (var p in method.Parameters)
                 if (p.Index != method.Parameters.IndexOf(p))
                     throw new Exception("parameter index mismatch");
 
+            if (verify)
             foreach (var v in method.Body.Variables)
                 if (v.Index != method.Body.Variables.IndexOf(v))
                     throw new Exception("variable index mismatch");
