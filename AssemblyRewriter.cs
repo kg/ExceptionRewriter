@@ -797,6 +797,8 @@ namespace ExceptionRewriter {
                 filterInsns.Insert(i + 1, Instruction.Create(OpCodes.Ldfld, closureField));
             }
 
+            CleanMethodBody(filterMethod, method, true);
+
             var handler = ExtractCatch(method, eh, closure, fakeThis, group);
 
             handler.FilterMethod = filterMethod;
@@ -1202,7 +1204,10 @@ namespace ExceptionRewriter {
                     else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf(opInsn) >= 0)
                         throw new Exception($"Branch target {i.Operand} of opcode {i} is present in old method");
                 } else if (opArg != null) {
-                    if (method.Parameters.IndexOf(opArg) < 0)
+                    if ((opArg.Name == "__this") && method.HasThis) {
+                        // HACK: method.Body.ThisParameter is unreliable for confusing reasons, and isn't
+                        //  present in .Parameters so just ignore the check here
+                    } else if (method.Parameters.IndexOf(opArg) < 0)
                         throw new Exception($"Parameter {opArg.Name} for opcode {i} is missing");
                     else if (oldMethod != null && oldMethod.Parameters.IndexOf(opArg) >= 0)
                         throw new Exception($"Parameter {opArg.Name} for opcode {i} is present in old method");
@@ -1291,10 +1296,9 @@ namespace ExceptionRewriter {
             MethodDefinition method,
             Dictionary<object, object> mapping = null
         ) {
-            object operand = i.Operand;
-            operand = LookupNumberedVariable(i.OpCode.Code, method.Body.Variables) ??
-                LookupNumberedArgument(i.OpCode.Code, fakeThis, method.Parameters) ??
-                operand;
+            object operand = i.Operand ??
+                (object)LookupNumberedVariable(i.OpCode.Code, method.Body.Variables) ??
+                (object)LookupNumberedArgument(i.OpCode.Code, fakeThis, method.Parameters);
 
             var code = i.OpCode;
             if (Denumberings.ContainsKey(i.OpCode.Code))
@@ -1303,35 +1307,35 @@ namespace ExceptionRewriter {
             if (operand == null)
                 return Instruction.Create(code);
 
-            if (operand is FieldReference) {
-                FieldReference fref = operand as FieldReference;
+            var newOperand = (mapping != null) && mapping.ContainsKey(operand) ? mapping[operand] : operand;
+
+            if (newOperand is FieldReference) {
+                FieldReference fref = newOperand as FieldReference;
                 return Instruction.Create(code, fref);
-            } else if (operand is TypeReference) {
-                TypeReference tref = operand as TypeReference;
+            } else if (newOperand is TypeReference) {
+                TypeReference tref = newOperand as TypeReference;
                 return Instruction.Create(code, tref);
-            } else if (operand is TypeDefinition) {
-                TypeDefinition tdef = operand as TypeDefinition;
+            } else if (newOperand is TypeDefinition) {
+                TypeDefinition tdef = newOperand as TypeDefinition;
                 return Instruction.Create(code, tdef);
-            } else if (operand is MethodReference) {
-                MethodReference mref = operand as MethodReference;
+            } else if (newOperand is MethodReference) {
+                MethodReference mref = newOperand as MethodReference;
                 return Instruction.Create(code, mref);
-            } else if (operand is Instruction) {
-                var insn = operand as Instruction;
+            } else if (newOperand is Instruction) {
+                var insn = newOperand as Instruction;
                 return Instruction.Create(code, insn);
-            } else if (operand is string) {
-                var s = operand as string;
+            } else if (newOperand is string) {
+                var s = newOperand as string;
                 return Instruction.Create(code, s);
-            } else if (operand is VariableReference) {
-                var v = operand as VariableReference;
-                var newOperand = (mapping != null) && mapping.ContainsKey(v) ? mapping[v] : v;
-                if (newOperand.GetType() != v.GetType())
+            } else if (newOperand is VariableReference) {
+                var v = newOperand as VariableReference;
+                if (operand.GetType() != v.GetType())
                     return CreateRemappedInstruction(operand, code, newOperand);
                 else
                     return Instruction.Create(code, (VariableDefinition)v);
-            } else if (operand is ParameterDefinition) {
-                var p = operand as ParameterDefinition;
-                var newOperand = (mapping != null) && mapping.ContainsKey(p) ? mapping[p] : p;
-                if (newOperand.GetType() != p.GetType())
+            } else if (newOperand is ParameterDefinition) {
+                var p = newOperand as ParameterDefinition;
+                if (operand.GetType() != p.GetType())
                     return CreateRemappedInstruction(operand, code, newOperand);
                 else
                     return Instruction.Create(code, p);
@@ -1355,8 +1359,6 @@ namespace ExceptionRewriter {
             for (int n = 0; n < count; n++) {
                 var i = sourceMethod.Body.Instructions[n + sourceIndex];
                 var newInsn = CloneInstruction(i, fakeThis, sourceMethod, mapping);
-                if (newInsn.OpCode.Code == Code.Ldarg_S)
-                    throw new Exception();
                 target.Add(newInsn);
             }
 
@@ -1377,8 +1379,6 @@ namespace ExceptionRewriter {
                     newInsn = Instruction.Create(insn.OpCode, newOperand);
                 }
 
-                if (newInsn.OpCode.Code == Code.Ldarg_S)
-                    throw new Exception();
                 target[i] = newInsn;
             }
         }
