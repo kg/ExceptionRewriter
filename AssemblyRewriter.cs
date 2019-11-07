@@ -773,6 +773,7 @@ namespace ExceptionRewriter {
                 // {closure, closureField }
             };
             var newVariables = ExtractRangeToMethod(method, filterMethod, fakeThis, i1, i2, true, mapping);
+            var newClosureLocal = (VariableDefinition)newVariables[closure];
 
             var filterInsns = filterMethod.Body.Instructions;
 
@@ -782,6 +783,10 @@ namespace ExceptionRewriter {
 
             InsertOps(
                 filterInsns, 0, new[] {
+                    // Load the closure from this and store it into our temporary
+                    Instruction.Create(OpCodes.Ldarg_0),
+                    Instruction.Create(OpCodes.Ldfld, closureField),
+                    Instruction.Create(OpCodes.Stloc, newClosureLocal),
                     // Load the exception from arg1 since exception handlers are entered with it on the stack
                     Instruction.Create(OpCodes.Ldarg, excArg)
                 }
@@ -948,6 +953,9 @@ namespace ExceptionRewriter {
                 foreach (var h in eg.Handlers) {
                     var fv = h.FilterVariable;
                     if (fv != null) {
+                        // Create each filter instance at function entry so it's always present during the finally blocks
+                        // FIXME: It'd be better to do this right before entering try blocks but doing that precisely is
+                        //  complicated
                         InsertOps(insns, 0, new Instruction[] {
                             Instruction.Create(OpCodes.Newobj, h.FilterType.Methods.First(m => m.Name == ".ctor")),
                             Instruction.Create(OpCodes.Stloc, fv),
