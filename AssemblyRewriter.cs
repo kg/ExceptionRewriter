@@ -803,11 +803,8 @@ namespace ExceptionRewriter {
 
             handler.FilterMethod = filterMethod;
             handler.FilterType = filterType;
-            handler.FilterField = new FieldDefinition(
-                "filter_" + filterIndex.ToString(), 
-                FieldAttributes.Public, filterType
-            );
-            ((TypeDefinition)closureType).Fields.Add(handler.FilterField);
+            handler.FilterVariable = new VariableDefinition(filterType);
+            method.Body.Variables.Add(handler.FilterVariable);
             handler.FirstFilterInsn = eh.FilterStart;
 
             return handler;
@@ -891,7 +888,7 @@ namespace ExceptionRewriter {
 
             public ExceptionHandler Handler;
             public TypeDefinition FilterType;
-            public FieldDefinition FilterField;
+            internal VariableDefinition FilterVariable;
             public MethodDefinition Method, FilterMethod;
 
             public Instruction FirstFilterInsn;
@@ -949,21 +946,19 @@ namespace ExceptionRewriter {
                 var hasAnyCatchAll = eg.Handlers.Any(h => h.IsCatchAll);
 
                 foreach (var h in eg.Handlers) {
-                    var ff = h.FilterField;
-                    if (ff != null) {
+                    var fv = h.FilterVariable;
+                    if (fv != null) {
                         var filterInitInsns = new Instruction[] {
                             // Construct a filter instance and store it into the closure
                             Instruction.Create(OpCodes.Ldloc, closure),
                             Instruction.Create(OpCodes.Newobj, h.FilterType.Methods.First(m => m.Name == ".ctor")),
-                            Instruction.Create(OpCodes.Stfld, h.FilterField),
+                            Instruction.Create(OpCodes.Stloc, fv),
                             // Then store the closure into the filter instance so it can access locals
-                            Instruction.Create(OpCodes.Ldloc, closure),
-                            Instruction.Create(OpCodes.Ldfld, h.FilterField),
+                            Instruction.Create(OpCodes.Ldloc, fv),
                             Instruction.Create(OpCodes.Ldloc, closure),
                             Instruction.Create(OpCodes.Stfld, h.FilterType.Fields.First(m => m.Name == "closure")),
                             // Then call Push on the filter instance
-                            Instruction.Create(OpCodes.Ldloc, closure),
-                            Instruction.Create(OpCodes.Ldfld, h.FilterField),
+                            Instruction.Create(OpCodes.Ldloc, fv),
                             Instruction.Create(OpCodes.Castclass, efilt),
                             Instruction.Create(OpCodes.Call, new MethodReference(
                                     "Push", method.Module.TypeSystem.Void, efilt
@@ -990,8 +985,7 @@ namespace ExceptionRewriter {
 
                         // At the end of the scope remove all our filters.
                         // FIXME: Should we do this earlier?
-                        finallyInsns.Add(Instruction.Create(OpCodes.Ldloc, closure));
-                        finallyInsns.Add(Instruction.Create(OpCodes.Ldfld, ff));
+                        finallyInsns.Add(Instruction.Create(OpCodes.Ldloc, fv));
                         finallyInsns.Add(Instruction.Create(OpCodes.Castclass, efilt));
                         finallyInsns.Add(Instruction.Create(OpCodes.Call, new MethodReference(
                                 "Pop", method.Module.TypeSystem.Void, efilt
@@ -1023,11 +1017,10 @@ namespace ExceptionRewriter {
                 foreach (var h in eg.Handlers) {
                     var skip = Instruction.Create(OpCodes.Nop);
 
-                    var ff = h.FilterField;
-                    if (ff != null) {
+                    var fv = h.FilterVariable;
+                    if (fv != null) {
                         // If we have a filter, check the Result to see if the filter returned execute_handler
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldfld, ff));
+                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, fv));
                         handlerBody.Add(Instruction.Create(OpCodes.Castclass, efilt));
                         handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
                         var mref = new MethodReference(
