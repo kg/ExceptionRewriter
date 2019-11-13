@@ -373,12 +373,23 @@ namespace ExceptionRewriter {
                 var git = result as GenericInstanceType;
                 var brt = result as ByReferenceType;
                 var pt = result as PointerType;
+                var at = result as ArrayType;
+
                 if (git != null)
                     result = FilterGenericInstanceType<T, U>(git, replacementTable);
-                else if (brt != null)
-                    result = FilterByReferenceType<T, U>(brt, replacementTable);
-                else if (pt != null)
-                    result = FilterPointerType<T, U>(pt, replacementTable);
+                else if (brt != null) {
+                    var newEt = FilterTypeReference<T, U>(brt.ElementType, replacementTable);
+                    if (newEt != brt.ElementType)
+                        result = new ByReferenceType(newEt);
+                } else if (pt != null) {
+                    var newEt = FilterTypeReference<T, U>(pt.ElementType, replacementTable);
+                    if (newEt != pt.ElementType)
+                        result = new PointerType(newEt);
+                } else if (at != null) {
+                    var newEt = FilterTypeReference<T, U>(at.ElementType, replacementTable);
+                    if (newEt != at.ElementType)
+                        result = new ArrayType(newEt, at.Rank);
+                }
 
                 if (prev == result)
                     return result;
@@ -752,7 +763,7 @@ namespace ExceptionRewriter {
                         var newOperandType = FilterTypeReference(operandType, gpMapping);
                         var byRefNewOperand = newOperandType as ByReferenceType;
                         
-                        var newTempLocal = new VariableDefinition(byRefNewOperand ?? new ByReferenceType(newOperandType));
+                        var newTempLocal = new VariableDefinition(byRefNewOperand?.ElementType ?? newOperandType);
                         catchMethod.Body.Variables.Add(newTempLocal);
 
                         return new[] {
