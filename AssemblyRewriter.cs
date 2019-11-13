@@ -298,6 +298,61 @@ namespace ExceptionRewriter {
             return null;
         }
 
+        private GenericInstanceType FilterGenericInstanceType<T, U> (GenericInstanceType git, Dictionary<T, U> replacementTable)
+            where T : TypeReference
+            where U : TypeReference
+        {
+            List<TypeReference> newArgs = null;
+
+            for (int i = 0; i < git.GenericArguments.Count; i++) {
+                var ga = git.GenericArguments[i];
+                var newGa = FilterTypeReference(ga, replacementTable);
+
+                if (newGa != ga) {
+                    if (newArgs == null) {
+                        newArgs = new List<TypeReference>();
+                        for (int j = 0; j < i; j++)
+                            newArgs[j] = git.GenericArguments[j];
+                    }
+
+                    newArgs.Add(newGa);
+                } else if (newArgs != null)
+                    newArgs.Add(ga);
+            }
+
+            if (newArgs != null) {
+                var result = new GenericInstanceType(git.ElementType);
+                foreach (var arg in newArgs)
+                    result.GenericArguments.Add(arg);
+
+                return result;
+            } else {
+                return git;
+            }
+        }
+
+        private TypeReference FilterTypeReference<T, U> (TypeReference tr, Dictionary<T, U> replacementTable)
+            where T : TypeReference
+            where U : TypeReference
+        {
+            if ((replacementTable == null) || (replacementTable.Count == 0))
+                return tr;
+
+            TypeReference result;
+            U temp;
+
+            if (replacementTable.TryGetValue((T)tr, out temp))
+                result = temp;
+            else
+                result = tr;
+
+            var git = result as GenericInstanceType;
+            if (git != null)
+                result = FilterGenericInstanceType<T, U>(git, replacementTable);
+
+            return result;
+        }
+
         private MethodDefinition CreateConstructor (TypeDefinition type) {
             var ctorMethod = new MethodDefinition(
                 ".ctor", MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, 
@@ -319,26 +374,36 @@ namespace ExceptionRewriter {
 
         private VariableDefinition ConvertToClosure (
             MethodDefinition method, ParameterDefinition fakeThis, HashSet<VariableReference> variables, 
-            HashSet<ParameterReference> parameters, out TypeDefinition closureType
+            HashSet<ParameterReference> parameters, out TypeDefinition closureTypeDefinition
         ) {
             var insns = method.Body.Instructions;
-            closureType = new TypeDefinition(
+            closureTypeDefinition = new TypeDefinition(
                 method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString(),
                 TypeAttributes.Class | TypeAttributes.NestedPrivate
             );
-            closureType.BaseType = method.Module.TypeSystem.Object;
-            method.DeclaringType.NestedTypes.Add(closureType);
+            closureTypeDefinition.BaseType = method.Module.TypeSystem.Object;
+            method.DeclaringType.NestedTypes.Add(closureTypeDefinition);
 
-            var ctorMethod = CreateConstructor(closureType);
+            var functionGpMapping = new Dictionary<TypeReference, GenericParameter>();
+            CopyGenericParameters(method.DeclaringType, closureTypeDefinition, functionGpMapping);
+            CopyGenericParameters(method, closureTypeDefinition, functionGpMapping);
+            foreach (var kvp in functionGpMapping)
+                closureTypeDefinition.GenericParameters.Add(kvp.Value);
+
+            var thisType = new GenericInstanceType(method.DeclaringType);
+            foreach (var p in method.DeclaringType.GenericParameters)
+                thisType.GenericArguments.Add(functionGpMapping[p]);
+
+            var ctorMethod = CreateConstructor(closureTypeDefinition);
 
             var isStatic = method.IsStatic;
 
             var localCount = 0;
-            var closureVar = new VariableDefinition(closureType);
+            var closureVar = new VariableDefinition(closureTypeDefinition);
 
             var extractedVariables = variables.ToDictionary(
                 v => (object)v, 
-                v => new FieldDefinition("local_" + localCount++, FieldAttributes.Public, v.VariableType)
+                v => new FieldDefinition("local_" + localCount++, FieldAttributes.Public, FilterTypeReference(v.VariableType, functionGpMapping))
             );
 
             method.Body.Variables.Add(closureVar);
@@ -349,19 +414,19 @@ namespace ExceptionRewriter {
                     continue;
 
                 var name = (p.Name != null) ? "arg_" + p.Name : "arg" + i;
-                extractedVariables[p] = new FieldDefinition(name, FieldAttributes.Public, p.ParameterType);
+                extractedVariables[p] = new FieldDefinition(name, FieldAttributes.Public, FilterTypeReference(p.ParameterType, functionGpMapping));
             }
 
             if (!isStatic)
-                extractedVariables[fakeThis] = new FieldDefinition("__this", FieldAttributes.Public, method.DeclaringType);
+                extractedVariables[fakeThis] = new FieldDefinition("__this", FieldAttributes.Public, thisType);
 
             foreach (var kvp in extractedVariables)
-                closureType.Fields.Add(kvp.Value);
+                closureTypeDefinition.Fields.Add(kvp.Value);
 
             FilterRange(
                 method, 0, insns.Count - 1, (insn) => {
                     var variable = (insn.Operand as VariableDefinition) 
-                    ?? LookupNumberedVariable(insn.OpCode.Code, method.Body.Variables);
+                        ?? LookupNumberedVariable(insn.OpCode.Code, method.Body.Variables);
                     var arg = (insn.Operand as ParameterDefinition)
                         ?? LookupNumberedArgument(insn.OpCode.Code, isStatic ? null : fakeThis, method.Parameters);
 
@@ -411,7 +476,7 @@ namespace ExceptionRewriter {
             CleanMethodBody(method, null, false);
 
             var toInject = new List<Instruction>() {
-                Instruction.Create(OpCodes.Newobj, closureType.Methods.First(m => m.Name == ".ctor")),
+                Instruction.Create(OpCodes.Newobj, closureTypeDefinition.Methods.First(m => m.Name == ".ctor")),
                 Instruction.Create(OpCodes.Stloc, closureVar)
             };
 
@@ -533,16 +598,28 @@ namespace ExceptionRewriter {
             Dictionary<object, object> mapping, HashSet<object> needsLdind
         ) {
             foreach (var pr in parameters) {
+                // FIXME: replacementTable
+                var filteredParamType = FilterTypeReference<TypeReference, TypeReference>(pr.ParameterType, null);
                 var newParamType =
-                    pr.ParameterType.IsByReference
-                        ? pr.ParameterType
-                        : new ByReferenceType(pr.ParameterType);
+                    filteredParamType.IsByReference
+                        ? filteredParamType
+                        : new ByReferenceType(filteredParamType);
                 var newParam = new ParameterDefinition("arg_" + pr.Name, ParameterAttributes.None, newParamType);
                 newMethod.Parameters.Add(newParam);
                 mapping[pr] = newParam;
-                if (newParamType != pr.ParameterType)
+                if (newParamType != filteredParamType)
                     needsLdind.Add(newParam);
             }
+        }
+
+        private void CopyGenericParameters (TypeDefinition sourceType, IGenericParameterProvider owner, Dictionary<TypeReference, GenericParameter> result) {
+            foreach (var gp in sourceType.GenericParameters)
+                result[gp] = new GenericParameter(gp.Name, owner);
+        }
+
+        private void CopyGenericParameters (MethodDefinition sourceMethod, IGenericParameterProvider owner, Dictionary<TypeReference, GenericParameter> result) {
+            foreach (var gp in sourceMethod.GenericParameters)
+                result[gp] = new GenericParameter(gp.Name, owner);
         }
 
         private ExcHandler ExtractCatch (
@@ -560,6 +637,12 @@ namespace ExceptionRewriter {
                 MethodAttributes.Static | MethodAttributes.Private,
                 method.Module.TypeSystem.Int32
             );
+
+            var gpMapping = new Dictionary<TypeReference, GenericParameter>();
+            CopyGenericParameters(method, catchMethod, gpMapping);
+            foreach (var kvp in gpMapping)
+                catchMethod.GenericParameters.Add(kvp.Value);
+
             catchMethod.Body.InitLocals = true;
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
             var excParam = new ParameterDefinition("__exc", ParameterAttributes.None, eh.CatchType ?? method.Module.TypeSystem.Object);
@@ -580,6 +663,13 @@ namespace ExceptionRewriter {
             FilterRange(
                 method, handlerFirstIndex, handlerLastIndex,
                 (insn) => {
+                    var operandTr = insn.Operand as TypeReference;
+                    if (operandTr != null) {
+                        var newOperandTr = FilterTypeReference(operandTr, gpMapping);
+                        if (newOperandTr != operandTr)
+                            insn.Operand = newOperandTr;
+                    }
+
                     switch (insn.OpCode.Code) {
                         case Code.Leave:
                         case Code.Leave_S:
@@ -601,12 +691,14 @@ namespace ExceptionRewriter {
 
             CleanMethodBody(catchMethod, method, false);
 
+            // FIXME: Use generic parameter mapping to replace GP type references
             var newMapping = ExtractRangeToMethod(
                 method, catchMethod, fakeThis,
                 insns.IndexOf(eh.HandlerStart), 
                 insns.IndexOf(eh.HandlerEnd) - 1,
                 deleteThem: true,
-                mapping: paramMapping
+                variableMapping: paramMapping,
+                typeMapping: gpMapping
             );
 
             var first = catchInsns[0];
@@ -735,19 +827,26 @@ namespace ExceptionRewriter {
             var insns = method.Body.Instructions;
             var closureType = closure.VariableType;
             var filterIndex = FilterIndex++;
-            var filterType = new TypeDefinition(
+            var filterTypeDefinition = new TypeDefinition(
                 method.DeclaringType.Namespace, method.Name + "__filter" + filterIndex.ToString(),
                 TypeAttributes.NestedPublic | TypeAttributes.Class,
                 GetExceptionFilter(method.Module)
             );
-            filterType.BaseType = GetExceptionFilter(method.Module);
-            method.DeclaringType.NestedTypes.Add(filterType);
-            CreateConstructor(filterType);
+
+            var gpMapping = new Dictionary<TypeReference, GenericParameter>();
+            CopyGenericParameters(method.DeclaringType, filterTypeDefinition, gpMapping);
+            CopyGenericParameters(method, filterTypeDefinition, gpMapping);
+            foreach (var kvp in gpMapping)
+                filterTypeDefinition.GenericParameters.Add(kvp.Value);
+
+            filterTypeDefinition.BaseType = GetExceptionFilter(method.Module);
+            method.DeclaringType.NestedTypes.Add(filterTypeDefinition);
+            CreateConstructor(filterTypeDefinition);
 
             var closureField = new FieldDefinition(
                 "closure", FieldAttributes.Public, closureType
             );
-            filterType.Fields.Add(closureField);
+            filterTypeDefinition.Fields.Add(closureField);
 
             var filterMethod = new MethodDefinition(
                 "Evaluate",
@@ -756,7 +855,7 @@ namespace ExceptionRewriter {
             );
             filterMethod.Body.InitLocals = true;
 
-            filterType.Methods.Add(filterMethod);
+            filterTypeDefinition.Methods.Add(filterMethod);
 
             var filterReplacement = Instruction.Create(OpCodes.Ret);
 
@@ -768,11 +867,14 @@ namespace ExceptionRewriter {
                 throw new Exception();
             i2--;
 
-            var mapping = new Dictionary<object, object> {
+            var variableMapping = new Dictionary<object, object> {
                 // FIXME
                 // {closure, closureField }
             };
-            var newVariables = ExtractRangeToMethod(method, filterMethod, fakeThis, i1, i2, true, mapping);
+            var newVariables = ExtractRangeToMethod(
+                method, filterMethod, fakeThis, i1, i2, true, 
+                variableMapping: variableMapping, typeMapping: gpMapping
+            );
             var newClosureLocal = (VariableDefinition)newVariables[closure];
 
             var filterInsns = filterMethod.Body.Instructions;
@@ -807,34 +909,39 @@ namespace ExceptionRewriter {
             var handler = ExtractCatch(method, eh, closure, fakeThis, group);
 
             handler.FilterMethod = filterMethod;
-            handler.FilterType = filterType;
-            handler.FilterVariable = new VariableDefinition(filterType);
+            handler.FilterType = filterTypeDefinition;
+            handler.FilterVariable = new VariableDefinition(filterTypeDefinition);
             method.Body.Variables.Add(handler.FilterVariable);
             handler.FirstFilterInsn = eh.FilterStart;
 
             return handler;
         }
 
-        private Dictionary<object, object> ExtractRangeToMethod (
+        private Dictionary<object, object> ExtractRangeToMethod<T, U> (
             MethodDefinition sourceMethod, MethodDefinition targetMethod, 
             ParameterDefinition fakeThis,
             int firstIndex, int lastIndex, bool deleteThem,
-            Dictionary<object, object> mapping,
+            Dictionary<object, object> variableMapping,
+            Dictionary<T, U> typeMapping,
             Func<Instruction, Instruction, Instruction> onFailedRemap = null
-        ) {
+        )
+            where T : TypeReference
+            where U : TypeReference
+        {
             var insns = sourceMethod.Body.Instructions;
             var targetInsns = targetMethod.Body.Instructions;
 
             foreach (var loc in sourceMethod.Body.Variables) {
-                if (mapping.ContainsKey(loc))
+                if (variableMapping.ContainsKey(loc))
                     continue;
                 var newLoc = new VariableDefinition(loc.VariableType);
                 targetMethod.Body.Variables.Add(newLoc);
-                mapping[loc] = newLoc;
+                variableMapping[loc] = newLoc;
             }
 
             CloneInstructions(
-                sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, targetInsns, 0, mapping, onFailedRemap
+                sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, 
+                targetInsns, 0, variableMapping, typeMapping, onFailedRemap
             );
 
             CleanMethodBody(targetMethod, sourceMethod, false);
@@ -851,7 +958,7 @@ namespace ExceptionRewriter {
                 CleanMethodBody(sourceMethod, null, false);
             }
 
-            return mapping;
+            return variableMapping;
         }
 
         private void RemoveRange (
@@ -1292,12 +1399,16 @@ namespace ExceptionRewriter {
                 throw new Exception(operand.ToString());
         }
 
-        private Instruction CloneInstruction (
+        private Instruction CloneInstruction<T, U> (
             Instruction i, 
             ParameterDefinition fakeThis,
             MethodDefinition method,
-            Dictionary<object, object> mapping = null
-        ) {
+            Dictionary<object, object> variableMapping,
+            Dictionary<T, U> typeMapping
+        )
+            where T : TypeReference
+            where U : TypeReference
+        {
             object operand = i.Operand ??
                 (object)LookupNumberedVariable(i.OpCode.Code, method.Body.Variables) ??
                 (object)LookupNumberedArgument(i.OpCode.Code, fakeThis, method.Parameters);
@@ -1309,7 +1420,14 @@ namespace ExceptionRewriter {
             if (operand == null)
                 return Instruction.Create(code);
 
-            var newOperand = (mapping != null) && mapping.ContainsKey(operand) ? mapping[operand] : operand;
+            object newOperand = operand;
+            if (variableMapping != null && variableMapping.ContainsKey(operand))
+                newOperand = variableMapping[operand];
+            else if (typeMapping != null) {
+                var operandTr = operand as T;
+                if (operandTr != null && typeMapping.ContainsKey(operandTr))
+                    newOperand = typeMapping[operandTr];
+            }
 
             if (newOperand is FieldReference) {
                 FieldReference fref = newOperand as FieldReference;
@@ -1346,21 +1464,25 @@ namespace ExceptionRewriter {
             }
         }
 
-        private void CloneInstructions (
+        private void CloneInstructions<T, U> (
             MethodDefinition sourceMethod,
             ParameterDefinition fakeThis,
             int sourceIndex, int count,
             Mono.Collections.Generic.Collection<Instruction> target,
             int targetIndex,
-            Dictionary<object, object> mapping = null,
+            Dictionary<object, object> variableMapping,
+            Dictionary<T, U> typeMapping,
             Func<Instruction, Instruction, Instruction> onFailedRemap = null
-        ) {
+        )
+            where T : TypeReference
+            where U : TypeReference
+        {
             if (sourceIndex < 0)
                 throw new ArgumentOutOfRangeException("sourceIndex");
 
             for (int n = 0; n < count; n++) {
                 var i = sourceMethod.Body.Instructions[n + sourceIndex];
-                var newInsn = CloneInstruction(i, fakeThis, sourceMethod, mapping);
+                var newInsn = CloneInstruction(i, fakeThis, sourceMethod, variableMapping, typeMapping);
                 target.Add(newInsn);
             }
 

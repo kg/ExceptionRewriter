@@ -39,11 +39,7 @@ namespace ExceptionRewriter {
 
             var result = new AnalyzedMethod {
                 Method = method,
-                SuppressRewriting = method.CustomAttributes.Any(ca => ca.AttributeType.Name == "SuppressRewritingAttribute") ||
-                    // FIXME: This is complicated so it's not being handled yet
-                    method.IsGenericInstance ||
-                    // FIXME: Same as above
-                    method.HasGenericParameters
+                SuppressRewriting = method.CustomAttributes.Any(ca => ca.AttributeType.Name == "SuppressRewritingAttribute")
             };
 
             var body = method.Body;
