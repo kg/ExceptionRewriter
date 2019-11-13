@@ -331,6 +331,28 @@ namespace ExceptionRewriter {
             }
         }
 
+        private TypeReference FilterByReferenceType<T, U> (ByReferenceType brt, Dictionary<T, U> replacementTable)
+            where T : TypeReference
+            where U : TypeReference
+        {
+            var et = FilterTypeReference<T, U>(brt.ElementType, replacementTable);
+            if (et != brt.ElementType)
+                return new ByReferenceType(et);
+            else
+                return brt;
+        }
+
+        private TypeReference FilterPointerType<T, U> (PointerType pt, Dictionary<T, U> replacementTable)
+            where T : TypeReference
+            where U : TypeReference
+        {
+            var et = FilterTypeReference<T, U>(pt.ElementType, replacementTable);
+            if (et != pt.ElementType)
+                return new PointerType(et);
+            else
+                return pt;
+        }
+
         private TypeReference FilterTypeReference<T, U> (TypeReference tr, Dictionary<T, U> replacementTable)
             where T : TypeReference
             where U : TypeReference
@@ -346,11 +368,23 @@ namespace ExceptionRewriter {
             else
                 result = tr;
 
-            var git = result as GenericInstanceType;
-            if (git != null)
-                result = FilterGenericInstanceType<T, U>(git, replacementTable);
+            for (int i = 0; i < 50; i++) {
+                var prev = result;
+                var git = result as GenericInstanceType;
+                var brt = result as ByReferenceType;
+                var pt = result as PointerType;
+                if (git != null)
+                    result = FilterGenericInstanceType<T, U>(git, replacementTable);
+                else if (brt != null)
+                    result = FilterByReferenceType<T, U>(brt, replacementTable);
+                else if (pt != null)
+                    result = FilterPointerType<T, U>(pt, replacementTable);
 
-            return result;
+                if (prev == result)
+                    return result;
+            }
+
+            throw new Exception();
         }
 
         private MethodDefinition CreateConstructor (TypeDefinition type) {
@@ -715,9 +749,10 @@ namespace ExceptionRewriter {
                         var operandVariable = i.Operand as VariableReference;
                         var operandParameter = i.Operand as ParameterReference;
                         var operandType = operandVariable?.VariableType ?? operandParameter.ParameterType;
-
-                        // ugh
-                        var newTempLocal = new VariableDefinition(operandType.IsByReference ? operandType.GetElementType() : operandType);
+                        var newOperandType = FilterTypeReference(operandType, gpMapping);
+                        var byRefNewOperand = newOperandType as ByReferenceType;
+                        
+                        var newTempLocal = new VariableDefinition(byRefNewOperand ?? new ByReferenceType(newOperandType));
                         catchMethod.Body.Variables.Add(newTempLocal);
 
                         return new[] {
