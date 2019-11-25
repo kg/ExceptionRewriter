@@ -55,6 +55,8 @@ namespace ExceptionRewriter {
 
             var tOpcodes = typeof(OpCodes);
 
+            // Table to convert Br_S, Brfalse_S, etc into full-length forms
+            //  because if you don't do this mono.cecil will silently generate bad IL
             foreach (var n in typeof(Code).GetEnumNames()) {
                 if (!n.EndsWith("_S"))
                     continue;
@@ -68,10 +70,11 @@ namespace ExceptionRewriter {
         }
 
         // The encouraged typeof() based import isn't valid because it will import
-        //  corelib types into netframework apps. yay
+        //  netcore corelib types into netframework apps and vice-versa
         private TypeReference ImportCorlibType (ModuleDefinition module, string @namespace, string name) {
             foreach (var m in Assembly.Modules) {
                 var ts = m.TypeSystem;
+                // Cecil uses this API internally to lookup corlib types by name before exposing them in TypeSystem
                 var mLookup = ts.GetType().GetMethod("LookupType", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                 var result = mLookup.Invoke(ts, new object[] { @namespace, name });
                 if (result != null)
@@ -81,6 +84,8 @@ namespace ExceptionRewriter {
             return null;
         }
 
+        // Locate an existing assembly reference to the specified assembly, then reference the
+        //  specified type by name from that assembly and import it
         private TypeReference ImportReferencedType (ModuleDefinition module, string assemblyName, string @namespace, string name) {
             var s = module.TypeSystem.String;
 
@@ -95,13 +100,6 @@ namespace ExceptionRewriter {
                         @namespace, name, ad.MainModule, ad.MainModule
                     );
                     return module.ImportReference(result);
-                    /*
-                    var result = new TypeReference(
-                        @namespace, name
-                    );
-                    if (result != null)
-                        return module.ImportReference((TypeReference)result);
-                        */
                 }
             }
 
@@ -130,24 +128,13 @@ namespace ExceptionRewriter {
         }
 
         public void Rewrite () {
-            var queue = new HashSet<AnalyzedMethod>();
-
             foreach (var m in Analyzer.Methods.Values) {
                 if (!m.ShouldRewrite)
                     continue;
 
-                queue.Add(m);
-            }
-
-            foreach (var m in queue) {
                 Console.WriteLine("Rewriting {0}", m.Method.FullName);
-                Rewrite(m);
+                ExtractExceptionFilters(m.Method);
             }
-        }
-
-        private void Rewrite (AnalyzedMethod am) {
-            var method = am.Method;
-            ExtractExceptionFilters(method);
         }
 
         private Instruction[] MakeDefault (
@@ -205,7 +192,7 @@ namespace ExceptionRewriter {
         }
 
         private void InsertOps (
-            Mono.Collections.Generic.Collection<Instruction> body, int offset, params Instruction[] ops
+            Collection<Instruction> body, int offset, params Instruction[] ops
         ) {
             for (int i = ops.Length - 1; i >= 0; i--)
                 body.Insert(offset, ops[i]);
