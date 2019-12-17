@@ -385,6 +385,64 @@ namespace ExceptionRewriter {
             throw new Exception();
         }
 
+        private T FilterMemberReference<T, U, V> (T mr, Dictionary<U, V> replacementTable)
+            where T : MemberReference
+            where U : TypeReference
+            where V : TypeReference
+        {
+            if ((replacementTable == null) || (replacementTable.Count == 0))
+                return mr;
+
+            var field = mr as FieldReference;
+            var meth = mr as MethodReference;
+            var prop = mr as PropertyReference;
+
+            if (field != null)
+                return FilterFieldReference<U, V>(field, replacementTable) as T;
+            else if (meth != null)
+                return FilterMethodReference<U, V>(meth, replacementTable) as T;
+            else if (prop != null)
+                return FilterPropertyReference<U, V>(prop, replacementTable) as T;
+            else
+                throw new Exception("Unhandled reference type");
+
+            return mr;
+        }
+
+        private MemberReference FilterPropertyReference<U, V> (PropertyReference prop, Dictionary<U, V> replacementTable)
+            where U : TypeReference
+            where V : TypeReference 
+        {
+            throw new NotImplementedException();
+        }
+
+        private MemberReference FilterMethodReference<U, V> (MethodReference meth, Dictionary<U, V> replacementTable)
+            where U : TypeReference
+            where V : TypeReference 
+        {
+            var result = new MethodReference(
+                meth.Name, 
+                FilterTypeReference(meth.ReturnType, replacementTable),
+                // FIXME: Is this correct?
+                FilterTypeReference(meth.DeclaringType, replacementTable)
+            ) {
+            };
+            return result;
+        }
+
+        private MemberReference FilterFieldReference<U, V> (FieldReference field, Dictionary<U, V> replacementTable)
+            where U : TypeReference
+            where V : TypeReference 
+        {
+            var result = new FieldReference(
+                field.Name,
+                FilterTypeReference(field.FieldType, replacementTable),
+                FilterTypeReference(field.DeclaringType, replacementTable)
+            ) {
+            };
+            return result;
+        }
+
         private MethodDefinition CreateConstructor (TypeDefinition type) {
             var ctorMethod = new MethodDefinition(
                 ".ctor", MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, 
@@ -405,8 +463,9 @@ namespace ExceptionRewriter {
         }
 
         private VariableDefinition ConvertToClosure (
-            MethodDefinition method, ParameterDefinition fakeThis, HashSet<VariableReference> variables, 
-            HashSet<ParameterReference> parameters, out TypeDefinition closureTypeDefinition
+            MethodDefinition method, ParameterDefinition fakeThis, 
+            HashSet<VariableReference> variables, HashSet<ParameterReference> parameters, 
+            out TypeDefinition closureTypeDefinition, out TypeReference closureTypeReference
         ) {
             var insns = method.Body.Instructions;
             closureTypeDefinition = new TypeDefinition(
@@ -423,15 +482,23 @@ namespace ExceptionRewriter {
                 closureTypeDefinition.GenericParameters.Add(kvp.Value);
 
             var thisType = new GenericInstanceType(method.DeclaringType);
-            foreach (var p in method.DeclaringType.GenericParameters)
+            var genClosureTypeReference = new GenericInstanceType(closureTypeDefinition);
+            foreach (var p in method.DeclaringType.GenericParameters) {
                 thisType.GenericArguments.Add(functionGpMapping[p]);
+                genClosureTypeReference.GenericArguments.Add(functionGpMapping[p]);
+            }
+
+            if (method.DeclaringType.GenericParameters.Count > 0)
+                closureTypeReference = genClosureTypeReference;
+            else
+                closureTypeReference = closureTypeDefinition;
 
             var ctorMethod = CreateConstructor(closureTypeDefinition);
 
             var isStatic = method.IsStatic;
 
             var localCount = 0;
-            var closureVar = new VariableDefinition(closureTypeDefinition);
+            var closureVar = new VariableDefinition(closureTypeReference);
 
             var extractedVariables = variables.ToDictionary(
                 v => (object)v, 
@@ -508,7 +575,7 @@ namespace ExceptionRewriter {
             CleanMethodBody(method, null, false);
 
             var toInject = new List<Instruction>() {
-                Instruction.Create(OpCodes.Newobj, closureTypeDefinition.Methods.First(m => m.Name == ".ctor")),
+                Instruction.Create(OpCodes.Newobj, new MethodReference(".ctor", method.DeclaringType.Module.TypeSystem.Void, closureTypeReference)),
                 Instruction.Create(OpCodes.Stloc, closureVar)
             };
 
@@ -700,6 +767,13 @@ namespace ExceptionRewriter {
                         var newOperandTr = FilterTypeReference(operandTr, gpMapping);
                         if (newOperandTr != operandTr)
                             insn.Operand = newOperandTr;
+                    }
+
+                    var operandMr = insn.Operand as MemberReference;
+                    if (operandMr != null) {
+                        var newOperandMr = FilterMemberReference(operandMr, gpMapping);
+                        if (newOperandMr != operandMr)
+                            insn.Operand = newOperandMr;
                     }
 
                     switch (insn.OpCode.Code) {
@@ -967,7 +1041,7 @@ namespace ExceptionRewriter {
             foreach (var loc in sourceMethod.Body.Variables) {
                 if (variableMapping.ContainsKey(loc))
                     continue;
-                var newLoc = new VariableDefinition(loc.VariableType);
+                var newLoc = new VariableDefinition(FilterTypeReference(loc.VariableType, typeMapping));
                 targetMethod.Body.Variables.Add(newLoc);
                 variableMapping[loc] = newLoc;
             }
@@ -1047,7 +1121,8 @@ namespace ExceptionRewriter {
 
             var efilt = GetExceptionFilter(method.Module);
             var excType = GetException(method.Module);
-            TypeDefinition closureType;
+            TypeDefinition closureTypeDefinition;
+            TypeReference closureTypeReference;
 
             var fakeThis = new ParameterDefinition("__this", ParameterAttributes.None, method.DeclaringType);
 
@@ -1055,7 +1130,10 @@ namespace ExceptionRewriter {
             var filterReferencedArguments = new HashSet<ParameterReference>();
             CollectReferencedLocals(method, method.IsStatic ? null : fakeThis, filterReferencedVariables, filterReferencedArguments);
 
-            var closure = ConvertToClosure(method, fakeThis, filterReferencedVariables, filterReferencedArguments, out closureType);
+            var closure = ConvertToClosure(
+                method, fakeThis, filterReferencedVariables, filterReferencedArguments, 
+                out closureTypeDefinition, out closureTypeReference
+            );
 
             var excVar = new VariableDefinition(method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
