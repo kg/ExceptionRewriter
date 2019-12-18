@@ -478,17 +478,19 @@ namespace ExceptionRewriter {
             var functionGpMapping = new Dictionary<TypeReference, GenericParameter>();
             CopyGenericParameters(method.DeclaringType, closureTypeDefinition, functionGpMapping);
             CopyGenericParameters(method, closureTypeDefinition, functionGpMapping);
-            foreach (var kvp in functionGpMapping)
-                closureTypeDefinition.GenericParameters.Add(kvp.Value);
 
             var thisType = new GenericInstanceType(method.DeclaringType);
             var genClosureTypeReference = new GenericInstanceType(closureTypeDefinition);
+
             foreach (var p in method.DeclaringType.GenericParameters) {
                 thisType.GenericArguments.Add(functionGpMapping[p]);
                 genClosureTypeReference.GenericArguments.Add(functionGpMapping[p]);
             }
 
-            if (method.DeclaringType.GenericParameters.Count > 0)
+            foreach (var p in method.GenericParameters)
+                genClosureTypeReference.GenericArguments.Add(functionGpMapping[p]);
+
+            if ((method.DeclaringType.GenericParameters.Count + method.GenericParameters.Count) > 0)
                 closureTypeReference = genClosureTypeReference;
             else
                 closureTypeReference = closureTypeDefinition;
@@ -711,14 +713,25 @@ namespace ExceptionRewriter {
             }
         }
 
-        private void CopyGenericParameters (TypeDefinition sourceType, IGenericParameterProvider owner, Dictionary<TypeReference, GenericParameter> result) {
-            foreach (var gp in sourceType.GenericParameters)
+        private void CopyGenericParameters (TypeDefinition sourceType, TypeDefinition owner, Dictionary<TypeReference, GenericParameter> result) {
+            foreach (var gp in sourceType.GenericParameters) {
                 result[gp] = new GenericParameter(gp.Name, owner);
+                owner.GenericParameters.Add(result[gp]);
+            }
         }
 
-        private void CopyGenericParameters (MethodDefinition sourceMethod, IGenericParameterProvider owner, Dictionary<TypeReference, GenericParameter> result) {
-            foreach (var gp in sourceMethod.GenericParameters)
+        private void CopyGenericParameters (MethodDefinition sourceMethod, TypeDefinition owner, Dictionary<TypeReference, GenericParameter> result) {
+            foreach (var gp in sourceMethod.GenericParameters) {
                 result[gp] = new GenericParameter(gp.Name, owner);
+                owner.GenericParameters.Add(result[gp]);
+            }
+        }
+
+        private void CopyGenericParameters (MethodDefinition sourceMethod, MethodDefinition owner, Dictionary<TypeReference, GenericParameter> result) {
+            foreach (var gp in sourceMethod.GenericParameters) {
+                result[gp] = new GenericParameter(gp.Name, owner);
+                owner.GenericParameters.Add(result[gp]);
+            }
         }
 
         private ExcHandler ExtractCatch (
@@ -739,8 +752,6 @@ namespace ExceptionRewriter {
 
             var gpMapping = new Dictionary<TypeReference, GenericParameter>();
             CopyGenericParameters(method, catchMethod, gpMapping);
-            foreach (var kvp in gpMapping)
-                catchMethod.GenericParameters.Add(kvp.Value);
 
             catchMethod.Body.InitLocals = true;
             var closureParam = new ParameterDefinition("__closure", ParameterAttributes.None, closureType);
@@ -943,8 +954,6 @@ namespace ExceptionRewriter {
             var gpMapping = new Dictionary<TypeReference, GenericParameter>();
             CopyGenericParameters(method.DeclaringType, filterTypeDefinition, gpMapping);
             CopyGenericParameters(method, filterTypeDefinition, gpMapping);
-            foreach (var kvp in gpMapping)
-                filterTypeDefinition.GenericParameters.Add(kvp.Value);
 
             filterTypeDefinition.BaseType = GetExceptionFilter(method.Module);
             method.DeclaringType.NestedTypes.Add(filterTypeDefinition);
