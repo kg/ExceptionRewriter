@@ -7,19 +7,26 @@ using Mono.Cecil.Cil;
 
 namespace ExceptionRewriter {
     class Program {
-        public static int Main (string[] args) {
+        public static int Main (string[] _args) {
             try {
-                var argv = args.ToList();
-                if (argv.Count < 2) {
+                var options = new RewriteOptions();
+
+                foreach (var arg in _args)
+                    ParseArgument(arg, options);
+
+                var argv = _args.Where(arg => !arg.StartsWith("-")).ToArray();
+
+                if (argv.Length < 2) {
                     Usage();
                     return 1;
                 }
 
-                for (int i = 0; i < args.Length; i += 2) {
-                    var src = args[i];
-                    var dst = args[i + 1];
+                for (int i = 0; i < argv.Length; i += 2) {
+                    var src = argv[i];
+                    var dst = argv[i + 1];
 
-                    Console.WriteLine($"{Path.GetFileName(src)} -> {Path.GetFileName(dst)}...");
+                    if (options.Verbose)
+                        Console.WriteLine($"{Path.GetFileName(src)} -> {Path.GetFileName(dst)}...{Environment.NewLine}====");
 
                     var assemblyResolver = new DefaultAssemblyResolver();
                     assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(src));
@@ -31,9 +38,7 @@ namespace ExceptionRewriter {
                         ReadSymbols = true,
                         SymbolReaderProvider = new DefaultSymbolReaderProvider(throwIfNoSymbol: false)
                     })) {
-                        Console.WriteLine("====");
-
-                        var arw = new AssemblyRewriter(def);
+                        var arw = new AssemblyRewriter(def, options);
                         arw.Rewrite();
 
                         var shouldWriteSymbols = def.MainModule.SymbolReader != null;
@@ -51,7 +56,6 @@ namespace ExceptionRewriter {
                     File.Delete(dst + ".tmp");
                 }
 
-                Console.WriteLine("Done");
                 return 0;
             } finally {
                 if (Debugger.IsAttached) {
@@ -61,8 +65,43 @@ namespace ExceptionRewriter {
             }
         }
 
+        static void ParseArgument (string arg, RewriteOptions options) {
+            if (!arg.StartsWith("-"))
+                return;
+
+            switch (arg) {
+                case "--abort":
+                    options.ThrowOnError = true;
+                    break;
+                case "--warn":
+                    options.ThrowOnError = false;
+                    break;
+                case "--generics":
+                    options.EnableGenerics = true;
+                    break;
+                case "--no-generics":
+                    options.EnableGenerics = false;
+                    break;
+                case "--verbose":
+                    options.Verbose = true;
+                    break;
+                case "--quiet":
+                    options.Verbose = false;
+                    break;
+                default:
+                    throw new Exception("Unsupported argument: " + arg);
+            }
+        }
+
         static void Usage () {
-            Console.WriteLine("Expected: exceptionrewriter [input] [output] ...");
+            Console.WriteLine(@"Expected: exceptionrewriter [options] input output ...
+--abort       Abort on error (default)
+--warn        On error, output warning instead of aborting
+--generics    Enable rewriting filters for generics (currently broken)
+--no-generics Disable rewriting filters for generics (default)
+--verbose     Output name of every rewritten method (default)
+--quiet       Do not output anything");
+
         }
     }
 }

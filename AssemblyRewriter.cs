@@ -8,11 +8,14 @@ using Mono.Cecil.Cil;
 using Mono.Collections.Generic;
 
 namespace ExceptionRewriter {
-    public class AssemblyRewriter {
-        public bool EnableGenerics;
+    public class RewriteOptions {
+        public bool EnableGenerics = false;
         public bool Verbose = true;
         public bool ThrowOnError = true;
+    }
 
+    public class AssemblyRewriter {
+        public readonly RewriteOptions Options;
         public readonly AssemblyDefinition Assembly;
 
         private int ClosureIndex, FilterIndex;
@@ -52,8 +55,9 @@ namespace ExceptionRewriter {
             {Code.Starg_S, OpCodes.Stloc }
         };
 
-        public AssemblyRewriter (AssemblyDefinition assembly) {
+        public AssemblyRewriter (AssemblyDefinition assembly, RewriteOptions options) {
             Assembly = assembly;
+            Options = options;
 
             var tOpcodes = typeof(OpCodes);
 
@@ -1146,7 +1150,18 @@ namespace ExceptionRewriter {
             if (!method.Body.ExceptionHandlers.Any(eh => eh.FilterStart != null))
                 return;
 
-            if (Verbose)
+            if (!Options.EnableGenerics) {
+                if (method.HasGenericParameters || method.DeclaringType.HasGenericParameters) {
+                    var msg = $"Method {method.FullName} contains an exception filter and generics are disabled";
+                    if (Options.ThrowOnError)
+                        throw new Exception(msg);
+
+                    Console.WriteLine(msg);
+                    return;
+                }
+            }
+
+            if (Options.Verbose)
                 Console.WriteLine("Rewriting {0}", method.FullName);
 
             // FIXME: Cecil currently throws inside the native PDB writer on methods we've modified
