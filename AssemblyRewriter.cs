@@ -9,8 +9,11 @@ using Mono.Collections.Generic;
 
 namespace ExceptionRewriter {
     public class AssemblyRewriter {
+        public bool EnableGenerics;
+        public bool Verbose = true;
+        public bool ThrowOnError = true;
+
         public readonly AssemblyDefinition Assembly;
-        public readonly AssemblyAnalyzer Analyzer;
 
         private int ClosureIndex, FilterIndex;
 
@@ -49,9 +52,8 @@ namespace ExceptionRewriter {
             {Code.Starg_S, OpCodes.Stloc }
         };
 
-        public AssemblyRewriter (AssemblyAnalyzer analyzer) {
-            Assembly = analyzer.Input;
-            Analyzer = analyzer;
+        public AssemblyRewriter (AssemblyDefinition assembly) {
+            Assembly = assembly;
 
             var tOpcodes = typeof(OpCodes);
 
@@ -128,12 +130,11 @@ namespace ExceptionRewriter {
         }
 
         public void Rewrite () {
-            foreach (var m in Analyzer.Methods.Values) {
-                if (!m.ShouldRewrite)
-                    continue;
-
-                Console.WriteLine("Rewriting {0}", m.Method.FullName);
-                ExtractExceptionFilters(m.Method);
+            foreach (var mod in Assembly.Modules) {
+                // Make temporary copy of the types and methods lists because we mutate them while iterating
+                foreach (var type in mod.Types.ToArray())
+                    foreach (var meth in type.Methods.ToArray())
+                        ExtractExceptionFilters(meth);
             }
         }
 
@@ -427,6 +428,8 @@ namespace ExceptionRewriter {
                 FilterTypeReference(meth.DeclaringType, replacementTable)
             ) {
             };
+            foreach (var p in meth.Parameters)
+                result.Parameters.Add(new ParameterDefinition(p.Name, p.Attributes, FilterTypeReference(p.ParameterType, replacementTable)));
             return result;
         }
 
@@ -1126,6 +1129,18 @@ namespace ExceptionRewriter {
         }
 
         private void ExtractExceptionFilters (MethodDefinition method) {
+            if (!method.HasBody)
+                return;
+
+            if (method.Body.ExceptionHandlers.Count == 0)
+                return;
+
+            if (!method.Body.ExceptionHandlers.Any(eh => eh.FilterStart != null))
+                return;
+
+            if (Verbose)
+                Console.WriteLine("Rewriting {0}", method.FullName);
+
             CleanMethodBody(method, null, false);
 
             var efilt = GetExceptionFilter(method.Module);
@@ -1153,7 +1168,6 @@ namespace ExceptionRewriter {
             var handlersByTry = method.Body.ExceptionHandlers.ToLookup(eh => (eh.TryStart, eh.TryEnd));
 
             var newGroups = new List<ExcGroup>();
-            var filterIndex = 0;
             var filtersToInsert = new List<(TypeDefinition, ExceptionHandler)>();
 
             foreach (var group in handlersByTry) {

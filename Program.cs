@@ -24,19 +24,19 @@ namespace ExceptionRewriter {
                     assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(src));
 
                     using (var def = AssemblyDefinition.ReadAssembly(src, new ReaderParameters {
-                        ReadWrite = true,
+                        ReadWrite = false,
                         ReadingMode = ReadingMode.Immediate,
-                        AssemblyResolver = assemblyResolver
+                        AssemblyResolver = assemblyResolver,
+                        ReadSymbols = true
                     })) {
-                        var aa = new AssemblyAnalyzer(def);
-                        aa.Analyze();
-
                         Console.WriteLine("====");
 
-                        var arw = new AssemblyRewriter(aa);
+                        var arw = new AssemblyRewriter(def);
                         arw.Rewrite();
 
-                        def.Write(dst + ".tmp");
+                        def.Write(dst + ".tmp", new WriterParameters {
+                            WriteSymbols = true
+                        });
                     }
 
                     File.Copy(dst + ".tmp", dst, true);

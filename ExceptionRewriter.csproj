@@ -7,12 +7,16 @@
 
   <ItemGroup>
     <Compile Remove="ExceptionFilterSupport\**" />
+    <Compile Remove="Upstream\**" />
     <EmbeddedResource Remove="ExceptionFilterSupport\**" />
+    <EmbeddedResource Remove="Upstream\**" />
     <None Remove="ExceptionFilterSupport\**" />
+    <None Remove="Upstream\**" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Mono.Cecil" Version="0.11.0" />
+    <ProjectReference Include="Upstream\Cecil\Mono.Cecil.csproj" />
+    <ProjectReference Include="Upstream\Cecil\symbols\pdb\Mono.Cecil.Pdb.csproj" />
   </ItemGroup>
 
 </Project>
