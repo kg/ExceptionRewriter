@@ -132,7 +132,7 @@ namespace ExceptionRewriter {
         public void Rewrite () {
             foreach (var mod in Assembly.Modules) {
                 // Make temporary copy of the types and methods lists because we mutate them while iterating
-                foreach (var type in mod.Types.ToArray())
+                foreach (var type in mod.GetTypes())
                     foreach (var meth in type.Methods.ToArray())
                         ExtractExceptionFilters(meth);
             }
@@ -1140,6 +1140,11 @@ namespace ExceptionRewriter {
 
             if (Verbose)
                 Console.WriteLine("Rewriting {0}", method.FullName);
+
+            // FIXME: Cecil currently throws inside the native PDB writer on methods we've modified
+            //  presumably because we need to manually update the debugging information after removing
+            //  instructions from the method body.
+            method.DebugInformation = null;
 
             CleanMethodBody(method, null, false);
 
