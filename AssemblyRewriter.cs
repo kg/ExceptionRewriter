@@ -473,7 +473,7 @@ namespace ExceptionRewriter {
             var insns = method.Body.Instructions;
             closureTypeDefinition = new TypeDefinition(
                 method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString(),
-                TypeAttributes.Class | TypeAttributes.NestedPrivate
+                TypeAttributes.Class | TypeAttributes.NestedPublic
             );
             closureTypeDefinition.BaseType = method.Module.TypeSystem.Object;
             method.DeclaringType.NestedTypes.Add(closureTypeDefinition);
@@ -579,8 +579,16 @@ namespace ExceptionRewriter {
 
             CleanMethodBody(method, null, false);
 
+            var ctorRef = new MethodReference(
+                ".ctor", method.DeclaringType.Module.TypeSystem.Void, closureTypeReference
+            ) {
+                // CallingConvention = MethodCallingConvention.ThisCall,
+                ExplicitThis = false,
+                HasThis = true
+            };
+
             var toInject = new List<Instruction>() {
-                Instruction.Create(OpCodes.Newobj, new MethodReference(".ctor", method.DeclaringType.Module.TypeSystem.Void, closureTypeReference)),
+                Instruction.Create(OpCodes.Newobj, ctorRef),
                 Instruction.Create(OpCodes.Stloc, closureVar)
             };
 
