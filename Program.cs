@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using Mono.Cecil;
+using Mono.Cecil.Cil;
 
 namespace ExceptionRewriter {
     class Program {
@@ -27,7 +28,8 @@ namespace ExceptionRewriter {
                         ReadWrite = false,
                         ReadingMode = ReadingMode.Immediate,
                         AssemblyResolver = assemblyResolver,
-                        ReadSymbols = true
+                        ReadSymbols = true,
+                        SymbolReaderProvider = new DefaultSymbolReaderProvider(throwIfNoSymbol: false)
                     })) {
                         Console.WriteLine("====");
 
@@ -35,7 +37,7 @@ namespace ExceptionRewriter {
                         arw.Rewrite();
 
                         def.Write(dst + ".tmp", new WriterParameters {
-                            WriteSymbols = true
+                            WriteSymbols = def.MainModule.SymbolReader != null
                         });
                     }
 
