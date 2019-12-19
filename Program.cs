@@ -36,12 +36,18 @@ namespace ExceptionRewriter {
                         var arw = new AssemblyRewriter(def);
                         arw.Rewrite();
 
+                        var shouldWriteSymbols = def.MainModule.SymbolReader != null;
+
                         def.Write(dst + ".tmp", new WriterParameters {
-                            WriteSymbols = def.MainModule.SymbolReader != null
+                            WriteSymbols = shouldWriteSymbols
                         });
                     }
 
                     File.Copy(dst + ".tmp", dst, true);
+                    if (File.Exists(dst + ".pdb")) {
+                        File.Copy(dst + ".pdb", dst.Replace(".exe", ".pdb"), true);
+                        File.Delete(dst + ".pdb");
+                    }
                     File.Delete(dst + ".tmp");
                 }
 
