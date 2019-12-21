@@ -12,6 +12,7 @@ namespace ExceptionRewriter {
         public bool EnableGenerics = false;
         public bool Verbose = true;
         public bool ThrowOnError = true;
+        internal bool Overwrite;
     }
 
     public class AssemblyRewriter {

@@ -16,17 +16,20 @@ namespace ExceptionRewriter {
 
                 var argv = _args.Where(arg => !arg.StartsWith("-")).ToArray();
 
-                if (argv.Length < 2) {
+                var step = options.Overwrite ? 1 : 2;
+                if (argv.Length < step) {
                     Usage();
                     return 1;
                 }
 
-                for (int i = 0; i < argv.Length; i += 2) {
+                for (int i = 0; i < argv.Length; i += step) {
                     var src = argv[i];
-                    var dst = argv[i + 1];
+                    var dst = options.Overwrite ? src : argv[i + 1];
 
                     if (options.Verbose)
-                        Console.WriteLine($"{Path.GetFileName(src)} -> {Path.GetFileName(dst)}...{Environment.NewLine}====");
+                        Console.WriteLine($"{Path.GetFileName(src)} -> {Path.GetFullPath(dst)}...{Environment.NewLine}====");
+                    else
+                        Console.WriteLine($"{Path.GetFileName(src)} -> {Path.GetFullPath(dst)}");
 
                     var assemblyResolver = new DefaultAssemblyResolver();
                     assemblyResolver.AddSearchDirectory(Path.GetDirectoryName(src));
@@ -70,6 +73,9 @@ namespace ExceptionRewriter {
                 return;
 
             switch (arg) {
+                case "--overwrite":
+                    options.Overwrite = true;
+                    break;
                 case "--abort":
                     options.ThrowOnError = true;
                     break;
@@ -94,7 +100,9 @@ namespace ExceptionRewriter {
         }
 
         static void Usage () {
-            Console.WriteLine(@"Expected: exceptionrewriter [options] input output ...
+            Console.WriteLine(@"Expected: exceptionrewriter [options] input output [input2 output2] ...
+or        exceptionrewriter [options] --overwrite file1 [file2] ...
+--overwrite   Overwrite source file with rewritten output (input is a list of filenames instead of in/out pairs)
 --abort       Abort on error (default)
 --warn        On error, output warning instead of aborting
 --generics    Enable rewriting filters for generics (currently broken)
