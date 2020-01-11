@@ -493,6 +493,13 @@ namespace ExceptionRewriter {
 			return result;
 		}
 
+        private Instruction Nop (string description = null) 
+        {
+            var result = Instruction.Create (OpCodes.Nop);
+            result.Operand = description;
+            return result;
+        }
+
 		private MethodDefinition CreateConstructor (TypeDefinition type) 
 		{
 			var ctorMethod = new MethodDefinition (
@@ -507,7 +514,7 @@ namespace ExceptionRewriter {
 						".ctor", type.Module.TypeSystem.Void, 
 						type.BaseType
 					) { HasThis = true }),
-				Instruction.Create (OpCodes.Nop),
+				Nop (),
 				Instruction.Create (OpCodes.Ret)
 			});
 			return ctorMethod;
@@ -726,8 +733,6 @@ namespace ExceptionRewriter {
 				insn.Operand = newOperand;
 			}
 
-			CleanMethodBody (method, null, false);
-
 			foreach (var eh in method.Body.ExceptionHandlers) {
 				eh.FilterStart = PostFilterRange (remapTableFirst, eh.FilterStart);
 				eh.TryStart = PostFilterRange (remapTableFirst, eh.TryStart);
@@ -735,6 +740,8 @@ namespace ExceptionRewriter {
 				eh.HandlerStart = PostFilterRange (remapTableFirst, eh.HandlerStart);
 				eh.HandlerEnd = PostFilterRange (remapTableFirst, eh.HandlerEnd);
 			}
+
+			CleanMethodBody (method, null, false);
 		}
 
 		private void GenerateParameters (
@@ -872,6 +879,8 @@ namespace ExceptionRewriter {
 
 			CleanMethodBody (catchMethod, method, false);
 
+			method.DeclaringType.Methods.Add (catchMethod);
+
 			// FIXME: Use generic parameter mapping to replace GP type references
 			var newMapping = ExtractRangeToMethod (
 				method, catchMethod, fakeThis,
@@ -921,8 +930,6 @@ namespace ExceptionRewriter {
 			});
 
 			CleanMethodBody (catchMethod, method, true);
-
-			method.DeclaringType.Methods.Add (catchMethod);
 
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
 			var handler = new ExcHandler {
@@ -1050,6 +1057,9 @@ namespace ExceptionRewriter {
 				throw new Exception ($"Handler start instruction {eh.HandlerStart} not found in method body");
 			i2--;
 
+            if (i2 <= i1)
+                throw new Exception("Handler size was 0 or less");
+
 			var variableMapping = new Dictionary<object, object> {
 				// FIXME
 				// {closure, closureField }
@@ -1061,6 +1071,8 @@ namespace ExceptionRewriter {
 			var newClosureLocal = (VariableDefinition)newVariables[closure];
 
 			var filterInsns = filterMethod.Body.Instructions;
+            if (filterInsns.Count <= 0)
+                throw new Exception("Filter body was empty");
 
 			var oldFilterInsn = filterInsns[filterInsns.Count - 1];
 			filterInsns[filterInsns.Count - 1] = filterReplacement;
@@ -1132,19 +1144,28 @@ namespace ExceptionRewriter {
 
 			var oldFirstInsn = insns[firstIndex];
             var oldLastInsn = insns[lastIndex];
-			var newFirstInsn = Instruction.Create (OpCodes.Nop);
+			var newFirstInsn = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):start");
 			insns[firstIndex] = newFirstInsn;
-            var newLastInsn = Instruction.Create(OpCodes.Nop);
-            insns[lastIndex] = newLastInsn;
 			// FIXME: This should not be necessary
 			Patch (sourceMethod, context, oldFirstInsn, newFirstInsn);
+
+            var newLastInsn = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):end");
+            insns[lastIndex] = newLastInsn;
             Patch (sourceMethod, context, oldLastInsn, newLastInsn);
 
 			if (deleteThem) {
-				for (int i = lastIndex; i > firstIndex; i--)
-					insns.RemoveAt (i);
+                var removedInstructions = new List<Instruction>();
 
-				CleanMethodBody (sourceMethod, null, false);
+				for (int i = lastIndex - 1; i > firstIndex; i--) {
+                    var oldInsn = insns[i];
+                    // FIXME: This also should not be necessary, and it breaks extraction after the first filter
+                    // Patch (sourceMethod, context, oldInsn, newFirstInsn);
+					insns.RemoveAt (i);
+                    removedInstructions.Add(oldInsn);
+                }
+
+                // FIXME: The exception handler state here may be messy because the caller has more work to do
+				CleanMethodBody (sourceMethod, null, false, removedInstructions);
 			}
 
 			return variableMapping;
@@ -1168,14 +1189,21 @@ namespace ExceptionRewriter {
 		{
 			var coll = method.Body.Instructions;
 			var lastOne = coll[lastIndex];
-			var newLast = Instruction.Create (OpCodes.Nop);
+            var newFirst = Nop ("<unnamed>:start");
+			var newLast = Nop ("<unnamed>:end");
 
-			for (int i = lastIndex; i > firstIndex; i--) {
-				Patch (method, context, coll[i], newLast);
-				if (i == lastIndex)
-					coll[lastIndex] = newLast;
-				else
-					coll.RemoveAt (i);
+			for (int i = lastIndex; i >= firstIndex; i--) {
+                if (i == firstIndex) {
+				    Patch (method, context, coll[i], newFirst);
+                    coll[i] = newFirst;
+                } else {
+				    Patch (method, context, coll[i], newLast);
+
+                    if (i == lastIndex)
+                        coll[i] = newLast;
+                    else
+					    coll.RemoveAt (i);
+                }
 			}
 		}
 
@@ -1361,7 +1389,7 @@ namespace ExceptionRewriter {
             method.Body.Variables.Add(excVar);
 
             var insns = method.Body.Instructions;
-            insns.Insert(0, Instruction.Create(OpCodes.Nop));
+            insns.Insert(0, Nop ("header"));
 
             bool iterating = true;
             int passNumber = 0;
@@ -1460,7 +1488,7 @@ namespace ExceptionRewriter {
                         var oldIndex = insns.IndexOf(h.Handler.TryStart);
                         if (oldIndex < 0)
                             throw new Exception($"Handler trystart not found in method body: {h.Handler.TryStart}");
-                        var nop = Instruction.Create(OpCodes.Nop);
+                        var nop = Nop ("filter block start");
                         insns[oldIndex] = nop;
                         Patch(method, context, h.Handler.TryStart, insns[oldIndex]);
                         InsertOps(insns, oldIndex + 1, filterInitInsns);
@@ -1497,9 +1525,9 @@ namespace ExceptionRewriter {
                     throw new Exception($"Handler end instruction {eg.TryEnd} not found in method body");
 
                 var tryExit = insns[newHandlerOffset + 1];
-                var newHandlerStart = Instruction.Create(OpCodes.Nop);
+                var newHandlerStart = Nop ("new handler start");
                 Instruction newHandlerEnd, handlerFallthroughRethrow;
-                handlerFallthroughRethrow = hasAnyCatchAll ? Instruction.Create(OpCodes.Nop) : Instruction.Create(OpCodes.Rethrow);
+                handlerFallthroughRethrow = hasAnyCatchAll ? Nop ("fallthrough rethrow (dead)") : Instruction.Create(OpCodes.Rethrow);
                 newHandlerEnd = Instruction.Create(OpCodes.Leave, tryExit);
 
                 var handlerBody = new List<Instruction> {
@@ -1507,10 +1535,10 @@ namespace ExceptionRewriter {
                     Instruction.Create (OpCodes.Stloc, excVar)
                 };
 
-                var breakOut = Instruction.Create(OpCodes.Nop);
+                var breakOut = Nop ("breakOut");
 
                 foreach (var h in eg.Handlers) {
-                    var skip = Instruction.Create(OpCodes.Nop);
+                    var skip = Nop ("skip");
 
                     var fv = h.FilterVariable;
                     if (fv != null) {
@@ -1677,7 +1705,23 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify) 
+        private void CheckInRange (Instruction insn, MethodDefinition method, MethodDefinition oldMethod, List<Instruction> removedInstructions) {
+            if (insn == null)
+                return;
+
+            var s = ((removedInstructions != null) && removedInstructions.Contains(insn))
+                ? "Removed instruction"
+                : "Instruction";
+
+			if (method.Body.Instructions.IndexOf (insn) < 0)
+				throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
+			else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
+				throw new Exception ($"{s} {insn} is present in old method for method {method.FullName}");
+
+            return;
+        }
+
+		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
 			foreach (var i in insns)
@@ -1696,10 +1740,7 @@ namespace ExceptionRewriter {
 				var opVar = i.Operand as VariableDefinition;
 
 				if (opInsn != null) {
-					if (insns.IndexOf (opInsn) < 0)
-						throw new Exception ($"Branch target {i.Operand} of opcode {i} is missing for method {method.FullName}");
-					else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (opInsn) >= 0)
-						throw new Exception ($"Branch target {i.Operand} of opcode {i} is present in old method for method {method.FullName}");
+                    CheckInRange(opInsn, method, oldMethod, removedInstructions);
 				} else if (opArg != null) {
 					if ((opArg.Name == "__this") && method.HasThis) {
 						// HACK: method.Body.ThisParameter is unreliable for confusing reasons, and isn't
@@ -1728,6 +1769,14 @@ namespace ExceptionRewriter {
 			foreach (var v in method.Body.Variables)
 				if (v.Index != method.Body.Variables.IndexOf (v))
 					throw new Exception ($"variable index mismatch for method {method.FullName}");
+
+            foreach (var eh in method.Body.ExceptionHandlers) {
+                CheckInRange(eh.HandlerStart, method, oldMethod, removedInstructions);
+                CheckInRange(eh.HandlerEnd, method, oldMethod, removedInstructions);
+                CheckInRange(eh.FilterStart, method, oldMethod, removedInstructions);
+                CheckInRange(eh.TryStart, method, oldMethod, removedInstructions);
+                CheckInRange(eh.TryEnd, method, oldMethod, removedInstructions);
+            }
 		}
 
 		private bool TryRemapInstruction (
