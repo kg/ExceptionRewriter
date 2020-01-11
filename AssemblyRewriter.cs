@@ -1325,6 +1325,8 @@ namespace ExceptionRewriter {
 				out closureTypeDefinition, out closureTypeReference
 			);
 
+            CleanMethodBody(method, null, true);
+
 			var excVar = new VariableDefinition (method.Module.TypeSystem.Object);
 			method.Body.Variables.Add (excVar);
 
