@@ -892,44 +892,46 @@ namespace ExceptionRewriter {
                 context: context
 			);
 
-			var first = catchInsns[0];
+            if (catchInsns.Count > 0) {
+			    var first = catchInsns[0];
 
-			InsertOps (
-				catchInsns, 0, new[] {
-					Instruction.Create (OpCodes.Ldarg, excParam)
-				}
-			);
+			    InsertOps (
+				    catchInsns, 0, new[] {
+					    Instruction.Create (OpCodes.Ldarg, excParam)
+				    }
+			    );
 
-			FilterRange (catchMethod, 0, catchMethod.Body.Instructions.Count - 1, (i) => {
-				if (needsLdind.Contains (i.Operand)) {
-					if (IsStoreOperation (i.OpCode.Code)) {
-						var operandVariable = i.Operand as VariableReference;
-						var operandParameter = i.Operand as ParameterReference;
-						var operandType = operandVariable?.VariableType ?? operandParameter.ParameterType;
-						var newOperandType = FilterTypeReference (operandType, gpMapping);
-						var byRefNewOperand = newOperandType as ByReferenceType;
+			    FilterRange (catchMethod, 0, catchMethod.Body.Instructions.Count - 1, (i) => {
+				    if (needsLdind.Contains (i.Operand)) {
+					    if (IsStoreOperation (i.OpCode.Code)) {
+						    var operandVariable = i.Operand as VariableReference;
+						    var operandParameter = i.Operand as ParameterReference;
+						    var operandType = operandVariable?.VariableType ?? operandParameter.ParameterType;
+						    var newOperandType = FilterTypeReference (operandType, gpMapping);
+						    var byRefNewOperand = newOperandType as ByReferenceType;
 						
-						var newTempLocal = new VariableDefinition (byRefNewOperand?.ElementType ?? newOperandType);
-						catchMethod.Body.Variables.Add (newTempLocal);
+						    var newTempLocal = new VariableDefinition (byRefNewOperand?.ElementType ?? newOperandType);
+						    catchMethod.Body.Variables.Add (newTempLocal);
 
-						return new[] {
-							Instruction.Create (OpCodes.Stloc, newTempLocal),
-							i.Operand is VariableReference
-								? Instruction.Create (OpCodes.Ldloc, (VariableDefinition)i.Operand)
-								: Instruction.Create (OpCodes.Ldarg, (ParameterDefinition)i.Operand),
-							Instruction.Create (OpCodes.Ldloc, newTempLocal),
-							Instruction.Create (SelectStindForOperand (i.Operand))
-						};
-					} else
-						return new[] {
-							i,
-							Instruction.Create (SelectLdindForOperand (i.Operand))
-						};
-				} else
-					return null;
-			});
+						    return new[] {
+							    Instruction.Create (OpCodes.Stloc, newTempLocal),
+							    i.Operand is VariableReference
+								    ? Instruction.Create (OpCodes.Ldloc, (VariableDefinition)i.Operand)
+								    : Instruction.Create (OpCodes.Ldarg, (ParameterDefinition)i.Operand),
+							    Instruction.Create (OpCodes.Ldloc, newTempLocal),
+							    Instruction.Create (SelectStindForOperand (i.Operand))
+						    };
+					    } else
+						    return new[] {
+							    i,
+							    Instruction.Create (SelectLdindForOperand (i.Operand))
+						    };
+				    } else
+					    return null;
+			    });
 
-			CleanMethodBody (catchMethod, method, true);
+			    CleanMethodBody (catchMethod, method, true);
+            }
 
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
 			var handler = new ExcHandler {
@@ -1057,49 +1059,50 @@ namespace ExceptionRewriter {
 				throw new Exception ($"Handler start instruction {eh.HandlerStart} not found in method body");
 			i2--;
 
-            if (i2 <= i1)
-                throw new Exception("Handler size was 0 or less");
+            if (i2 <= i1) {
+                // throw new Exception("Handler size was 0 or less");
+            } else {
+			    var variableMapping = new Dictionary<object, object> {
+				    // FIXME
+				    // {closure, closureField }
+			    };
+			    var newVariables = ExtractRangeToMethod (
+				    method, filterMethod, fakeThis, i1, i2, true, 
+				    variableMapping: variableMapping, typeMapping: gpMapping, context: context
+			    );
+			    var newClosureLocal = (VariableDefinition)newVariables[closure];
 
-			var variableMapping = new Dictionary<object, object> {
-				// FIXME
-				// {closure, closureField }
-			};
-			var newVariables = ExtractRangeToMethod (
-				method, filterMethod, fakeThis, i1, i2, true, 
-				variableMapping: variableMapping, typeMapping: gpMapping, context: context
-			);
-			var newClosureLocal = (VariableDefinition)newVariables[closure];
+			    var filterInsns = filterMethod.Body.Instructions;
+                if (filterInsns.Count <= 0)
+                    throw new Exception("Filter body was empty");
 
-			var filterInsns = filterMethod.Body.Instructions;
-            if (filterInsns.Count <= 0)
-                throw new Exception("Filter body was empty");
+			    var oldFilterInsn = filterInsns[filterInsns.Count - 1];
+			    filterInsns[filterInsns.Count - 1] = filterReplacement;
+			    Patch (filterMethod, context, oldFilterInsn, filterReplacement);
 
-			var oldFilterInsn = filterInsns[filterInsns.Count - 1];
-			filterInsns[filterInsns.Count - 1] = filterReplacement;
-			Patch (filterMethod, context, oldFilterInsn, filterReplacement);
+			    InsertOps (
+				    filterInsns, 0, new[] {
+					    // Load the closure from this and store it into our temporary
+					    Instruction.Create (OpCodes.Ldarg_0),
+					    Instruction.Create (OpCodes.Ldfld, closureField),
+					    Instruction.Create (OpCodes.Stloc, newClosureLocal),
+					    // Load the exception from arg1 since exception handlers are entered with it on the stack
+					    Instruction.Create (OpCodes.Ldarg, excArg)
+				    }
+			    );
 
-			InsertOps (
-				filterInsns, 0, new[] {
-					// Load the closure from this and store it into our temporary
-					Instruction.Create (OpCodes.Ldarg_0),
-					Instruction.Create (OpCodes.Ldfld, closureField),
-					Instruction.Create (OpCodes.Stloc, newClosureLocal),
-					// Load the exception from arg1 since exception handlers are entered with it on the stack
-					Instruction.Create (OpCodes.Ldarg, excArg)
-				}
-			);
+			    for (int i = 0; i < filterInsns.Count; i++) {
+				    var insn = filterInsns[i];
+				    if (insn.Operand != closure)
+					    continue;
 
-			for (int i = 0; i < filterInsns.Count; i++) {
-				var insn = filterInsns[i];
-				if (insn.Operand != closure)
-					continue;
+				    filterInsns[i] = Instruction.Create (OpCodes.Ldarg, fakeThis);
+				    Patch (filterMethod, context, insn, filterInsns[i]);
+				    filterInsns.Insert (i + 1, Instruction.Create (OpCodes.Ldfld, closureField));
+			    }
 
-				filterInsns[i] = Instruction.Create (OpCodes.Ldarg, fakeThis);
-				Patch (filterMethod, context, insn, filterInsns[i]);
-				filterInsns.Insert (i + 1, Instruction.Create (OpCodes.Ldfld, closureField));
-			}
-
-			CleanMethodBody (filterMethod, method, true);
+			    CleanMethodBody (filterMethod, method, true);
+            }
 
 			var handler = ExtractCatch (method, eh, closure, fakeThis, group, context);
 
@@ -1158,8 +1161,11 @@ namespace ExceptionRewriter {
 
 				for (int i = lastIndex - 1; i > firstIndex; i--) {
                     var oldInsn = insns[i];
+
                     // FIXME: This also should not be necessary, and it breaks extraction after the first filter
-                    // Patch (sourceMethod, context, oldInsn, newFirstInsn);
+                    // After doing this we end up with empty catch/filter bodies, which is clearly wrong
+                    Patch (sourceMethod, context, oldInsn, newLastInsn);
+
 					insns.RemoveAt (i);
                     removedInstructions.Add(oldInsn);
                 }
@@ -1724,8 +1730,12 @@ namespace ExceptionRewriter {
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
-			foreach (var i in insns)
-				i.Offset = insns.IndexOf (i);
+            bool renumber = false;
+
+			foreach (var i in insns) {
+                if (renumber || i.Offset == 0)
+				    i.Offset = insns.IndexOf (i);
+            }
 
 			foreach (var i in insns) {
 				OpCode newOpcode;
@@ -1757,8 +1767,10 @@ namespace ExceptionRewriter {
 				}
 			}
 
-			foreach (var i in insns)
-				i.Offset = insns.IndexOf (i);
+			foreach (var i in insns) {
+                if (renumber || i.Offset == 0)
+				    i.Offset = insns.IndexOf (i);
+            }
 
 			if (verify)
 			foreach (var p in method.Parameters)
@@ -1866,7 +1878,12 @@ namespace ExceptionRewriter {
 					newOperand = typeMapping[operandTr];
 			}
 
-			if (newOperand is FieldReference) {
+            if (code.Code == Code.Nop) {
+                var result = Instruction.Create(OpCodes.Nop);
+                // HACK: Manually preserve any operand that was tucked inside the nop for bookkeeping
+                result.Operand = operand;
+                return result;
+            } else if (newOperand is FieldReference) {
 				FieldReference fref = newOperand as FieldReference;
 				return Instruction.Create (code, fref);
 			} else if (newOperand is TypeReference) {
