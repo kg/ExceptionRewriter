@@ -505,6 +505,13 @@ namespace ExceptionRewriter {
             return result;
         }
 
+        private Instruction Rethrow (string description = null) 
+        {
+            var result = Instruction.Create (OpCodes.Rethrow);
+            result.Operand = description;
+            return result;
+        }
+
 		private MethodDefinition CreateConstructor (TypeDefinition type) 
 		{
 			var ctorMethod = new MethodDefinition (
@@ -1064,7 +1071,7 @@ namespace ExceptionRewriter {
 			i2--;
 
             if (i2 <= i1) {
-                // throw new Exception("Handler size was 0 or less");
+                throw new Exception("Handler size was 0 or less");
             } else {
 			    var variableMapping = new Dictionary<object, object> {
 				    // FIXME
@@ -1163,13 +1170,13 @@ namespace ExceptionRewriter {
             {
                 var removedInstructions = new List<Instruction>();
 
-				for (int i = lastIndex - 1; i > firstIndex; i--) {
+				for (int i = lastIndex; i > firstIndex; i--) {
                     var oldInsn = insns[i];
                     var dead = Nop ("removed [" + oldInsn.ToString() + "]");
 
                     // FIXME: This also should not be necessary, and it breaks extraction after the first filter
                     // After doing this we end up with empty catch/filter bodies, which is clearly wrong
-                    // Patch (sourceMethod, context, oldInsn, dead);
+                    Patch (sourceMethod, context, oldInsn, dead);
 
 					insns.RemoveAt (i);
                     removedInstructions.Add(oldInsn);
@@ -1203,7 +1210,8 @@ namespace ExceptionRewriter {
             var newFirst = Nop ("<unnamed>:start");
 			var newLast = Nop ("<unnamed>:end");
 
-			for (int i = lastIndex; i >= firstIndex; i--) {
+            // FIXME: This used to exclude the first element
+			for (int i = lastIndex; i > firstIndex; i--) {
                 if (i == firstIndex) {
 				    Patch (method, context, coll[i], newFirst);
                     coll[i] = newFirst;
@@ -1469,6 +1477,7 @@ namespace ExceptionRewriter {
 
             foreach (var eg in newGroups) {
                 var finallyInsns = new List<Instruction>();
+                finallyInsns.Add (Nop ("Finally header"));
 
                 var hasAnyCatchAll = eg.Handlers.Any(h => h.IsCatchAll);
 
@@ -1538,7 +1547,7 @@ namespace ExceptionRewriter {
                 var tryExit = insns[newHandlerOffset + 1];
                 var newHandlerStart = Nop ("new handler start");
                 Instruction newHandlerEnd, handlerFallthroughRethrow;
-                handlerFallthroughRethrow = hasAnyCatchAll ? Nop ("fallthrough rethrow (dead)") : Instruction.Create(OpCodes.Rethrow);
+                handlerFallthroughRethrow = hasAnyCatchAll ? Nop ("fallthrough rethrow (dead)") : Rethrow ("fallthrough rethrow");
                 newHandlerEnd = Instruction.Create(OpCodes.Leave, tryExit);
 
                 var handlerBody = new List<Instruction> {
@@ -1554,9 +1563,9 @@ namespace ExceptionRewriter {
                     var fv = h.FilterVariable;
                     if (fv != null) {
                         // If we have a filter, check the Result to see if the filter returned execute_handler
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, fv));
-                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, efilt));
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
+                        handlerBody.Add(Instruction.Create (OpCodes.Ldloc, fv));
+                        handlerBody.Add(Instruction.Create (OpCodes.Castclass, efilt));
+                        handlerBody.Add(Instruction.Create (OpCodes.Ldloc, excVar));
                         var mref = new MethodReference(
                             "ShouldRunHandler", method.Module.TypeSystem.Boolean, efilt
                         ) {
@@ -1565,16 +1574,16 @@ namespace ExceptionRewriter {
                             new ParameterDefinition (method.Module.TypeSystem.Object)
                         }
                         };
-                        handlerBody.Add(Instruction.Create(OpCodes.Call, method.Module.ImportReference(mref)));
-                        handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
+                        handlerBody.Add(Instruction.Create (OpCodes.Call, method.Module.ImportReference(mref)));
+                        handlerBody.Add(Instruction.Create (OpCodes.Brfalse, skip));
                     }
 
                     var needsTypeCheck = (h.Handler.CatchType != null) && (h.Handler.CatchType.FullName != "System.Object");
                     if (needsTypeCheck) {
                         // If the handler has a type check do an isinst to check whether it should run
-                        handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
-                        handlerBody.Add(Instruction.Create(OpCodes.Isinst, h.Handler.CatchType));
-                        handlerBody.Add(Instruction.Create(OpCodes.Brfalse, skip));
+                        handlerBody.Add(Instruction.Create (OpCodes.Ldloc, excVar));
+                        handlerBody.Add(Instruction.Create (OpCodes.Isinst, h.Handler.CatchType));
+                        handlerBody.Add(Instruction.Create (OpCodes.Brfalse, skip));
                     }
 
                     // Load anything the catch referenced onto the stack. If it wasn't a byref type,
@@ -1582,28 +1591,28 @@ namespace ExceptionRewriter {
                     //  (so that the catch can modify them)
                     foreach (var a in h.CatchReferencedArguments)
                         if (a.ParameterType.IsByReference)
-                            handlerBody.Add(Instruction.Create(OpCodes.Ldarg, (ParameterDefinition)a));
+                            handlerBody.Add(Instruction.Create (OpCodes.Ldarg, (ParameterDefinition)a));
                         else
-                            handlerBody.Add(Instruction.Create(OpCodes.Ldarga, (ParameterDefinition)a));
+                            handlerBody.Add(Instruction.Create (OpCodes.Ldarga, (ParameterDefinition)a));
 
                     foreach (var v in h.CatchReferencedVariables)
                         if (v.VariableType.IsByReference)
-                            handlerBody.Add(Instruction.Create(OpCodes.Ldloc, (VariableDefinition)v));
+                            handlerBody.Add(Instruction.Create (OpCodes.Ldloc, (VariableDefinition)v));
                         else
-                            handlerBody.Add(Instruction.Create(OpCodes.Ldloca, (VariableDefinition)v));
+                            handlerBody.Add(Instruction.Create (OpCodes.Ldloca, (VariableDefinition)v));
 
                     // Now load the exception
-                    handlerBody.Add(Instruction.Create(OpCodes.Ldloc, excVar));
+                    handlerBody.Add(Instruction.Create (OpCodes.Ldloc, excVar));
                     // If the isinst passed we need to cast the exception value to the appropriate type
                     if (needsTypeCheck)
-                        handlerBody.Add(Instruction.Create(OpCodes.Castclass, h.Handler.CatchType));
+                        handlerBody.Add(Instruction.Create (OpCodes.Castclass, h.Handler.CatchType));
 
                     // Run the handler, then if it returns true, throw.
                     // If it returned false, we leave the entire handler.
-                    handlerBody.Add(Instruction.Create(OpCodes.Ldloc, closure));
-                    handlerBody.Add(Instruction.Create(OpCodes.Call, h.Method));
-                    handlerBody.Add(Instruction.Create(OpCodes.Brfalse, newHandlerEnd));
-                    handlerBody.Add(Instruction.Create(OpCodes.Rethrow));
+                    handlerBody.Add(Instruction.Create (OpCodes.Ldloc, closure));
+                    handlerBody.Add(Instruction.Create (OpCodes.Call, h.Method));
+                    handlerBody.Add(Instruction.Create (OpCodes.Brfalse, newHandlerEnd));
+                    handlerBody.Add(Rethrow ("end of handler"));
                     handlerBody.Add(skip);
                 }
 
@@ -1613,37 +1622,27 @@ namespace ExceptionRewriter {
                 InsertOps(insns, newHandlerOffset + 1, handlerBody.ToArray());
 
                 var originalExitPoint = insns[insns.IndexOf(newHandlerEnd) + 1];
-                Instruction handlerEnd;
+                Instruction handlerEnd = Nop ("handlerEnd");
 
-                Instruction preFinallyBr, afterPreFinallyBr = Nop ("after preFinallyBr");
+                Instruction preFinallyBr;
                 // If there was a catch-all block we can jump to the original exit point, because
                 //  the catch-all block handler would have returned 1 to trigger a rethrow - it didn't.
                 // If no catch-all block existed we need to rethrow at the end of our coalesced handler.
                 if (hasAnyCatchAll)
                     preFinallyBr = Instruction.Create(OpCodes.Leave, originalExitPoint);
                 else
-                    preFinallyBr = Instruction.Create(OpCodes.Rethrow);
+                    preFinallyBr = Rethrow ("preFinallyBr");
 
-                if (finallyInsns.Count > 0)
-                    handlerEnd = afterPreFinallyBr;
-                else
+                if (finallyInsns.Count == 0)
                     handlerEnd = originalExitPoint;
-
-                var newEh = new ExceptionHandler(ExceptionHandlerType.Catch) {
-                    TryStart = eg.TryStart,
-                    TryEnd = newHandlerStart,
-                    HandlerStart = newHandlerStart,
-                    HandlerEnd = handlerEnd,
-                    CatchType = method.Module.TypeSystem.Object,
-                };
-                method.Body.ExceptionHandlers.Add(newEh);
 
                 if (finallyInsns.Count > 0) {
                     finallyInsns.Add(Instruction.Create(OpCodes.Endfinally));
 
                     var newLeave = Instruction.Create(OpCodes.Leave, originalExitPoint);
                     if (!hasAnyCatchAll)
-                        newLeave = Instruction.Create(OpCodes.Rethrow);
+                        newLeave = Rethrow ("newLeave");
+
                     var originalExitIndex = insns.IndexOf(originalExitPoint);
                     InsertOps(insns, originalExitIndex, finallyInsns.ToArray());
 
@@ -1658,16 +1657,19 @@ namespace ExceptionRewriter {
                     InsertOps(
                         insns, insns.IndexOf(finallyInsns[0]),
                         new[] {
-                            preFinallyBr, afterPreFinallyBr
+                            preFinallyBr, newLeave, handlerEnd
                         }
                     );
-
-                    var handlerEndIndex = insns.IndexOf(handlerEnd);
-                    if (handlerEndIndex < 0)
-                        throw new Exception($"Handler end instruction not found in method body {handlerEnd}");
-
-                    insns.Insert(handlerEndIndex + 1, newLeave);
                 }
+
+                var newEh = new ExceptionHandler(ExceptionHandlerType.Catch) {
+                    TryStart = eg.TryStart,
+                    TryEnd = newHandlerStart,
+                    HandlerStart = newHandlerStart,
+                    HandlerEnd = handlerEnd,
+                    CatchType = method.Module.TypeSystem.Object,
+                };
+                method.Body.ExceptionHandlers.Add(newEh);
 
                 CleanMethodBody(method, null, true);
                 foreach (var g in newGroups) {
@@ -1747,10 +1749,35 @@ namespace ExceptionRewriter {
 				    i.Offset = insns.IndexOf (i);
             }
 
-			foreach (var i in insns) {
+			for (int idx = 0; idx < insns.Count; idx++) {
+                var i = insns[idx];
+
 				OpCode newOpcode;
 				if (ShortFormRemappings.TryGetValue (i.OpCode.Code, out newOpcode))
 					i.OpCode = newOpcode;
+
+                switch (i.OpCode.Code) {
+                    case Code.Rethrow: {
+                        bool foundRange = false;
+
+                        foreach (var eh in method.Body.ExceptionHandlers) {
+                            if (eh.HandlerType != ExceptionHandlerType.Catch)
+                                continue;
+                            int startIndex = insns.IndexOf(eh.HandlerStart),
+                                endIndex = insns.IndexOf(eh.HandlerEnd);
+
+                            if ((idx >= startIndex) && (idx <= endIndex)) {
+                                foundRange = true;
+                                break;
+                            }
+                        }
+
+                        if (!foundRange)
+                            throw new Exception($"Found rethrow instruction outside of catch block: {i}");
+
+                        break;
+                    }
+                }
 
 				if (!verify)
 					continue;

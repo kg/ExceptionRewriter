@@ -47,7 +47,7 @@ namespace ExceptionRewriter {
 						var arw = new AssemblyRewriter (def, options);
 						int errorCount = arw.Rewrite ();
 
-						if (errorCount > 0) {
+						if (errorCount > 0 && false) {
 							Console.Error.WriteLine ($"Not saving due to error(s): {dst}");
 							exitCode += 1;
 						} else {
