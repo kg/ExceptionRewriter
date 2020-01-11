@@ -1359,24 +1359,29 @@ namespace ExceptionRewriter {
 			var insns = method.Body.Instructions;
 			insns.Insert (0, Instruction.Create (OpCodes.Nop));
 
-            var context = new RewriteContext();
+            var context = new RewriteContext ();
             var newGroups = context.NewGroups;
             var filtersToInsert = context.FiltersToInsert;
 
 			var handlersByTry = method.Body.ExceptionHandlers.ToLookup (
 				eh => {
                     var p = new InstructionPair { A = eh.TryStart, B = eh.TryEnd };
-                    context.Pairs.Add(p);
+                    context.Pairs.Add (p);
                     return p;
                 },
 				new InstructionPair.Comparer ()
 			);
 
-			foreach (var group in handlersByTry) {
+            var groupsToExtract = handlersByTry.OrderBy (g => {
+                return g.Key.B.Offset - g.Key.A.Offset;
+            }).ToList ();
+			foreach (var group in groupsToExtract) {
 				var excGroup = new ExcGroup {
 					TryStart = group.Key.A,
 					TryEnd = insns[insns.IndexOf (group.Key.B) - 1],
 				};
+
+				newGroups.Add (excGroup);
 
 				foreach (var eh in group) {
 					if (eh.FilterStart != null)
@@ -1384,8 +1389,6 @@ namespace ExceptionRewriter {
 					else
 						ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
 				}
-
-				newGroups.Add (excGroup);
 			}
 
 			foreach (var eg in newGroups) {
