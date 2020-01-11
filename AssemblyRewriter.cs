@@ -9,6 +9,7 @@ using Mono.Collections.Generic;
 
 namespace ExceptionRewriter {
 	public class RewriteOptions {
+        public bool Mono = false;
 		public bool EnableGenerics = false;
 		public bool Verbose = false;
 		public bool AbortOnError = true;
@@ -118,9 +119,13 @@ namespace ExceptionRewriter {
 
 		private TypeReference GetExceptionFilter (ModuleDefinition module, bool autoAddReference = true) 
 		{
-			var result = ImportCorlibType (module, "Mono", "ExceptionFilter");
-			if (result != null)
-				return result;
+            TypeReference result;
+
+            if (Options.Mono) {
+			    result = ImportCorlibType (module, "Mono", "ExceptionFilter");
+			    if (result != null)
+				    return result;
+            }
 
 			result = ImportReferencedType (module, "ExceptionFilterSupport", "Mono", "ExceptionFilter");
 			if (result == null) {

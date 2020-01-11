@@ -83,6 +83,9 @@ namespace ExceptionRewriter {
 				return;
 
 			switch (arg) {
+                case "--mono":
+                    options.Mono = true;
+                    break;
 				case "--overwrite":
 					options.Overwrite = true;
 					break;
@@ -119,7 +122,8 @@ or        exception-filter-rewriter [options] --overwrite file1 [file2] ...
 --symbols     Enable loading/saving debug information
 --generics    Enable rewriting filters for generics (currently broken)
 --no-generics Disable rewriting filters for generics (default)
---verbose     Output name of every rewritten method");
+--verbose     Output name of every rewritten method
+--mono        Import support code from mscorlib instead of satellite assembly");
 
 		}
 	}
