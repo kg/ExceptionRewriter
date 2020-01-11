@@ -224,6 +224,9 @@ namespace ExceptionRewriter {
 
 			foreach (var eh in method.Body.ExceptionHandlers)
                 Patch (eh, old, replacement);
+
+            foreach (var eh in context.RemovedHandlers)
+                Patch (eh, old, replacement);
 		}
 
         private void Patch (ExceptionHandler eh,  Instruction old, Instruction replacement) {
@@ -1175,15 +1178,30 @@ namespace ExceptionRewriter {
             public List<InstructionPair> Pairs = new List<InstructionPair>();
             public List<ExcGroup> NewGroups = new List<ExcGroup>();
             public List<FilterToInsert> FiltersToInsert = new List<FilterToInsert>();
+            public List<ExceptionHandler> RemovedHandlers = new List<ExceptionHandler>();
         }
 
 		public class ExcGroup {
+            private static int NextID = 0;
+
+            public readonly int ID;
 			public Instruction TryStart, TryEnd;
 			public List<ExcHandler> Handlers = new List<ExcHandler> ();
 			internal Instruction FirstPushInstruction;
+
+            public ExcGroup () {
+                ID = NextID++;
+            }
+
+            public override string ToString () {
+                return $"Group #{ID}";
+            }
 		}
 
 		public class ExcHandler {
+            private static int NextID = 0;
+
+            public readonly int ID;
 			public bool IsCatchAll;
 
 			public ExceptionHandler Handler;
@@ -1195,7 +1213,15 @@ namespace ExceptionRewriter {
 			internal HashSet<VariableReference> CatchReferencedVariables;
 			internal HashSet<ParameterReference> CatchReferencedArguments;
 			internal Dictionary<object, object> Mapping;
-		}
+
+            public ExcHandler () {
+                ID = NextID++;
+            }
+
+            public override string ToString () {
+                return $"Handler #{ID}";
+            }
+        }
 
 		public class InstructionPair {
 			public class Comparer : IEqualityComparer<InstructionPair> {
@@ -1422,18 +1448,19 @@ namespace ExceptionRewriter {
 						}}));
 					}
 
+                    context.RemovedHandlers.Add (h.Handler);
 					method.Body.ExceptionHandlers.Remove (h.Handler);
 				}
-
-				var tryExit = insns[insns.IndexOf (eg.TryEnd) + 1];
-				var newHandlerStart = Instruction.Create (OpCodes.Nop);
-				Instruction newHandlerEnd, handlerFallthroughRethrow;
-				handlerFallthroughRethrow = hasAnyCatchAll ? Instruction.Create (OpCodes.Nop) : Instruction.Create (OpCodes.Rethrow);
-				newHandlerEnd = Instruction.Create (OpCodes.Leave, tryExit);
 
 				var newHandlerOffset = insns.IndexOf (eg.TryEnd);
 				if (newHandlerOffset < 0)
 					throw new Exception ($"Handler end instruction {eg.TryEnd} not found in method body");
+
+				var tryExit = insns[newHandlerOffset + 1];
+				var newHandlerStart = Instruction.Create (OpCodes.Nop);
+				Instruction newHandlerEnd, handlerFallthroughRethrow;
+				handlerFallthroughRethrow = hasAnyCatchAll ? Instruction.Create (OpCodes.Nop) : Instruction.Create (OpCodes.Rethrow);
+				newHandlerEnd = Instruction.Create (OpCodes.Leave, tryExit);
 
 				var handlerBody = new List<Instruction> {
 					newHandlerStart,
