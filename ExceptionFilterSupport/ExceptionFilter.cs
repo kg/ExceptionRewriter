@@ -34,11 +34,11 @@ namespace Mono.Runtime.Internal {
         public static void Pop (ExceptionFilter filter) {
             var ef = ExceptionFilters.Value;
             if (ef.Count == 0)
-                throw new ThreadStateException("Corrupt exception filter stack");
+                throw new Exception("Corrupt exception filter stack");
             var current = ef[ef.Count - 1];
             ef.RemoveAt(ef.Count - 1);
             if (current != filter)
-                throw new ThreadStateException("Corrupt exception filter stack");
+                throw new Exception("Corrupt exception filter stack");
         }
 
         /// <summary>

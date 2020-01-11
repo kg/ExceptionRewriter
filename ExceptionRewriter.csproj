@@ -3,6 +3,7 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <TargetFramework>netcoreapp2.1</TargetFramework>
+    <AssemblyName>exception-rewriter</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
@@ -15,6 +16,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="ExceptionFilterSupport\ExceptionFilterSupport.csproj" />
     <ProjectReference Include="Upstream\Cecil\Mono.Cecil.csproj" />
     <ProjectReference Include="Upstream\Cecil\symbols\pdb\Mono.Cecil.Pdb.csproj" />
   </ItemGroup>
