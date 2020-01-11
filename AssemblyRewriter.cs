@@ -891,7 +891,6 @@ namespace ExceptionRewriter {
 				method, catchMethod, fakeThis,
 				insns.IndexOf (eh.HandlerStart), 
 				insns.IndexOf (eh.HandlerEnd) - 1,
-				deleteThem: true,
 				variableMapping: paramMapping,
 				typeMapping: gpMapping,
                 context: context
@@ -1072,7 +1071,7 @@ namespace ExceptionRewriter {
 				    // {closure, closureField }
 			    };
 			    var newVariables = ExtractRangeToMethod (
-				    method, filterMethod, fakeThis, i1, i2, true, 
+				    method, filterMethod, fakeThis, i1, i2, 
 				    variableMapping: variableMapping, typeMapping: gpMapping, context: context
 			    );
 			    var newClosureLocal = (VariableDefinition)newVariables[closure];
@@ -1123,7 +1122,7 @@ namespace ExceptionRewriter {
 		private Dictionary<object, object> ExtractRangeToMethod<T, U> (
 			MethodDefinition sourceMethod, MethodDefinition targetMethod, 
 			ParameterDefinition fakeThis,
-			int firstIndex, int lastIndex, bool deleteThem,
+			int firstIndex, int lastIndex,
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
             RewriteContext context, 
@@ -1161,15 +1160,16 @@ namespace ExceptionRewriter {
             insns[lastIndex] = newLastInsn;
             Patch (sourceMethod, context, oldLastInsn, newLastInsn);
 
-			if (deleteThem) {
+            {
                 var removedInstructions = new List<Instruction>();
 
 				for (int i = lastIndex - 1; i > firstIndex; i--) {
                     var oldInsn = insns[i];
+                    var dead = Nop ("removed [" + oldInsn.ToString() + "]");
 
                     // FIXME: This also should not be necessary, and it breaks extraction after the first filter
                     // After doing this we end up with empty catch/filter bodies, which is clearly wrong
-                    Patch (sourceMethod, context, oldInsn, newLastInsn);
+                    // Patch (sourceMethod, context, oldInsn, dead);
 
 					insns.RemoveAt (i);
                     removedInstructions.Add(oldInsn);
@@ -1457,6 +1457,9 @@ namespace ExceptionRewriter {
                 newGroups.Add(excGroup);
 
                 foreach (var eh in group) {
+                    context.RemovedHandlers.Add(eh);
+                    method.Body.ExceptionHandlers.Remove(eh);
+
                     if (eh.FilterStart != null)
                         ExtractFilterAndCatch(method, eh, closure, fakeThis, excGroup, context);
                     else
@@ -1526,9 +1529,6 @@ namespace ExceptionRewriter {
                         }
                         }));
                     }
-
-                    context.RemovedHandlers.Add(h.Handler);
-                    method.Body.ExceptionHandlers.Remove(h.Handler);
                 }
 
                 var newHandlerOffset = insns.IndexOf(eg.TryEnd);
@@ -1615,7 +1615,7 @@ namespace ExceptionRewriter {
                 var originalExitPoint = insns[insns.IndexOf(newHandlerEnd) + 1];
                 Instruction handlerEnd;
 
-                Instruction preFinallyBr;
+                Instruction preFinallyBr, afterPreFinallyBr = Nop ("after preFinallyBr");
                 // If there was a catch-all block we can jump to the original exit point, because
                 //  the catch-all block handler would have returned 1 to trigger a rethrow - it didn't.
                 // If no catch-all block existed we need to rethrow at the end of our coalesced handler.
@@ -1625,7 +1625,7 @@ namespace ExceptionRewriter {
                     preFinallyBr = Instruction.Create(OpCodes.Rethrow);
 
                 if (finallyInsns.Count > 0)
-                    handlerEnd = preFinallyBr;
+                    handlerEnd = afterPreFinallyBr;
                 else
                     handlerEnd = originalExitPoint;
 
@@ -1655,7 +1655,12 @@ namespace ExceptionRewriter {
                     };
                     method.Body.ExceptionHandlers.Add(newFinally);
 
-                    insns.Insert(insns.IndexOf(finallyInsns[0]), preFinallyBr);
+                    InsertOps(
+                        insns, insns.IndexOf(finallyInsns[0]),
+                        new[] {
+                            preFinallyBr, afterPreFinallyBr
+                        }
+                    );
 
                     var handlerEndIndex = insns.IndexOf(handlerEnd);
                     if (handlerEndIndex < 0)
@@ -1787,12 +1792,20 @@ namespace ExceptionRewriter {
 				if (v.Index != method.Body.Variables.IndexOf (v))
 					throw new Exception ($"variable index mismatch for method {method.FullName}");
 
+            if (verify)
             foreach (var eh in method.Body.ExceptionHandlers) {
                 CheckInRange(eh.HandlerStart, method, oldMethod, removedInstructions);
                 CheckInRange(eh.HandlerEnd, method, oldMethod, removedInstructions);
                 CheckInRange(eh.FilterStart, method, oldMethod, removedInstructions);
                 CheckInRange(eh.TryStart, method, oldMethod, removedInstructions);
                 CheckInRange(eh.TryEnd, method, oldMethod, removedInstructions);
+
+                if (eh.TryStart != null) {
+                    var tryStartIndex = insns.IndexOf(eh.TryStart);
+                    var tryEndIndex = insns.IndexOf(eh.TryEnd);
+                    if (tryEndIndex <= tryStartIndex)
+                        throw new Exception($"Try block contains no instructions at {eh.TryStart}");
+                }
             }
 		}
 
