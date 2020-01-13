@@ -230,6 +230,7 @@ namespace ExceptionRewriter {
 			foreach (var eh in method.Body.ExceptionHandlers)
                 Patch (eh, old, replacement);
 
+			// CHANGE #1
             foreach (var eh in context.RemovedHandlers)
                 Patch (eh, old, replacement);
 		}
@@ -745,6 +746,7 @@ namespace ExceptionRewriter {
 				insn.Operand = newOperand;
 			}
 
+			// CHANGE #2: Removed clean
 			foreach (var eh in method.Body.ExceptionHandlers) {
 				eh.FilterStart = PostFilterRange (remapTableFirst, eh.FilterStart);
 				eh.TryStart = PostFilterRange (remapTableFirst, eh.TryStart);
@@ -753,6 +755,7 @@ namespace ExceptionRewriter {
 				eh.HandlerEnd = PostFilterRange (remapTableFirst, eh.HandlerEnd);
 			}
 
+			// CHANGE #3: Added clean
 			CleanMethodBody (method, null, false);
 		}
 
@@ -891,6 +894,7 @@ namespace ExceptionRewriter {
 
 			CleanMethodBody (catchMethod, method, false);
 
+			// CHANGE #4: Adding method earlier
 			method.DeclaringType.Methods.Add (catchMethod);
 
 			// FIXME: Use generic parameter mapping to replace GP type references
@@ -1156,6 +1160,8 @@ namespace ExceptionRewriter {
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
 
+			// CHANGE GROUP: This whole block changed a lot
+
 			var oldFirstInsn = insns[firstIndex];
             var oldLastInsn = insns[lastIndex];
 			var newFirstInsn = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):start");
@@ -1205,6 +1211,7 @@ namespace ExceptionRewriter {
 
 		private void RemoveRange (MethodDefinition method, RewriteContext context, int firstIndex, int lastIndex) 
 		{
+			// CHANGE GROUP: This changed a lot too.
 			var coll = method.Body.Instructions;
 			var lastOne = coll[lastIndex];
             var newFirst = Nop ("<unnamed>:start");
@@ -1623,6 +1630,8 @@ namespace ExceptionRewriter {
 
                 var originalExitPoint = insns[insns.IndexOf(newHandlerEnd) + 1];
                 Instruction handlerEnd = Nop ("handlerEnd");
+
+				// CHANGE GROUP: The preFinallyBr and handler end stuff changed a lot here
 
                 Instruction preFinallyBr;
                 // If there was a catch-all block we can jump to the original exit point, because
