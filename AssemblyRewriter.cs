@@ -1426,60 +1426,55 @@ namespace ExceptionRewriter {
             }
         }
 
-        private bool ExtractStep (MethodDefinition method, TypeReference efilt, ParameterDefinition fakeThis, VariableDefinition closure, VariableDefinition excVar, Collection<Instruction> insns) {
-            var context = new RewriteContext();
-            var newGroups = context.NewGroups;
-            var filtersToInsert = context.FiltersToInsert;
-
+        private IGrouping<InstructionPair, ExceptionHandler> GetFirstSmallestHandler (MethodDefinition method) {
             var handlersByTry = method.Body.ExceptionHandlers.ToLookup(
                 eh => {
                     var p = new InstructionPair { A = eh.TryStart, B = eh.TryEnd };
-                    context.Pairs.Add(p);
                     return p;
                 },
                 new InstructionPair.Comparer()
             );
 
-            var willContinue = false;
-
-            // Filter out any groups that don't contain an exception filter, since we don't
-            //  have any reason to process any of their handlers.
-            var groupsToExtract = handlersByTry.Where (g =>
-                g.Any (eh => eh.HandlerType == ExceptionHandlerType.Filter)
+            return handlersByTry.Where(g =>
+               g.Any(eh => eh.HandlerType == ExceptionHandlerType.Filter)
             // Sort the groups such that the smallest ones come first. This ensures that for
             //  nested filters we process the innermost filters first.
-            ).OrderBy (g => {
+            ).OrderBy(g => {
                 return g.Key.B.Offset - g.Key.A.Offset;
-            }).ToList ();
+            }).FirstOrDefault();
+        }
 
-            foreach (var group in groupsToExtract) {
-                // FIXME: Processing multiple groups in one pass causes methods with nested
-                //  exception filters to break, so we will process one group at a time and then resume
-                //  from the beginning.
-                if (newGroups.Count > 0) {
-                    willContinue = true;
-                    continue;
-                }
+        private bool ExtractStep (MethodDefinition method, TypeReference efilt, ParameterDefinition fakeThis, VariableDefinition closure, VariableDefinition excVar, Collection<Instruction> insns) {
+            var context = new RewriteContext();
+            var newGroups = context.NewGroups;
+            var filtersToInsert = context.FiltersToInsert;
 
-                var endIndex = insns.IndexOf(group.Key.B);
-                if (endIndex < 0)
-                    throw new Exception($"End instruction {group.Key.B} not found in method body");
-                var excGroup = new ExcGroup {
-                    TryStart = group.Key.A,
-                    TryEnd = insns[endIndex - 1],
-                };
+            var willContinue = false;
 
-                newGroups.Add(excGroup);
+            var group = GetFirstSmallestHandler(method);
+            if (group == null)
+                return false;
 
-                foreach (var eh in group) {
-                    context.RemovedHandlers.Add(eh);
-                    method.Body.ExceptionHandlers.Remove(eh);
+            context.Pairs.Add(group.Key);
 
-                    if (eh.FilterStart != null)
-                        ExtractFilterAndCatch(method, eh, closure, fakeThis, excGroup, context);
-                    else
-                        ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
-                }
+            var endIndex = insns.IndexOf(group.Key.B);
+            if (endIndex < 0)
+                throw new Exception($"End instruction {group.Key.B} not found in method body");
+            var excGroup = new ExcGroup {
+                TryStart = group.Key.A,
+                TryEnd = insns[endIndex - 1],
+            };
+
+            newGroups.Add(excGroup);
+
+            foreach (var eh in group) {
+                context.RemovedHandlers.Add(eh);
+                method.Body.ExceptionHandlers.Remove(eh);
+
+                if (eh.FilterStart != null)
+                    ExtractFilterAndCatch(method, eh, closure, fakeThis, excGroup, context);
+                else
+                    ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
             }
 
             foreach (var eg in newGroups) {
