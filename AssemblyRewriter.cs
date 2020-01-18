@@ -575,9 +575,11 @@ namespace ExceptionRewriter {
 			var localCount = 0;
 			var closureVar = new VariableDefinition (closureTypeReference);
 
+            return closureVar;
+
 			var extractedVariables = variables.ToDictionary (
 				v => (object)v, 
-				v => new FieldDefinition ("local_" + localCount++, FieldAttributes.Public, FilterTypeReference (v.VariableType, functionGpMapping))
+				v => new FieldDefinition ("local_" + method.Body.Variables.IndexOf((VariableDefinition)v), FieldAttributes.Public, FilterTypeReference (v.VariableType, functionGpMapping))
 			);
 
 			method.Body.Variables.Add (closureVar);
@@ -904,7 +906,9 @@ namespace ExceptionRewriter {
 				insns.IndexOf (eh.HandlerEnd) - 1,
 				variableMapping: paramMapping,
 				typeMapping: gpMapping,
-                context: context
+                context: context,
+                newFirstInstruction: Instruction.Create(OpCodes.Rethrow),
+                newLastInstruction: Instruction.Create(OpCodes.Leave, eh.HandlerEnd)
 			);
 
             if (catchInsns.Count > 0) {
@@ -1031,7 +1035,9 @@ namespace ExceptionRewriter {
 		}
 
 		private ExcHandler ExtractFilterAndCatch (
-			MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ParameterDefinition fakeThis, ExcGroup group, RewriteContext context
+			MethodDefinition method, ExceptionHandler eh, 
+            VariableDefinition closure, ParameterDefinition fakeThis, 
+            ExcGroup group, RewriteContext context
 		) {
 			var insns = method.Body.Instructions;
 			var closureType = closure.VariableType;
@@ -1083,7 +1089,9 @@ namespace ExceptionRewriter {
 			    };
 			    var newVariables = ExtractRangeToMethod (
 				    method, filterMethod, fakeThis, i1, i2, 
-				    variableMapping: variableMapping, typeMapping: gpMapping, context: context
+				    variableMapping: variableMapping, typeMapping: gpMapping, context: context,
+                    newFirstInstruction: Instruction.Create(OpCodes.Pop),
+                    newLastInstruction: Instruction.Create(OpCodes.Endfilter)
 			    );
 			    var newClosureLocal = (VariableDefinition)newVariables[closure];
 
@@ -1137,7 +1145,9 @@ namespace ExceptionRewriter {
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
             RewriteContext context, 
-			Func<Instruction, Instruction, Instruction> onFailedRemap = null
+			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
+            Instruction newFirstInstruction = null,
+            Instruction newLastInstruction = null
 		)
 			where T : TypeReference
 			where U : TypeReference
@@ -1164,19 +1174,21 @@ namespace ExceptionRewriter {
 
 			var oldFirstInsn = insns[firstIndex];
             var oldLastInsn = insns[lastIndex];
-			var newFirstInsn = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):start");
-			insns[firstIndex] = newFirstInsn;
+            if (newFirstInstruction == null)
+			    newFirstInstruction = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):start");
+			insns[firstIndex] = newFirstInstruction;
 			// FIXME: This should not be necessary
-			Patch (sourceMethod, context, oldFirstInsn, newFirstInsn);
+			Patch (sourceMethod, context, oldFirstInsn, newFirstInstruction);
 
-            var newLastInsn = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):end");
-            insns[lastIndex] = newLastInsn;
-            Patch (sourceMethod, context, oldLastInsn, newLastInsn);
+            if (newLastInstruction == null)
+                newLastInstruction = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):end");
+            insns[lastIndex] = newLastInstruction;
+            Patch (sourceMethod, context, oldLastInsn, newLastInstruction);
 
             {
                 var removedInstructions = new List<Instruction>();
 
-				for (int i = lastIndex; i > firstIndex; i--) {
+				for (int i = lastIndex - 1; i > firstIndex; i--) {
                     var oldInsn = insns[i];
                     var dead = Nop ("removed [" + oldInsn.ToString() + "]");
 
@@ -1189,7 +1201,7 @@ namespace ExceptionRewriter {
                 }
 
                 // FIXME: The exception handler state here may be messy because the caller has more work to do
-				CleanMethodBody (sourceMethod, null, false, removedInstructions);
+				CleanMethodBody (sourceMethod, null, true, removedInstructions);
 			}
 
 			return variableMapping;
@@ -1420,20 +1432,29 @@ namespace ExceptionRewriter {
             bool iterating = true;
             int passNumber = 0;
 
-            while (iterating) {
-                iterating = ExtractStep (method, efilt, fakeThis, closure, excVar, insns);
+            return;
+
+            var groups = GetOrderedFilters(method);
+            foreach (var group in groups) {
+                iterating = RewriteSingleFilter (method, efilt, fakeThis, closure, excVar, insns, group);
                 passNumber += 1;
+                if (!iterating)
+                    break;
             }
         }
 
-        private IGrouping<InstructionPair, ExceptionHandler> GetFirstSmallestHandler (MethodDefinition method) {
-            var handlersByTry = method.Body.ExceptionHandlers.ToLookup(
+        private static ILookup<InstructionPair, ExceptionHandler> GetHandlersByTry (MethodDefinition method) {
+            return method.Body.ExceptionHandlers.ToLookup(
                 eh => {
                     var p = new InstructionPair { A = eh.TryStart, B = eh.TryEnd };
                     return p;
                 },
                 new InstructionPair.Comparer()
             );
+        }
+
+        private static IOrderedEnumerable<IGrouping<InstructionPair, ExceptionHandler>> GetOrderedFilters (MethodDefinition method) {
+            var handlersByTry = GetHandlersByTry(method);
 
             return handlersByTry.Where(g =>
                g.Any(eh => eh.HandlerType == ExceptionHandlerType.Filter)
@@ -1441,19 +1462,18 @@ namespace ExceptionRewriter {
             //  nested filters we process the innermost filters first.
             ).OrderBy(g => {
                 return g.Key.B.Offset - g.Key.A.Offset;
-            }).FirstOrDefault();
+            });
         }
 
-        private bool ExtractStep (MethodDefinition method, TypeReference efilt, ParameterDefinition fakeThis, VariableDefinition closure, VariableDefinition excVar, Collection<Instruction> insns) {
+        private bool RewriteSingleFilter (
+            MethodDefinition method, TypeReference efilt, 
+            ParameterDefinition fakeThis, VariableDefinition closure, 
+            VariableDefinition excVar, Collection<Instruction> insns,
+            IGrouping<InstructionPair, ExceptionHandler> group
+        ) {
             var context = new RewriteContext();
             var newGroups = context.NewGroups;
             var filtersToInsert = context.FiltersToInsert;
-
-            var willContinue = false;
-
-            var group = GetFirstSmallestHandler(method);
-            if (group == null)
-                return false;
 
             context.Pairs.Add(group.Key);
 
@@ -1468,14 +1488,16 @@ namespace ExceptionRewriter {
             newGroups.Add(excGroup);
 
             foreach (var eh in group) {
-                context.RemovedHandlers.Add(eh);
-                method.Body.ExceptionHandlers.Remove(eh);
+                // context.RemovedHandlers.Add(eh);
+                // method.Body.ExceptionHandlers.Remove(eh);
 
                 if (eh.FilterStart != null)
                     ExtractFilterAndCatch(method, eh, closure, fakeThis, excGroup, context);
                 else
                     ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
             }
+
+            /*
 
             foreach (var eg in newGroups) {
                 var finallyInsns = new List<Instruction>();
@@ -1685,8 +1707,9 @@ namespace ExceptionRewriter {
                     }
                 }
             }
+            */
 
-            return willContinue;
+            return true;
         }
 
         private void CollectReferencedLocals (
@@ -1746,7 +1769,7 @@ namespace ExceptionRewriter {
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
-            bool renumber = false;
+            bool renumber = true;
 
 			foreach (var i in insns) {
                 if (renumber || i.Offset == 0)
@@ -1765,8 +1788,9 @@ namespace ExceptionRewriter {
                         bool foundRange = false;
 
                         foreach (var eh in method.Body.ExceptionHandlers) {
-                            if (eh.HandlerType != ExceptionHandlerType.Catch)
+                            if (eh.HandlerType == ExceptionHandlerType.Finally)
                                 continue;
+
                             int startIndex = insns.IndexOf(eh.HandlerStart),
                                 endIndex = insns.IndexOf(eh.HandlerEnd);
 
