@@ -205,8 +205,6 @@ namespace ExceptionRewriter {
 		{
 			var body = method.Body.Instructions;
 			for (int i = 0; i < body.Count; i++) {
-				if (body[i].OpCode.Code == Code.Brtrue_S)
-					;
 				if (body[i].Operand == old)
 					body[i] = Instruction.Create (body[i].OpCode, replacement);
 			}
@@ -235,13 +233,68 @@ namespace ExceptionRewriter {
                 Patch (eh, old, replacement);
 		}
 
-        private void Patch (ExceptionHandler eh,  Instruction old, Instruction replacement) {
+        private void Patch (ExceptionHandler eh,  Instruction old, Instruction replacement) 
+        {
             eh.TryStart = Patch (eh.TryStart, old, replacement);
 			eh.TryEnd = Patch (eh.TryEnd, old, replacement);
 			eh.HandlerStart = Patch (eh.HandlerStart, old, replacement);
 			eh.HandlerEnd = Patch (eh.HandlerEnd, old, replacement);
 			eh.FilterStart = Patch (eh.FilterStart, old, replacement);
         }
+
+		private Instruction Patch (Instruction i, Dictionary<Instruction, Instruction> pairs) 
+		{
+            if (i == null)
+                return null;
+            Instruction result;
+            if (!pairs.TryGetValue (i, out result))
+                result = i;
+            return result;
+		}
+
+        private void Patch (ExceptionHandler eh, Dictionary<Instruction, Instruction> pairs) 
+        {
+            eh.TryStart = Patch (eh.TryStart, pairs);
+			eh.TryEnd = Patch (eh.TryEnd, pairs);
+			eh.HandlerStart = Patch (eh.HandlerStart, pairs);
+			eh.HandlerEnd = Patch (eh.HandlerEnd, pairs);
+			eh.FilterStart = Patch (eh.FilterStart, pairs);
+        }
+
+		private void PatchMany (MethodDefinition method, RewriteContext context, Dictionary<Instruction, Instruction> pairs) 
+        {
+			var body = method.Body.Instructions;
+            Instruction replacement;
+
+			for (int i = 0; i < body.Count; i++) {
+                var opInsn = body[i].Operand as Instruction;
+                if (opInsn != null && pairs.TryGetValue (opInsn, out replacement))
+                    body[i] = Instruction.Create (body[i].OpCode, replacement);
+			}
+
+            foreach (var p in context.Pairs) {
+                p.A = Patch (p.A, pairs);
+                p.B = Patch (p.B, pairs);
+            }
+
+            foreach (var g in context.NewGroups) {
+                g.FirstPushInstruction = Patch (g.FirstPushInstruction, pairs);
+                g.TryStart = Patch (g.TryStart, pairs);
+                g.TryEnd = Patch (g.TryEnd, pairs);
+
+                foreach (var h in g.Handlers) {
+                    h.FirstFilterInsn = Patch (h.FirstFilterInsn, pairs);
+                    Patch (h.Handler, pairs);
+                }
+            }
+
+			foreach (var eh in method.Body.ExceptionHandlers)
+                Patch (eh, pairs);
+
+			// CHANGE #1
+            foreach (var eh in context.RemovedHandlers)
+                Patch (eh, pairs);
+		}
 
 		private void InsertOps (
 			Collection<Instruction> body, int offset, params Instruction[] ops
@@ -574,8 +627,6 @@ namespace ExceptionRewriter {
 
 			var localCount = 0;
 			var closureVar = new VariableDefinition (closureTypeReference);
-
-            return closureVar;
 
 			var extractedVariables = variables.ToDictionary (
 				v => (object)v, 
@@ -1114,6 +1165,7 @@ namespace ExceptionRewriter {
 				    }
 			    );
 
+                // FIXME: What does this do?
 			    for (int i = 0; i < filterInsns.Count; i++) {
 				    var insn = filterInsns[i];
 				    if (insn.Operand != closure)
@@ -1170,83 +1222,21 @@ namespace ExceptionRewriter {
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
 
-			// CHANGE GROUP: This whole block changed a lot
+            var pairs = new Dictionary<Instruction, Instruction>();
+            for (int i = firstIndex; i <= lastIndex; i++) {
+                var oldInsn = insns[i];
+                var newInsn = Nop("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):removed " + oldInsn.ToString());
+                pairs.Add(oldInsn, newInsn);
+                insns[i] = newInsn;
+            }
 
-			var oldFirstInsn = insns[firstIndex];
-            var oldLastInsn = insns[lastIndex];
-            if (newFirstInstruction == null)
-			    newFirstInstruction = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):start");
-			insns[firstIndex] = newFirstInstruction;
-			// FIXME: This should not be necessary
-			Patch (sourceMethod, context, oldFirstInsn, newFirstInstruction);
-
-            if (newLastInstruction == null)
-                newLastInstruction = Nop ("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):end");
-            insns[lastIndex] = newLastInstruction;
-            Patch (sourceMethod, context, oldLastInsn, newLastInstruction);
-
-            {
-                var removedInstructions = new List<Instruction>();
-
-				for (int i = lastIndex - 1; i > firstIndex; i--) {
-                    var oldInsn = insns[i];
-                    var dead = Nop ("removed [" + oldInsn.ToString() + "]");
-
-                    // FIXME: This also should not be necessary, and it breaks extraction after the first filter
-                    // After doing this we end up with empty catch/filter bodies, which is clearly wrong
-                    Patch (sourceMethod, context, oldInsn, dead);
-
-					insns.RemoveAt (i);
-                    removedInstructions.Add(oldInsn);
-                }
-
-                // FIXME: The exception handler state here may be messy because the caller has more work to do
-				CleanMethodBody (sourceMethod, null, true, removedInstructions);
-			}
+            PatchMany(sourceMethod, context, pairs);
 
 			return variableMapping;
 		}
 
-		private void RemoveRange (
-			MethodDefinition method, RewriteContext context, 
-			Instruction first, Instruction last, bool inclusive
-		) {
-			var coll = method.Body.Instructions;
-			var firstIndex = coll.IndexOf (first);
-			var lastIndex = coll.IndexOf (last);
-			if (firstIndex < 0)
-				throw new Exception ($"Instruction {first} not found in method");
-			if (lastIndex < 0)
-				throw new Exception ($"Instruction {last} not found in method");
-			RemoveRange (method, context, firstIndex, lastIndex - (inclusive ? 0 : 1));
-		}
-
-		private void RemoveRange (MethodDefinition method, RewriteContext context, int firstIndex, int lastIndex) 
-		{
-			// CHANGE GROUP: This changed a lot too.
-			var coll = method.Body.Instructions;
-			var lastOne = coll[lastIndex];
-            var newFirst = Nop ("<unnamed>:start");
-			var newLast = Nop ("<unnamed>:end");
-
-            // FIXME: This used to exclude the first element
-			for (int i = lastIndex; i > firstIndex; i--) {
-                if (i == firstIndex) {
-				    Patch (method, context, coll[i], newFirst);
-                    coll[i] = newFirst;
-                } else {
-				    Patch (method, context, coll[i], newLast);
-
-                    if (i == lastIndex)
-                        coll[i] = newLast;
-                    else
-					    coll.RemoveAt (i);
-                }
-			}
-		}
-
         public class RewriteContext {
-            public List<InstructionPair> Pairs = new List<InstructionPair>();
+            public List<InstructionPair> Pairs;
             public List<ExcGroup> NewGroups = new List<ExcGroup>();
             public List<FilterToInsert> FiltersToInsert = new List<FilterToInsert>();
             public List<ExceptionHandler> RemovedHandlers = new List<ExceptionHandler>();
@@ -1432,11 +1422,10 @@ namespace ExceptionRewriter {
             bool iterating = true;
             int passNumber = 0;
 
-            return;
-
             var groups = GetOrderedFilters(method);
+            var pairs = (from k in groups select k.Key).ToList();
             foreach (var group in groups) {
-                iterating = RewriteSingleFilter (method, efilt, fakeThis, closure, excVar, insns, group);
+                iterating = RewriteSingleFilter (method, efilt, fakeThis, closure, excVar, insns, group, pairs);
                 passNumber += 1;
                 if (!iterating)
                     break;
@@ -1469,13 +1458,12 @@ namespace ExceptionRewriter {
             MethodDefinition method, TypeReference efilt, 
             ParameterDefinition fakeThis, VariableDefinition closure, 
             VariableDefinition excVar, Collection<Instruction> insns,
-            IGrouping<InstructionPair, ExceptionHandler> group
+            IGrouping<InstructionPair, ExceptionHandler> group,
+            List<InstructionPair> pairs
         ) {
-            var context = new RewriteContext();
+            var context = new RewriteContext { Pairs = pairs };
             var newGroups = context.NewGroups;
             var filtersToInsert = context.FiltersToInsert;
-
-            context.Pairs.Add(group.Key);
 
             var endIndex = insns.IndexOf(group.Key.B);
             if (endIndex < 0)
