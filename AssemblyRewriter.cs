@@ -865,7 +865,7 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private ExcHandler ExtractCatch (
+		private ExcBlock ExtractCatch (
 			MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ParameterDefinition fakeThis, ExcGroup group, RewriteContext context
 		) {
 			var insns = method.Body.Instructions;
@@ -948,6 +948,9 @@ namespace ExceptionRewriter {
             var i1 = insns.IndexOf (eh.HandlerStart);
             var i2 = insns.IndexOf (eh.HandlerEnd);
 
+            if (i2 <= i1)
+                throw new Exception("Hit beginning of handler while rewinding past rethrows");
+
 			// FIXME: Use generic parameter mapping to replace GP type references
 			var newMapping = ExtractRangeToMethod (
 				method, catchMethod, fakeThis,
@@ -1003,7 +1006,7 @@ namespace ExceptionRewriter {
             }
 
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
-			var handler = new ExcHandler {
+			var handler = new ExcBlock {
 				Handler = eh,
 				Method = catchMethod,
 				IsCatchAll = isCatchAll,
@@ -1011,7 +1014,6 @@ namespace ExceptionRewriter {
 				CatchReferencedVariables = catchReferencedVariables,
 				CatchReferencedArguments = catchReferencedArguments
 			};
-			group.Handlers.Add (handler);
 			return handler;
 		}
 
@@ -1084,10 +1086,11 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private void ExtractFilter (
+		private ExcBlock ExtractFilter (
 			MethodDefinition method, ExceptionHandler eh, 
             VariableDefinition closure, ParameterDefinition fakeThis, 
-            ExcGroup group, RewriteContext context
+            ExcGroup group, RewriteContext context,
+            ExcBlock catchBlock
 		) {
 			var insns = method.Body.Instructions;
 			var closureType = closure.VariableType;
@@ -1190,18 +1193,17 @@ namespace ExceptionRewriter {
 			    CleanMethodBody (filterMethod, method, true);
             }
 
-            // FIXME
-            /*
-			var handler = ExtractCatch (method, eh, closure, fakeThis, group, context);
+			var handler = new ExcBlock {
+				Handler = eh,
+				FilterMethod = filterMethod,
+                FilterType = filterTypeDefinition,
+                FilterVariable = new VariableDefinition (filterTypeDefinition),
+                FirstFilterInsn = eh.FilterStart,
+			};
 
-			handler.FilterMethod = filterMethod;
-			handler.FilterType = filterTypeDefinition;
-			handler.FilterVariable = new VariableDefinition (filterTypeDefinition);
-			method.Body.Variables.Add (handler.FilterVariable);
-			handler.FirstFilterInsn = eh.FilterStart;
+            method.Body.Variables.Add (handler.FilterVariable);
 
 			return handler;
-            */
 		}
 
 		private Dictionary<object, object> ExtractRangeToMethod<T, U> (
@@ -1250,6 +1252,8 @@ namespace ExceptionRewriter {
 
             PatchMany(sourceMethod, context, pairs);
 
+            StripUnreferencedNops(targetMethod);
+
 			return variableMapping;
 		}
 
@@ -1263,8 +1267,8 @@ namespace ExceptionRewriter {
             private static int NextID = 0;
 
             public readonly int ID;
-			public Instruction TryStart, TryEnd;
-			public List<ExcHandler> Handlers = new List<ExcHandler> ();
+			public Instruction TryStart, TryEnd, TryEndPredecessor;
+			public List<ExcBlock> Handlers = new List<ExcBlock> ();
 			internal Instruction FirstPushInstruction;
 
             public ExcGroup () {
@@ -1276,7 +1280,7 @@ namespace ExceptionRewriter {
             }
 		}
 
-		public class ExcHandler {
+		public class ExcBlock {
             private static int NextID = 0;
 
             public readonly int ID;
@@ -1292,12 +1296,12 @@ namespace ExceptionRewriter {
 			internal HashSet<ParameterReference> CatchReferencedArguments;
 			internal Dictionary<object, object> Mapping;
 
-            public ExcHandler () {
+            public ExcBlock () {
                 ID = NextID++;
             }
 
             public override string ToString () {
-                return $"Handler #{ID}";
+                return $"Handler #{ID} {(FilterMethod ?? Method).FullName}";
             }
         }
 
@@ -1443,7 +1447,7 @@ namespace ExceptionRewriter {
             bool iterating = true;
             int passNumber = 0;
 
-            ExtractFilterAndCatchBlocks(method, efilt, fakeThis, closure, excVar, insns);
+            ConvertFiltersAndCatchBlocks(method, efilt, fakeThis, closure, excVar, insns);
 
             /*
             foreach (var group in groups) {
@@ -1460,6 +1464,8 @@ namespace ExceptionRewriter {
         }
 
         private void StripUnreferencedNops (MethodDefinition method) {
+            return;
+
             var referenced = new HashSet<Instruction> ();
 
             foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1510,7 +1516,7 @@ namespace ExceptionRewriter {
             });
         }
 
-        private void ExtractFilterAndCatchBlocks (
+        private void ConvertFiltersAndCatchBlocks (
             MethodDefinition method, TypeReference efilt, 
             ParameterDefinition fakeThis, VariableDefinition closure, 
             VariableDefinition excVar, Collection<Instruction> insns
@@ -1526,16 +1532,48 @@ namespace ExceptionRewriter {
 
                 var excGroup = new ExcGroup {
                     TryStart = group.Key.A,
-                    TryEnd = insns[endIndex - 1],
+                    TryEndPredecessor = insns[endIndex - 1],
+                    TryEnd = group.Key.B,
                 };
 
                 foreach (var eh in group) {
-                    if (eh.FilterStart != null)
-                        ExtractFilter(method, eh, closure, fakeThis, excGroup, context);
+                    var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
+                    excGroup.Handlers.Add (catchBlock);
 
-                    ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
+                    if (eh.FilterStart != null) {
+                        var filterBlock = ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
+                        excGroup.Handlers.Add (filterBlock);
+                    }
+                }
 
-                    method.Body.ExceptionHandlers.Remove(eh);
+                var newInstructions = new List<Instruction> ();
+                var newStart = Nop ("Constructed handler start");
+                var newEnd = Nop ("Constructed handler end");
+                newInstructions.Add (newStart);
+                newInstructions.Add (Rethrow ("Constructed handler"));
+                newInstructions.Add (newEnd);
+
+                var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
+                if (targetIndex < 0)
+                    throw new Exception ("Failed to find TryEnd");
+                targetIndex += 1;
+                InsertOps (insns, targetIndex, newInstructions.ToArray());
+
+                var newEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
+                    CatchType = method.Module.TypeSystem.Object,
+                    HandlerType = ExceptionHandlerType.Catch,
+                    HandlerStart = newStart,
+                    HandlerEnd = newEnd,
+                    TryStart = excGroup.TryStart,
+                    TryEnd = newStart,
+                    FilterStart = null
+                };
+                method.Body.ExceptionHandlers.Add (newEh);
+                
+                foreach (var eh in group) {
+                    // FIXME
+                    // if (eh.HandlerType == ExceptionHandlerType.Filter)
+                        method.Body.ExceptionHandlers.Remove(eh);
                 }
             }
         }
@@ -1556,18 +1594,11 @@ namespace ExceptionRewriter {
                 throw new Exception($"End instruction {group.Key.B} not found in method body");
             var excGroup = new ExcGroup {
                 TryStart = group.Key.A,
-                TryEnd = insns[endIndex - 1],
+                TryEndPredecessor = insns[endIndex - 1],
+                TryEnd = group.Key.B
             };
 
             newGroups.Add(excGroup);
-
-            foreach (var eh in group.Where(_ => _.FilterStart == null))
-                ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
-
-            foreach (var eh in group.Where(_ => _.FilterStart != null)) {
-                ExtractFilter(method, eh, closure, fakeThis, excGroup, context);
-                method.Body.ExceptionHandlers.Remove(eh);
-            }
 
             /*
 
@@ -1872,7 +1903,7 @@ namespace ExceptionRewriter {
                             }
                         }
 
-                        if (!foundRange)
+                        if (!foundRange && false)
                             throw new Exception($"Found rethrow instruction outside of catch block: {i}");
 
                         break;
