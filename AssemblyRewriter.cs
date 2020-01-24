@@ -227,10 +227,6 @@ namespace ExceptionRewriter {
 
 			foreach (var eh in method.Body.ExceptionHandlers)
                 Patch (eh, old, replacement);
-
-			// CHANGE #1
-            foreach (var eh in context.RemovedHandlers)
-                Patch (eh, old, replacement);
 		}
 
         private void Patch (ExceptionHandler eh,  Instruction old, Instruction replacement) 
@@ -289,10 +285,6 @@ namespace ExceptionRewriter {
             }
 
 			foreach (var eh in method.Body.ExceptionHandlers)
-                Patch (eh, pairs);
-
-			// CHANGE #1
-            foreach (var eh in context.RemovedHandlers)
                 Patch (eh, pairs);
 		}
 
@@ -909,7 +901,10 @@ namespace ExceptionRewriter {
 
 			var handlerFirstIndex = insns.IndexOf (eh.HandlerStart);
 			var handlerLastIndex = insns.IndexOf (eh.HandlerEnd) - 1;
-			FilterRange (
+
+            Console.WriteLine($"Extracting catch [{eh.HandlerStart}] - [{eh.HandlerEnd} - 1]");
+
+            FilterRange (
 				method, handlerFirstIndex, handlerLastIndex,
 				(insn) => {
 					var operandTr = insn.Operand as TypeReference;
@@ -950,16 +945,20 @@ namespace ExceptionRewriter {
 			// CHANGE #4: Adding method earlier
 			method.DeclaringType.Methods.Add (catchMethod);
 
+            var i1 = insns.IndexOf (eh.HandlerStart);
+            var i2 = insns.IndexOf (eh.HandlerEnd);
+
 			// FIXME: Use generic parameter mapping to replace GP type references
 			var newMapping = ExtractRangeToMethod (
 				method, catchMethod, fakeThis,
-				insns.IndexOf (eh.HandlerStart), 
-				insns.IndexOf (eh.HandlerEnd) - 1,
+				i1, i2 - 1,
 				variableMapping: paramMapping,
 				typeMapping: gpMapping,
-                context: context,
+                context: context
+                /*,
                 newFirstInstruction: Instruction.Create(OpCodes.Rethrow),
                 newLastInstruction: Instruction.Create(OpCodes.Leave, eh.HandlerEnd)
+                */
 			);
 
             if (catchInsns.Count > 0) {
@@ -1085,7 +1084,7 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private ExcHandler ExtractFilterAndCatch (
+		private void ExtractFilter (
 			MethodDefinition method, ExceptionHandler eh, 
             VariableDefinition closure, ParameterDefinition fakeThis, 
             ExcGroup group, RewriteContext context
@@ -1121,28 +1120,31 @@ namespace ExceptionRewriter {
 
 			filterTypeDefinition.Methods.Add (filterMethod);
 
-			var filterReplacement = Instruction.Create (OpCodes.Ret);
-
 			var excArg = new ParameterDefinition ("exc", default (ParameterAttributes), method.Module.TypeSystem.Object);
 			filterMethod.Parameters.Add (excArg);
 
 			int i1 = insns.IndexOf (eh.FilterStart), i2 = insns.IndexOf (eh.HandlerStart);
 			if (i2 < 0)
 				throw new Exception ($"Handler start instruction {eh.HandlerStart} not found in method body");
-			i2--;
 
-            if (i2 <= i1) {
+            if (i2 <= i1)
                 throw new Exception("Handler size was 0 or less");
-            } else {
-			    var variableMapping = new Dictionary<object, object> {
-				    // FIXME
-				    // {closure, closureField }
-			    };
+
+            var endfilter = insns[i2 - 1];
+            if (endfilter.OpCode.Code != Code.Endfilter)
+                throw new Exception("Filter did not end with an endfilter");
+
+            {
+                Console.WriteLine($"Extracting filter [{eh.FilterStart}] - [{endfilter}]");
+
+                var variableMapping = new Dictionary<object, object> ();
 			    var newVariables = ExtractRangeToMethod (
-				    method, filterMethod, fakeThis, i1, i2, 
-				    variableMapping: variableMapping, typeMapping: gpMapping, context: context,
+				    method, filterMethod, fakeThis, i1, i2 - 1, 
+				    variableMapping: variableMapping, typeMapping: gpMapping, context: context
+                    /*,
                     newFirstInstruction: Instruction.Create(OpCodes.Pop),
                     newLastInstruction: Instruction.Create(OpCodes.Endfilter)
+                    */
 			    );
 			    var newClosureLocal = (VariableDefinition)newVariables[closure];
 
@@ -1151,6 +1153,10 @@ namespace ExceptionRewriter {
                     throw new Exception("Filter body was empty");
 
 			    var oldFilterInsn = filterInsns[filterInsns.Count - 1];
+                if (oldFilterInsn.OpCode.Code != Code.Endfilter)
+                    throw new Exception("Unexpected last instruction");
+
+                var filterReplacement = Instruction.Create (OpCodes.Ret);
 			    filterInsns[filterInsns.Count - 1] = filterReplacement;
 			    Patch (filterMethod, context, oldFilterInsn, filterReplacement);
 
@@ -1184,6 +1190,8 @@ namespace ExceptionRewriter {
 			    CleanMethodBody (filterMethod, method, true);
             }
 
+            // FIXME
+            /*
 			var handler = ExtractCatch (method, eh, closure, fakeThis, group, context);
 
 			handler.FilterMethod = filterMethod;
@@ -1193,6 +1201,7 @@ namespace ExceptionRewriter {
 			handler.FirstFilterInsn = eh.FilterStart;
 
 			return handler;
+            */
 		}
 
 		private Dictionary<object, object> ExtractRangeToMethod<T, U> (
@@ -1202,9 +1211,7 @@ namespace ExceptionRewriter {
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
             RewriteContext context, 
-			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
-            Instruction newFirstInstruction = null,
-            Instruction newLastInstruction = null
+			Func<Instruction, Instruction, Instruction> onFailedRemap = null
 		)
 			where T : TypeReference
 			where U : TypeReference
@@ -1232,6 +1239,10 @@ namespace ExceptionRewriter {
             var pairs = new Dictionary<Instruction, Instruction>();
             for (int i = firstIndex; i <= lastIndex; i++) {
                 var oldInsn = insns[i];
+                if ((oldInsn.OpCode.Code == Code.Nop) && (oldInsn.Operand != null))
+                    continue;
+                    // throw new Exception($"Extracting already-extracted instruction {oldInsn}");
+
                 var newInsn = Nop(key + oldInsn.ToString());
                 pairs.Add(oldInsn, newInsn);
                 insns[i] = newInsn;
@@ -1246,7 +1257,6 @@ namespace ExceptionRewriter {
             public List<InstructionPair> Pairs;
             public List<ExcGroup> NewGroups = new List<ExcGroup>();
             public List<FilterToInsert> FiltersToInsert = new List<FilterToInsert>();
-            public List<ExceptionHandler> RemovedHandlers = new List<ExceptionHandler>();
         }
 
 		public class ExcGroup {
@@ -1398,6 +1408,9 @@ namespace ExceptionRewriter {
             //  instructions from the method body.
             method.DebugInformation = null;
 
+            if (!method.FullName.Contains("NestedFiltersIn"))
+                return;
+
             CleanMethodBody(method, null, false);
 
             var efilt = GetExceptionFilter(method.Module);
@@ -1430,14 +1443,16 @@ namespace ExceptionRewriter {
             bool iterating = true;
             int passNumber = 0;
 
-            var groups = GetOrderedFilters (method);
-            var pairs = (from k in groups select k.Key).ToList ();
+            ExtractFilterAndCatchBlocks(method, efilt, fakeThis, closure, excVar, insns);
+
+            /*
             foreach (var group in groups) {
                 iterating = RewriteSingleFilter (method, efilt, fakeThis, closure, excVar, insns, group, pairs);
                 passNumber += 1;
                 if (!iterating)
                     break;
             }
+            */
 
             StripUnreferencedNops (method);
 
@@ -1495,6 +1510,36 @@ namespace ExceptionRewriter {
             });
         }
 
+        private void ExtractFilterAndCatchBlocks (
+            MethodDefinition method, TypeReference efilt, 
+            ParameterDefinition fakeThis, VariableDefinition closure, 
+            VariableDefinition excVar, Collection<Instruction> insns
+        ) {
+            var groups = GetOrderedFilters (method).ToList ();
+            var pairs = (from k in groups select k.Key).ToList ();
+            var context = new RewriteContext { Pairs = pairs };
+
+            foreach (var group in groups) {
+                var endIndex = insns.IndexOf(group.Key.B);
+                if (endIndex < 0)
+                    throw new Exception($"End instruction [{group.Key.B}] not found in method body");
+
+                var excGroup = new ExcGroup {
+                    TryStart = group.Key.A,
+                    TryEnd = insns[endIndex - 1],
+                };
+
+                foreach (var eh in group) {
+                    if (eh.FilterStart != null)
+                        ExtractFilter(method, eh, closure, fakeThis, excGroup, context);
+
+                    ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
+
+                    method.Body.ExceptionHandlers.Remove(eh);
+                }
+            }
+        }
+
         private bool RewriteSingleFilter (
             MethodDefinition method, TypeReference efilt, 
             ParameterDefinition fakeThis, VariableDefinition closure, 
@@ -1516,17 +1561,12 @@ namespace ExceptionRewriter {
 
             newGroups.Add(excGroup);
 
-            foreach (var eh in group) {
-                // context.RemovedHandlers.Add(eh);
-                // method.Body.ExceptionHandlers.Remove(eh);
+            foreach (var eh in group.Where(_ => _.FilterStart == null))
+                ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
 
-                if (eh.FilterStart != null) {
-                    ExtractFilterAndCatch(method, eh, closure, fakeThis, excGroup, context);
-                    method.Body.ExceptionHandlers.Remove(eh);
-                } else {
-                    // FIXME
-                    ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
-                }
+            foreach (var eh in group.Where(_ => _.FilterStart != null)) {
+                ExtractFilter(method, eh, closure, fakeThis, excGroup, context);
+                method.Body.ExceptionHandlers.Remove(eh);
             }
 
             /*
@@ -1801,7 +1841,7 @@ namespace ExceptionRewriter {
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
-            bool renumber = true;
+            bool renumber = false;
 
 			foreach (var i in insns) {
                 if (renumber || i.Offset == 0)
