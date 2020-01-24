@@ -2,7 +2,7 @@
   "profiles": {
     "ExceptionRewriter": {
       "commandName": "Project",
-      "commandLineArgs": "\"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Debug\\NetFramework.exe\" \"C:\\Users\\Katelyn\\Desktop\\rewritten.exe\" \"\"C:\\Users\\Katelyn\\Desktop\\System.Data.dll\"\" \"C:\\Users\\Katelyn\\Desktop\\system.data.rewritten.dll\" \"E:\\Documents\\Projects\\ExceptionTransformTests\\bin\\Debug\\netcoreapp2.1\\ExceptionTransformTests.dll\" \"C:\\Users\\Katelyn\\Desktop\\rewritten.dll\" --warn"
+      "commandLineArgs": "\"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Debug\\NetFramework.exe\" \"C:\\Users\\Katelyn\\Desktop\\rewritten.exe\" \"E:\\Documents\\Projects\\ExceptionTransformTests\\bin\\Debug\\netcoreapp2.1\\ExceptionTransformTests.dll\" \"C:\\Users\\Katelyn\\Desktop\\rewritten.dll\" --warn"
     }
   }
 }

@@ -1417,18 +1417,52 @@ namespace ExceptionRewriter {
             method.Body.Variables.Add(excVar);
 
             var insns = method.Body.Instructions;
-            insns.Insert(0, Nop ("header"));
+            insns.Insert (0, Nop ("header"));
+            insns.Append (Nop ("footer"));
 
             bool iterating = true;
             int passNumber = 0;
 
-            var groups = GetOrderedFilters(method);
-            var pairs = (from k in groups select k.Key).ToList();
+            var groups = GetOrderedFilters (method);
+            var pairs = (from k in groups select k.Key).ToList ();
             foreach (var group in groups) {
                 iterating = RewriteSingleFilter (method, efilt, fakeThis, closure, excVar, insns, group, pairs);
                 passNumber += 1;
                 if (!iterating)
                     break;
+            }
+
+            StripUnreferencedNops (method);
+
+            CleanMethodBody (method, null, true);
+        }
+
+        private void StripUnreferencedNops (MethodDefinition method) {
+            var referenced = new HashSet<Instruction> ();
+
+            foreach (var eh in method.Body.ExceptionHandlers) {
+                referenced.Add (eh.HandlerStart);
+                referenced.Add (eh.HandlerEnd);
+                referenced.Add (eh.FilterStart);
+                referenced.Add (eh.TryStart);
+                referenced.Add (eh.TryEnd);
+            }
+
+            var insns = method.Body.Instructions;
+            foreach (var insn in insns) {
+                var operand = insn.Operand as Instruction;
+                if (operand != null)
+                    referenced.Add (operand);
+            }
+
+            var old = insns.ToArray ();
+            insns.Clear ();
+
+            foreach (var insn in old) {
+                if ((insn.OpCode.Code == Code.Nop) && !referenced.Contains (insn))
+                    continue;
+
+                insns.Add (insn);
             }
         }
 
@@ -1479,10 +1513,13 @@ namespace ExceptionRewriter {
                 // context.RemovedHandlers.Add(eh);
                 // method.Body.ExceptionHandlers.Remove(eh);
 
-                if (eh.FilterStart != null)
+                if (eh.FilterStart != null) {
                     ExtractFilterAndCatch(method, eh, closure, fakeThis, excGroup, context);
-                else
+                    method.Body.ExceptionHandlers.Remove(eh);
+                } else {
+                    // FIXME
                     ExtractCatch(method, eh, closure, fakeThis, excGroup, context);
+                }
             }
 
             /*
