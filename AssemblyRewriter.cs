@@ -218,6 +218,7 @@ namespace ExceptionRewriter {
                 g.FirstPushInstruction = Patch (g.FirstPushInstruction, old, replacement);
                 g.TryStart = Patch (g.TryStart, old, replacement);
                 g.TryEnd = Patch (g.TryEnd, old, replacement);
+                g.TryEndPredecessor = Patch (g.TryEndPredecessor, old, replacement);
 
                 foreach (var h in g.Handlers) {
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, old, replacement);
@@ -277,6 +278,7 @@ namespace ExceptionRewriter {
                 g.FirstPushInstruction = Patch (g.FirstPushInstruction, pairs);
                 g.TryStart = Patch (g.TryStart, pairs);
                 g.TryEnd = Patch (g.TryEnd, pairs);
+                g.TryEndPredecessor = Patch (g.TryEndPredecessor, pairs);
 
                 foreach (var h in g.Handlers) {
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, pairs);
@@ -904,9 +906,27 @@ namespace ExceptionRewriter {
 
             Console.WriteLine($"Extracting catch [{eh.HandlerStart}] - [{eh.HandlerEnd} - 1]");
 
-            FilterRange (
-				method, handlerFirstIndex, handlerLastIndex,
-				(insn) => {
+			// CHANGE #4: Adding method earlier
+			method.DeclaringType.Methods.Add (catchMethod);
+
+            var i1 = insns.IndexOf (eh.HandlerStart);
+            var i2 = insns.IndexOf (eh.HandlerEnd);
+
+            var endsWithRethrow = insns[i2].OpCode.Code == Code.Rethrow;
+
+            if (i2 <= i1)
+                throw new Exception("Hit beginning of handler while rewinding past rethrows");
+
+			// FIXME: Use generic parameter mapping to replace GP type references
+			var newMapping = ExtractRangeToMethod (
+				method, catchMethod, fakeThis,
+				i1, i2 - 1,
+				variableMapping: paramMapping,
+				typeMapping: gpMapping,
+                context: context,
+                // FIXME: Identify when we want to preserve control flow and when we don't
+                preserveControlFlow: true,
+                filter: (insn) => {
 					var operandTr = insn.Operand as TypeReference;
 					if (operandTr != null) {
 						var newOperandTr = FilterTypeReference (operandTr, gpMapping);
@@ -941,28 +961,13 @@ namespace ExceptionRewriter {
 			);
 
 			CleanMethodBody (catchMethod, method, false);
-
-			// CHANGE #4: Adding method earlier
-			method.DeclaringType.Methods.Add (catchMethod);
-
-            var i1 = insns.IndexOf (eh.HandlerStart);
-            var i2 = insns.IndexOf (eh.HandlerEnd);
-
-            if (i2 <= i1)
-                throw new Exception("Hit beginning of handler while rewinding past rethrows");
-
-			// FIXME: Use generic parameter mapping to replace GP type references
-			var newMapping = ExtractRangeToMethod (
-				method, catchMethod, fakeThis,
-				i1, i2 - 1,
-				variableMapping: paramMapping,
-				typeMapping: gpMapping,
-                context: context
-                /*,
-                newFirstInstruction: Instruction.Create(OpCodes.Rethrow),
-                newLastInstruction: Instruction.Create(OpCodes.Leave, eh.HandlerEnd)
-                */
-			);
+            /*
+            if (endsWithRethrow) {
+                var oldInsn = insns[i2 - 1];
+                insns[i2 - 1] = Rethrow ("Preserved rethrow");
+                Patch (method, context, oldInsn, insns[i2 - 1]);
+            }
+            */
 
             if (catchInsns.Count > 0) {
 			    var first = catchInsns[0];
@@ -1143,7 +1148,9 @@ namespace ExceptionRewriter {
                 var variableMapping = new Dictionary<object, object> ();
 			    var newVariables = ExtractRangeToMethod (
 				    method, filterMethod, fakeThis, i1, i2 - 1, 
-				    variableMapping: variableMapping, typeMapping: gpMapping, context: context
+				    variableMapping: variableMapping, typeMapping: gpMapping, 
+                    context: context,
+                    preserveControlFlow: false
                     /*,
                     newFirstInstruction: Instruction.Create(OpCodes.Pop),
                     newLastInstruction: Instruction.Create(OpCodes.Endfilter)
@@ -1213,7 +1220,9 @@ namespace ExceptionRewriter {
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
             RewriteContext context, 
-			Func<Instruction, Instruction, Instruction> onFailedRemap = null
+            bool preserveControlFlow,
+			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
+            Func<Instruction, Instruction[]> filter = null
 		)
 			where T : TypeReference
 			where U : TypeReference
@@ -1229,24 +1238,45 @@ namespace ExceptionRewriter {
 				variableMapping[loc] = newLoc;
 			}
 
-			CloneInstructions (
+            var pairs = new Dictionary<Instruction, Instruction>();
+
+            var key = "extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + ") ";
+
+            // Scan the range we're extracting and prepare to erase it after the clone
+            // We need to do this now because the clone process can mutate the instructions being copied (yuck)
+            for (int i = firstIndex; i <= lastIndex; i++) {
+                var oldInsn = insns[i];
+
+                if (preserveControlFlow) {
+                    // Do not erase rethrows or leaves because they can turn the catch into an invalid one by unbalancing the stack
+                    if ((oldInsn.OpCode.Code == Code.Rethrow))
+                        continue;
+                    else if (((oldInsn.OpCode.Code == Code.Leave) || (oldInsn.OpCode.Code == Code.Leave_S)))
+                        continue;
+                }
+
+                // Do not erase existing placeholder nops
+                if ((oldInsn.OpCode.Code == Code.Nop) && (oldInsn.Operand != null))
+                    continue;
+                    // throw new Exception($"Extracting already-extracted instruction {oldInsn}");
+                
+                var newInsn = Nop(key + oldInsn.ToString());
+                pairs.Add(oldInsn, newInsn);
+            }
+
+            CloneInstructions (
 				sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, 
-				targetInsns, 0, variableMapping, typeMapping, onFailedRemap
+				targetInsns, 0, variableMapping, typeMapping, onFailedRemap, filter
 			);
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
 
-            var key = "extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + ") ";
-
-            var pairs = new Dictionary<Instruction, Instruction>();
             for (int i = firstIndex; i <= lastIndex; i++) {
                 var oldInsn = insns[i];
-                if ((oldInsn.OpCode.Code == Code.Nop) && (oldInsn.Operand != null))
+                Instruction newInsn;
+                if (!pairs.TryGetValue(oldInsn, out newInsn))
                     continue;
-                    // throw new Exception($"Extracting already-extracted instruction {oldInsn}");
 
-                var newInsn = Nop(key + oldInsn.ToString());
-                pairs.Add(oldInsn, newInsn);
                 insns[i] = newInsn;
             }
 
@@ -1412,7 +1442,7 @@ namespace ExceptionRewriter {
             //  instructions from the method body.
             method.DebugInformation = null;
 
-            if (!method.FullName.Contains("NestedFiltersIn"))
+            if (false && !method.FullName.Contains("NestedFiltersIn"))
                 return;
 
             CleanMethodBody(method, null, false);
@@ -1447,7 +1477,7 @@ namespace ExceptionRewriter {
             bool iterating = true;
             int passNumber = 0;
 
-            ConvertFiltersAndCatchBlocks(method, efilt, fakeThis, closure, excVar, insns);
+            ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closure, excVar, insns);
 
             /*
             foreach (var group in groups) {
@@ -1464,8 +1494,6 @@ namespace ExceptionRewriter {
         }
 
         private void StripUnreferencedNops (MethodDefinition method) {
-            return;
-
             var referenced = new HashSet<Instruction> ();
 
             foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1516,7 +1544,7 @@ namespace ExceptionRewriter {
             });
         }
 
-        private void ConvertFiltersAndCatchBlocks (
+        private void ExtractFiltersAndCatchBlocks (
             MethodDefinition method, TypeReference efilt, 
             ParameterDefinition fakeThis, VariableDefinition closure, 
             VariableDefinition excVar, Collection<Instruction> insns
@@ -1550,12 +1578,12 @@ namespace ExceptionRewriter {
                 var newStart = Nop ("Constructed handler start");
                 var newEnd = Nop ("Constructed handler end");
                 newInstructions.Add (newStart);
-                newInstructions.Add (Rethrow ("Constructed handler"));
+                newInstructions.Add (Rethrow ("Constructed handler rethrow"));
                 newInstructions.Add (newEnd);
 
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
-                    throw new Exception ("Failed to find TryEnd");
+                    throw new Exception ("Failed to find TryEndPredecessor");
                 targetIndex += 1;
                 InsertOps (insns, targetIndex, newInstructions.ToArray());
 
@@ -1572,8 +1600,11 @@ namespace ExceptionRewriter {
                 
                 foreach (var eh in group) {
                     // FIXME
-                    // if (eh.HandlerType == ExceptionHandlerType.Filter)
-                        method.Body.ExceptionHandlers.Remove(eh);
+                    if (eh.HandlerType == ExceptionHandlerType.Filter) {
+                        eh.HandlerType = ExceptionHandlerType.Catch;
+                        eh.FilterStart = null;
+                        eh.CatchType = method.Module.TypeSystem.Object;
+                    }
                 }
             }
         }
@@ -2059,6 +2090,11 @@ namespace ExceptionRewriter {
                 // HACK: Manually preserve any operand that was tucked inside the nop for bookkeeping
                 result.Operand = operand;
                 return result;
+            } else if (code.Code == Code.Rethrow) {
+                var result = Instruction.Create(OpCodes.Rethrow);
+                // HACK: Manually preserve any operand that was tucked inside the rethrow for bookkeeping
+                result.Operand = operand;
+                return result;
             } else if (newOperand is FieldReference) {
 				FieldReference fref = newOperand as FieldReference;
 				return Instruction.Create (code, fref);
@@ -2113,7 +2149,8 @@ namespace ExceptionRewriter {
 			int targetIndex,
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
-			Func<Instruction, Instruction, Instruction> onFailedRemap = null
+			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
+            Func<Instruction, Instruction[]> filter = null
 		)
 			where T : TypeReference
 			where U : TypeReference
@@ -2124,7 +2161,17 @@ namespace ExceptionRewriter {
 			for (int n = 0; n < count; n++) {
 				var i = sourceMethod.Body.Instructions[n + sourceIndex];
 				var newInsn = CloneInstruction (i, fakeThis, sourceMethod, variableMapping, typeMapping);
-				target.Add (newInsn);
+                if (filter != null) {
+                    var filtered = filter (newInsn);
+                    if (filtered != null) {
+                        foreach (var filteredInsn in filtered)
+                            target.Add (filteredInsn);
+                    } else {
+                        target.Add (newInsn);
+                    }
+                } else {
+    				target.Add (newInsn);
+                }
 			}
 
 			// Fixup branches
