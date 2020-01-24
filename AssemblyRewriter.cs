@@ -1165,12 +1165,17 @@ namespace ExceptionRewriter {
 				    }
 			    );
 
-                // FIXME: What does this do?
+                // Scan through the extracted method body to find references to the closure object local
+                //  since it is an instance field inside the filter object instead of a local variable
 			    for (int i = 0; i < filterInsns.Count; i++) {
 				    var insn = filterInsns[i];
 				    if (insn.Operand != closure)
 					    continue;
 
+                    if (insn.OpCode.Code != Code.Ldloc)
+                        throw new Exception ("Invalid reference to closure");
+
+                    // Replace the ldloc with a ldfld this.closure
 				    filterInsns[i] = Instruction.Create (OpCodes.Ldarg, fakeThis);
 				    Patch (filterMethod, context, insn, filterInsns[i]);
 				    filterInsns.Insert (i + 1, Instruction.Create (OpCodes.Ldfld, closureField));
@@ -1222,10 +1227,12 @@ namespace ExceptionRewriter {
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
 
+            var key = "extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + ") ";
+
             var pairs = new Dictionary<Instruction, Instruction>();
             for (int i = firstIndex; i <= lastIndex; i++) {
                 var oldInsn = insns[i];
-                var newInsn = Nop("extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + "):removed " + oldInsn.ToString());
+                var newInsn = Nop(key + oldInsn.ToString());
                 pairs.Add(oldInsn, newInsn);
                 insns[i] = newInsn;
             }
