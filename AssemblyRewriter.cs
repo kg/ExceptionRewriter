@@ -1246,7 +1246,12 @@ namespace ExceptionRewriter {
             // We need to do this now because the clone process can mutate the instructions being copied (yuck)
             for (int i = firstIndex; i <= lastIndex; i++) {
                 var oldInsn = insns[i];
-
+                
+                // FIXME: Currently any bare rethrow or throw we encounter is transformed into a ret, 
+                //  when what we actually want is to preserve it if it happens to be inside a catch
+                //  block contained within the current method.
+                // We need to identify whether this control flow is top-level or not so we can decide
+                //  whether to preserve it.
                 if (preserveControlFlow) {
                     // Do not erase rethrows or leaves because they can turn the catch into an invalid one by unbalancing the stack
                     if ((oldInsn.OpCode.Code == Code.Rethrow))
@@ -1279,6 +1284,8 @@ namespace ExceptionRewriter {
 
                 insns[i] = newInsn;
             }
+
+            // FIXME: Copy over any try/catch blocks from the source range
 
             PatchMany(sourceMethod, context, pairs);
 
