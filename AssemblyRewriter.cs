@@ -926,7 +926,7 @@ namespace ExceptionRewriter {
                 context: context,
                 // FIXME: Identify when we want to preserve control flow and when we don't
                 preserveControlFlow: true,
-                filter: (insn) => {
+                filter: (insn, range) => {
 					var operandTr = insn.Operand as TypeReference;
 					if (operandTr != null) {
 						var newOperandTr = FilterTypeReference (operandTr, gpMapping);
@@ -941,22 +941,22 @@ namespace ExceptionRewriter {
 							insn.Operand = newOperandMr;
 					}
 
-					switch (insn.OpCode.Code) {
-						case Code.Leave:
-						case Code.Leave_S:
-							return new[] {
-								Instruction.Create (OpCodes.Ldc_I4_0),
-								Instruction.Create (OpCodes.Ret)
-							};
-						case Code.Rethrow:
-							return new[] {
-								Instruction.Create (OpCodes.Ldc_I4_1),
-								Instruction.Create (OpCodes.Ret)
-							};
-						case Code.Ldarg:
-						default:
-							return null;
-					}
+                    if (range == null)
+					    switch (insn.OpCode.Code) {
+						    case Code.Leave:
+						    case Code.Leave_S:
+							    return new[] {
+								    Instruction.Create (OpCodes.Ldc_I4_0),
+								    Instruction.Create (OpCodes.Ret)
+							    };
+						    case Code.Rethrow:
+							    return new[] {
+								    Instruction.Create (OpCodes.Ldc_I4_1),
+								    Instruction.Create (OpCodes.Ret)
+							    };
+					    }
+
+                    return null;
 				}
 			);
 
@@ -1213,6 +1213,21 @@ namespace ExceptionRewriter {
 			return handler;
 		}
 
+        private class EhRange {
+            public ExceptionHandler Handler;
+            public int TryStartIndex, TryEndIndex, HandlerStartIndex, HandlerEndIndex;
+            public int MinIndex, MaxIndex;
+        }
+
+        private EhRange FindRangeForOffset (List<EhRange> ranges, int offset) {
+            foreach (var range in ranges) {
+                if ((offset >= range.MinIndex) && (offset <= range.MaxIndex))
+                    return range;
+            }
+
+            return null;
+        }
+
 		private Dictionary<object, object> ExtractRangeToMethod<T, U> (
 			MethodDefinition sourceMethod, MethodDefinition targetMethod, 
 			ParameterDefinition fakeThis,
@@ -1222,7 +1237,7 @@ namespace ExceptionRewriter {
             RewriteContext context, 
             bool preserveControlFlow,
 			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
-            Func<Instruction, Instruction[]> filter = null
+            Func<Instruction, EhRange, Instruction[]> filter = null
 		)
 			where T : TypeReference
 			where U : TypeReference
@@ -1238,8 +1253,32 @@ namespace ExceptionRewriter {
 				variableMapping[loc] = newLoc;
 			}
 
-            var pairs = new Dictionary<Instruction, Instruction>();
+            var ranges = new List<EhRange> ();
+            foreach (var eh in sourceMethod.Body.ExceptionHandlers) {
+                if (eh.HandlerType == ExceptionHandlerType.Filter)
+                    continue;
 
+                var range = new EhRange {
+                    Handler = eh,
+                    TryStartIndex = insns.IndexOf(eh.TryStart),
+                    TryEndIndex = insns.IndexOf(eh.TryEnd),
+                    HandlerStartIndex = insns.IndexOf(eh.HandlerStart),
+                    HandlerEndIndex = insns.IndexOf(eh.HandlerEnd)
+                };
+
+                range.MinIndex = Math.Min(range.TryStartIndex, range.HandlerStartIndex);
+                range.MaxIndex = Math.Max(range.TryEndIndex, range.HandlerEndIndex);
+
+                // Skip any handlers that span or contain the region we're extracting
+                if (range.MinIndex <= firstIndex)
+                    continue;
+                if (range.MaxIndex >= lastIndex)
+                    continue;
+
+                ranges.Add(range);
+            }
+
+            var pairs = new Dictionary<Instruction, Instruction> ();
             var key = "extracted(" + targetMethod.DeclaringType?.Name + "." + targetMethod.Name + ") ";
 
             // Scan the range we're extracting and prepare to erase it after the clone
@@ -1247,31 +1286,21 @@ namespace ExceptionRewriter {
             for (int i = firstIndex; i <= lastIndex; i++) {
                 var oldInsn = insns[i];
                 
-                // FIXME: Currently any bare rethrow or throw we encounter is transformed into a ret, 
-                //  when what we actually want is to preserve it if it happens to be inside a catch
-                //  block contained within the current method.
-                // We need to identify whether this control flow is top-level or not so we can decide
-                //  whether to preserve it.
-                if (preserveControlFlow) {
-                    // Do not erase rethrows or leaves because they can turn the catch into an invalid one by unbalancing the stack
-                    if ((oldInsn.OpCode.Code == Code.Rethrow))
-                        continue;
-                    else if (((oldInsn.OpCode.Code == Code.Leave) || (oldInsn.OpCode.Code == Code.Leave_S)))
-                        continue;
-                }
-
                 // Do not erase existing placeholder nops
                 if ((oldInsn.OpCode.Code == Code.Nop) && (oldInsn.Operand != null))
                     continue;
                     // throw new Exception($"Extracting already-extracted instruction {oldInsn}");
-                
+
+                var isExceptionControlFlow = (oldInsn.OpCode.Code == Code.Rethrow) ||
+                    (oldInsn.OpCode.Code == Code.Leave) || (oldInsn.OpCode.Code == Code.Leave_S);
+               
                 var newInsn = Nop(key + oldInsn.ToString());
                 pairs.Add(oldInsn, newInsn);
             }
 
             CloneInstructions (
 				sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, 
-				targetInsns, 0, variableMapping, typeMapping, onFailedRemap, filter
+				targetInsns, 0, variableMapping, typeMapping, ranges, onFailedRemap, filter
 			);
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
@@ -1449,7 +1478,7 @@ namespace ExceptionRewriter {
             //  instructions from the method body.
             method.DebugInformation = null;
 
-            if (false && !method.FullName.Contains("NestedFiltersIn"))
+            if (!method.FullName.Contains("NestedFiltersIn"))
                 return;
 
             CleanMethodBody(method, null, false);
@@ -1611,6 +1640,7 @@ namespace ExceptionRewriter {
                         eh.HandlerType = ExceptionHandlerType.Catch;
                         eh.FilterStart = null;
                         eh.CatchType = method.Module.TypeSystem.Object;
+                        method.Body.ExceptionHandlers.Remove (eh);
                     }
                 }
             }
@@ -2156,8 +2186,9 @@ namespace ExceptionRewriter {
 			int targetIndex,
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
+            List<EhRange> ranges,
 			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
-            Func<Instruction, Instruction[]> filter = null
+            Func<Instruction, EhRange, Instruction[]> filter = null
 		)
 			where T : TypeReference
 			where U : TypeReference
@@ -2169,7 +2200,9 @@ namespace ExceptionRewriter {
 				var i = sourceMethod.Body.Instructions[n + sourceIndex];
 				var newInsn = CloneInstruction (i, fakeThis, sourceMethod, variableMapping, typeMapping);
                 if (filter != null) {
-                    var filtered = filter (newInsn);
+                    var range = FindRangeForOffset (ranges, n + sourceIndex);
+
+                    var filtered = filter (newInsn, range);
                     if (filtered != null) {
                         foreach (var filteredInsn in filtered)
                             target.Add (filteredInsn);
