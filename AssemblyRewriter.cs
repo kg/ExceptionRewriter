@@ -904,7 +904,7 @@ namespace ExceptionRewriter {
 			var handlerFirstIndex = insns.IndexOf (eh.HandlerStart);
 			var handlerLastIndex = insns.IndexOf (eh.HandlerEnd) - 1;
 
-            Console.WriteLine($"Extracting catch [{eh.HandlerStart}] - [{eh.HandlerEnd} - 1]");
+            Console.WriteLine($"Extracting catch [{eh.HandlerStart}] - [{insns[handlerLastIndex]}]");
 
 			// CHANGE #4: Adding method earlier
 			method.DeclaringType.Methods.Add (catchMethod);
@@ -1217,6 +1217,7 @@ namespace ExceptionRewriter {
             public ExceptionHandler Handler;
             public int TryStartIndex, TryEndIndex, HandlerStartIndex, HandlerEndIndex;
             public int MinIndex, MaxIndex;
+            public Instruction NewTryStart, NewTryEnd, NewHandlerStart, NewHandlerEnd;
         }
 
         private EhRange FindRangeForOffset (List<EhRange> ranges, int offset) {
@@ -1314,9 +1315,23 @@ namespace ExceptionRewriter {
                 insns[i] = newInsn;
             }
 
-            // FIXME: Copy over any try/catch blocks from the source range
-
             PatchMany(sourceMethod, context, pairs);
+
+            // Copy over any exception handlers that were contained by the source range, remapping
+            //  the start/end instructions of the handler and try blocks appropriately post-transform
+            foreach (var range in ranges) {
+                var newEh = new ExceptionHandler (range.Handler.HandlerType) {
+                    CatchType = range.Handler.CatchType,
+                    FilterStart = null,
+                    HandlerType = range.Handler.HandlerType,
+                    HandlerStart = range.NewHandlerStart,
+                    HandlerEnd = range.NewHandlerEnd,
+                    TryStart = range.NewTryStart,
+                    TryEnd = range.NewTryEnd
+                };
+
+                targetMethod.Body.ExceptionHandlers.Add(newEh);
+            }
 
             StripUnreferencedNops(targetMethod);
 
@@ -2197,20 +2212,26 @@ namespace ExceptionRewriter {
 				throw new ArgumentOutOfRangeException ("sourceIndex");
 
 			for (int n = 0; n < count; n++) {
-				var i = sourceMethod.Body.Instructions[n + sourceIndex];
-				var newInsn = CloneInstruction (i, fakeThis, sourceMethod, variableMapping, typeMapping);
+                var absoluteIndex = n + sourceIndex;
+				var insn = sourceMethod.Body.Instructions[absoluteIndex];
+				var newInsn = CloneInstruction (insn, fakeThis, sourceMethod, variableMapping, typeMapping);
+
                 if (filter != null) {
-                    var range = FindRangeForOffset (ranges, n + sourceIndex);
+                    var range = FindRangeForOffset (ranges, absoluteIndex);
 
                     var filtered = filter (newInsn, range);
                     if (filtered != null) {
                         foreach (var filteredInsn in filtered)
                             target.Add (filteredInsn);
+
+                        UpdateRangeReferences (ranges, absoluteIndex, filtered.First(), filtered.Last());
                     } else {
                         target.Add (newInsn);
+                        UpdateRangeReferences (ranges, absoluteIndex, newInsn, newInsn);
                     }
                 } else {
     				target.Add (newInsn);
+                    UpdateRangeReferences (ranges, absoluteIndex, newInsn, newInsn);
                 }
 			}
 
@@ -2234,5 +2255,21 @@ namespace ExceptionRewriter {
 				target[i] = newInsn;
 			}
 		}
-	}
+
+        private void UpdateRangeReference (ref Instruction target, int index, Instruction newInsn, int newIndex) {
+            if (index != newIndex)
+                return;
+
+            target = newInsn;
+        }
+
+        private void UpdateRangeReferences (List<EhRange> ranges, int absoluteIndex, Instruction firstNewInsn, Instruction lastNewInsn) {
+            foreach (var range in ranges) {
+                UpdateRangeReference(ref range.NewTryStart, range.TryStartIndex, firstNewInsn, absoluteIndex);
+                UpdateRangeReference(ref range.NewHandlerStart, range.HandlerStartIndex, firstNewInsn, absoluteIndex);
+                UpdateRangeReference(ref range.NewTryEnd, range.TryEndIndex, lastNewInsn, absoluteIndex);
+                UpdateRangeReference(ref range.NewHandlerEnd, range.HandlerEndIndex, lastNewInsn, absoluteIndex);
+            }
+        }
+    }
 }
