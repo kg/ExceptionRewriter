@@ -1256,9 +1256,6 @@ namespace ExceptionRewriter {
 
             var ranges = new List<EhRange> ();
             foreach (var eh in sourceMethod.Body.ExceptionHandlers) {
-                if (eh.HandlerType == ExceptionHandlerType.Filter)
-                    continue;
-
                 var range = new EhRange {
                     Handler = eh,
                     TryStartIndex = insns.IndexOf(eh.TryStart),
@@ -1320,6 +1317,12 @@ namespace ExceptionRewriter {
             // Copy over any exception handlers that were contained by the source range, remapping
             //  the start/end instructions of the handler and try blocks appropriately post-transform
             foreach (var range in ranges) {
+                if (
+                    (range.Handler.HandlerType != ExceptionHandlerType.Catch) &&
+                    (range.Handler.HandlerType != ExceptionHandlerType.Finally)
+                )
+                    continue;
+
                 var newEh = new ExceptionHandler (range.Handler.HandlerType) {
                     CatchType = range.Handler.CatchType,
                     FilterStart = null,
@@ -1331,6 +1334,11 @@ namespace ExceptionRewriter {
                 };
 
                 targetMethod.Body.ExceptionHandlers.Add(newEh);
+
+                // Since the handler was copied over, we want to remove it from the source, 
+                //  because replacing the source instruction range with nops has corrupted
+                //  any remaining catch or filter blocks
+                sourceMethod.Body.ExceptionHandlers.Remove(range.Handler);
             }
 
             StripUnreferencedNops(targetMethod);
@@ -1493,7 +1501,7 @@ namespace ExceptionRewriter {
             //  instructions from the method body.
             method.DebugInformation = null;
 
-            if (!method.FullName.Contains("NestedFiltersIn"))
+            if (!method.FullName.Contains("NestedFiltersIn") && !method.FullName.Contains("Lopsided"))
                 return;
 
             CleanMethodBody(method, null, false);
@@ -1525,19 +1533,7 @@ namespace ExceptionRewriter {
             insns.Insert (0, Nop ("header"));
             insns.Append (Nop ("footer"));
 
-            bool iterating = true;
-            int passNumber = 0;
-
             ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closure, excVar, insns);
-
-            /*
-            foreach (var group in groups) {
-                iterating = RewriteSingleFilter (method, efilt, fakeThis, closure, excVar, insns, group, pairs);
-                passNumber += 1;
-                if (!iterating)
-                    break;
-            }
-            */
 
             StripUnreferencedNops (method);
 
@@ -1649,15 +1645,8 @@ namespace ExceptionRewriter {
                 };
                 method.Body.ExceptionHandlers.Add (newEh);
                 
-                foreach (var eh in group) {
-                    // FIXME
-                    if (eh.HandlerType == ExceptionHandlerType.Filter) {
-                        eh.HandlerType = ExceptionHandlerType.Catch;
-                        eh.FilterStart = null;
-                        eh.CatchType = method.Module.TypeSystem.Object;
-                        method.Body.ExceptionHandlers.Remove (eh);
-                    }
-                }
+                foreach (var eh in group)
+                    method.Body.ExceptionHandlers.Remove(eh);
             }
         }
 
