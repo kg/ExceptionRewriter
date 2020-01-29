@@ -1609,8 +1609,11 @@ namespace ExceptionRewriter {
 
                     if (eh.FilterStart != null)
                         ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
+
+                    method.Body.ExceptionHandlers.Remove(eh);
                 }
 
+                var leaveTarget = Nop("Leave target");
                 var newHandler = new List<Instruction> ();
                 var newStart = Nop ("Constructed handler start");
                 var newEnd = Nop ("Constructed handler end");
@@ -1618,6 +1621,7 @@ namespace ExceptionRewriter {
                 newHandler.Add (newStart);
                 ConstructNewExceptionHandler (method, group, excGroup, newHandler);
                 newHandler.Add (newEnd);
+                // newHandler.Add (leaveTarget);
 
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
@@ -1635,9 +1639,6 @@ namespace ExceptionRewriter {
                     FilterStart = null
                 };
                 method.Body.ExceptionHandlers.Add (newEh);
-                
-                foreach (var eh in group)
-                    method.Body.ExceptionHandlers.Remove(eh);
             }
         }
 
@@ -1663,11 +1664,11 @@ namespace ExceptionRewriter {
             foreach (var h in excGroup.Handlers) {
                 if (h.FilterMethod != null) {
                     var callFilterInsn = Instruction.Create (OpCodes.Call, h.FilterMethod);
-                    newInstructions.Add (callFilterInsn);
+                    // newInstructions.Add (callFilterInsn);
                 }
 
                 var callCatchInsn = Instruction.Create (OpCodes.Call, h.Method);
-                newInstructions.Add (callCatchInsn);
+                // newInstructions.Add (callCatchInsn);
             }
         }
 
@@ -1954,6 +1955,8 @@ namespace ExceptionRewriter {
                 ? "Removed instruction"
                 : "Instruction";
 
+            return;
+
 			if (method.Body.Instructions.IndexOf (insn) < 0)
 				throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
 			else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
@@ -1965,7 +1968,7 @@ namespace ExceptionRewriter {
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
-            bool renumber = false;
+            bool renumber = true;
 
 			foreach (var i in insns) {
                 if (renumber || i.Offset == 0)
@@ -2012,6 +2015,11 @@ namespace ExceptionRewriter {
 
 				if (opInsn != null) {
                     CheckInRange(opInsn, method, oldMethod, removedInstructions);
+
+                    if ((i.OpCode.Code == Code.Leave) || (i.OpCode.Code == Code.Leave_S)) {
+                        if (i.Offset > opInsn.Offset)
+                            throw new Exception ($"Leave target {opInsn} precedes leave instruction");
+                    }
 				} else if (opArg != null) {
 					if ((opArg.Name == "__this") && method.HasThis) {
 						// HACK: method.Body.ThisParameter is unreliable for confusing reasons, and isn't
