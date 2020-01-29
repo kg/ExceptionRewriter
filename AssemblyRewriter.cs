@@ -266,7 +266,7 @@ namespace ExceptionRewriter {
 			for (int i = 0; i < body.Count; i++) {
                 var opInsn = body[i].Operand as Instruction;
                 if (opInsn != null && pairs.TryGetValue (opInsn, out replacement))
-                    body[i] = Instruction.Create (body[i].OpCode, replacement);
+                    body[i].Operand = replacement;
 			}
 
             foreach (var p in context.Pairs) {
@@ -1288,6 +1288,7 @@ namespace ExceptionRewriter {
                     (oldInsn.OpCode.Code == Code.Leave) || (oldInsn.OpCode.Code == Code.Leave_S);
                
                 var newInsn = Nop(key + oldInsn.ToString());
+                newInsn.Offset = oldInsn.Offset;
                 pairs.Add(oldInsn, newInsn);
             }
 
@@ -1522,8 +1523,10 @@ namespace ExceptionRewriter {
             CleanMethodBody(method, null, true);
 
             var insns = method.Body.Instructions;
+            /*
             insns.Insert (0, Nop ("header"));
             insns.Append (Nop ("footer"));
+            */
 
             ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closure, insns);
 
@@ -1956,8 +1959,6 @@ namespace ExceptionRewriter {
                 ? "Removed instruction"
                 : "Instruction";
 
-            return;
-
 			if (method.Body.Instructions.IndexOf (insn) < 0)
 				throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
 			else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
@@ -1969,7 +1970,7 @@ namespace ExceptionRewriter {
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
-            bool renumber = true;
+            bool renumber = false;
 
 			foreach (var i in insns) {
                 if (renumber || i.Offset == 0)
