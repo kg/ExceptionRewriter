@@ -1609,8 +1609,6 @@ namespace ExceptionRewriter {
 
                     if (eh.FilterStart != null)
                         ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
-
-                    method.Body.ExceptionHandlers.Remove(eh);
                 }
 
                 var leaveTarget = Nop("Leave target");
@@ -1639,6 +1637,9 @@ namespace ExceptionRewriter {
                     FilterStart = null
                 };
                 method.Body.ExceptionHandlers.Add (newEh);
+
+                foreach (var eh in group)
+                    method.Body.ExceptionHandlers.Remove(eh);
             }
         }
 
@@ -1974,6 +1975,7 @@ namespace ExceptionRewriter {
                 if (renumber || i.Offset == 0)
 				    i.Offset = insns.IndexOf (i);
             }
+
 
 			for (int idx = 0; idx < insns.Count; idx++) {
                 var i = insns[idx];
