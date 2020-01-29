@@ -1091,7 +1091,7 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private ExcBlock ExtractFilter (
+		private void ExtractFilter (
 			MethodDefinition method, ExceptionHandler eh, 
             VariableDefinition closure, ParameterDefinition fakeThis, 
             ExcGroup group, RewriteContext context,
@@ -1200,17 +1200,12 @@ namespace ExceptionRewriter {
 			    CleanMethodBody (filterMethod, method, true);
             }
 
-			var handler = new ExcBlock {
-				Handler = eh,
-				FilterMethod = filterMethod,
-                FilterType = filterTypeDefinition,
-                FilterVariable = new VariableDefinition (filterTypeDefinition),
-                FirstFilterInsn = eh.FilterStart,
-			};
+            catchBlock.FilterMethod = filterMethod;
+            catchBlock.FilterType = filterTypeDefinition;
+            catchBlock.FilterVariable = new VariableDefinition(filterTypeDefinition);
+            catchBlock.FirstFilterInsn = eh.FilterStart;
 
-            method.Body.Variables.Add (handler.FilterVariable);
-
-			return handler;
+            method.Body.Variables.Add (catchBlock.FilterVariable);
 		}
 
         private class EhRange {
@@ -1526,14 +1521,11 @@ namespace ExceptionRewriter {
 
             CleanMethodBody(method, null, true);
 
-            var excVar = new VariableDefinition(method.Module.TypeSystem.Object);
-            method.Body.Variables.Add(excVar);
-
             var insns = method.Body.Instructions;
             insns.Insert (0, Nop ("header"));
             insns.Append (Nop ("footer"));
 
-            ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closure, excVar, insns);
+            ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closure, insns);
 
             StripUnreferencedNops (method);
 
@@ -1594,7 +1586,7 @@ namespace ExceptionRewriter {
         private void ExtractFiltersAndCatchBlocks (
             MethodDefinition method, TypeReference efilt, 
             ParameterDefinition fakeThis, VariableDefinition closure, 
-            VariableDefinition excVar, Collection<Instruction> insns
+            Collection<Instruction> insns
         ) {
             var groups = GetOrderedFilters (method).ToList ();
             var pairs = (from k in groups select k.Key).ToList ();
@@ -1615,24 +1607,23 @@ namespace ExceptionRewriter {
                     var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
                     excGroup.Handlers.Add (catchBlock);
 
-                    if (eh.FilterStart != null) {
-                        var filterBlock = ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
-                        excGroup.Handlers.Add (filterBlock);
-                    }
+                    if (eh.FilterStart != null)
+                        ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
                 }
 
-                var newInstructions = new List<Instruction> ();
+                var newHandler = new List<Instruction> ();
                 var newStart = Nop ("Constructed handler start");
                 var newEnd = Nop ("Constructed handler end");
-                newInstructions.Add (newStart);
-                newInstructions.Add (Rethrow ("Constructed handler rethrow"));
-                newInstructions.Add (newEnd);
+
+                newHandler.Add (newStart);
+                ConstructNewExceptionHandler (method, group, excGroup, newHandler);
+                newHandler.Add (newEnd);
 
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
                     throw new Exception ("Failed to find TryEndPredecessor");
                 targetIndex += 1;
-                InsertOps (insns, targetIndex, newInstructions.ToArray());
+                InsertOps (insns, targetIndex, newHandler.ToArray());
 
                 var newEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
                     CatchType = method.Module.TypeSystem.Object,
@@ -1647,6 +1638,36 @@ namespace ExceptionRewriter {
                 
                 foreach (var eh in group)
                     method.Body.ExceptionHandlers.Remove(eh);
+            }
+        }
+
+        private void ConstructNewExceptionHandler (
+            MethodDefinition method, IGrouping<InstructionPair, ExceptionHandler> group, 
+            ExcGroup excGroup, List<Instruction> newInstructions
+        ) {
+            var excVar = new VariableDefinition (method.Module.TypeSystem.Object);
+            method.Body.Variables.Add(excVar);
+
+            newInstructions.Add (Instruction.Create (OpCodes.Stloc, excVar));
+
+            excGroup.Handlers.Sort(
+                (lhs, rhs) => {
+                    var l = (lhs.FilterMethod != null) ? 0 : 1;
+                    var r = (rhs.FilterMethod != null) ? 0 : 1;
+                    return l.CompareTo(r);
+                }
+            );
+
+            var hasFallthrough = excGroup.Handlers.Any(h => h.FilterMethod == null);
+
+            foreach (var h in excGroup.Handlers) {
+                if (h.FilterMethod != null) {
+                    var callFilterInsn = Instruction.Create (OpCodes.Call, h.FilterMethod);
+                    newInstructions.Add (callFilterInsn);
+                }
+
+                var callCatchInsn = Instruction.Create (OpCodes.Call, h.Method);
+                newInstructions.Add (callCatchInsn);
             }
         }
 
