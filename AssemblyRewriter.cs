@@ -624,7 +624,15 @@ namespace ExceptionRewriter {
 
 			var extractedVariables = variables.ToDictionary (
 				v => (object)v, 
-				v => new FieldDefinition ("local_" + method.Body.Variables.IndexOf((VariableDefinition)v), FieldAttributes.Public, FilterTypeReference (v.VariableType, functionGpMapping))
+				v => {
+                    var vd = v.Resolve();
+
+                    string variableName;
+                    if ((method.DebugInformation == null) || !method.DebugInformation.TryGetName(vd, out variableName))
+                        variableName = "__local_" + method.Body.Variables.IndexOf(vd);
+
+                    return new FieldDefinition (variableName, FieldAttributes.Public, FilterTypeReference (v.VariableType, functionGpMapping));
+                }
 			);
 
 			method.Body.Variables.Add (closureVar);
@@ -1513,11 +1521,6 @@ namespace ExceptionRewriter {
 		}
 
 		private void ExtractExceptionFilters (MethodDefinition method) {
-            // FIXME: Cecil currently throws inside the native PDB writer on methods we've modified
-            //  presumably because we need to manually update the debugging information after removing
-            //  instructions from the method body.
-            method.DebugInformation = null;
-
             if (!method.FullName.Contains("NestedFiltersIn") && !method.FullName.Contains("Lopsided"))
                 return;
 
@@ -1554,6 +1557,11 @@ namespace ExceptionRewriter {
             StripUnreferencedNops (method);
 
             CleanMethodBody (method, null, true);
+
+            // FIXME: Cecil currently throws inside the native PDB writer on methods we've modified
+            //  presumably because we need to manually update the debugging information after removing
+            //  instructions from the method body.
+            method.DebugInformation = null;
         }
 
         private void StripUnreferencedNops (MethodDefinition method) {
