@@ -1565,8 +1565,6 @@ namespace ExceptionRewriter {
         }
 
         private void StripUnreferencedNops (MethodDefinition method) {
-            return;
-
             var referenced = new HashSet<Instruction> ();
 
             foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1653,7 +1651,7 @@ namespace ExceptionRewriter {
                 var newEnd = Nop ("Constructed handler end");
 
                 newHandler.Add (newStart);
-                ConstructNewExceptionHandler (method, group, excGroup, newHandler);
+                ConstructNewExceptionHandler (method, group, excGroup, newHandler, closure);
                 newHandler.Add (newEnd);
                 // newHandler.Add (leaveTarget);
 
@@ -1684,7 +1682,7 @@ namespace ExceptionRewriter {
 
         private void ConstructNewExceptionHandler (
             MethodDefinition method, IGrouping<InstructionPair, ExceptionHandler> group, 
-            ExcGroup excGroup, List<Instruction> newInstructions
+            ExcGroup excGroup, List<Instruction> newInstructions, VariableDefinition closureVar
         ) {
             var excVar = new VariableDefinition (method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
@@ -1702,13 +1700,24 @@ namespace ExceptionRewriter {
             var hasFallthrough = excGroup.Handlers.Any(h => h.FilterMethod == null);
 
             foreach (var h in excGroup.Handlers) {
+                var callCatchPrologue = Nop ("Before call catch " + h.Method.Name);
+                var callCatchEpilogue = Nop ("After call catch " + h.Method.Name);
+
                 if (h.FilterMethod != null) {
                     var callFilterInsn = Instruction.Create (OpCodes.Call, h.FilterMethod);
                     // newInstructions.Add (callFilterInsn);
                 }
 
-                var callCatchInsn = Instruction.Create (OpCodes.Call, h.Method);
-                // newInstructions.Add (callCatchInsn);
+                newInstructions.Add (callCatchPrologue);
+                newInstructions.Add (Instruction.Create (OpCodes.Ldc_I4_0));
+                newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
+                if (!h.Method.IsStatic)
+                    newInstructions.Add (Instruction.Create (OpCodes.Ldarg_0));
+                newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
+                newInstructions.Add (Instruction.Create (OpCodes.Ldloc, closureVar));
+                newInstructions.Add (Instruction.Create (OpCodes.Call, h.Method));
+                newInstructions.Add (Instruction.Create (OpCodes.Pop));
+                newInstructions.Add (callCatchEpilogue);
             }
 
             newInstructions.Add (Instruction.Create (OpCodes.Rethrow));
