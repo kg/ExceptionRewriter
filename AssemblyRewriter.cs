@@ -873,9 +873,11 @@ namespace ExceptionRewriter {
 			var insns = method.Body.Instructions;
 			var closureType = closure.VariableType;
 
+            /*
 			var catchReferencedVariables = new HashSet<VariableReference> ();
 			var catchReferencedArguments = new HashSet<ParameterReference> ();
 			CollectReferencedLocals (method, fakeThis, eh.HandlerStart, eh.HandlerEnd, catchReferencedVariables, catchReferencedArguments);
+            */
 
 			var catchMethod = new MethodDefinition (
 				method.Name + "__catch" + (CatchCount++),
@@ -894,8 +896,12 @@ namespace ExceptionRewriter {
 			};
 			var closureVariable = new VariableDefinition (closureType);
 			var needsLdind = new HashSet<object> ();
+
+            /*
 			GenerateParameters (catchMethod, catchReferencedArguments, paramMapping, needsLdind);
 			GenerateParameters (catchMethod, catchReferencedVariables, paramMapping, needsLdind);
+            */
+
 			catchMethod.Parameters.Add (excParam);
 			catchMethod.Parameters.Add (closureParam);
 
@@ -925,7 +931,7 @@ namespace ExceptionRewriter {
 				typeMapping: gpMapping,
                 context: context,
                 // FIXME: Identify when we want to preserve control flow and when we don't
-                preserveControlFlow: true,
+                preserveControlFlow: false,
                 filter: (insn, range) => {
 					var operandTr = insn.Operand as TypeReference;
 					if (operandTr != null) {
@@ -978,6 +984,7 @@ namespace ExceptionRewriter {
 				    }
 			    );
 
+                /*
 			    FilterRange (catchMethod, 0, catchMethod.Body.Instructions.Count - 1, (i) => {
 				    if (needsLdind.Contains (i.Operand)) {
 					    if (IsStoreOperation (i.OpCode.Code)) {
@@ -1006,6 +1013,7 @@ namespace ExceptionRewriter {
 				    } else
 					    return null;
 			    });
+                */
 
 			    CleanMethodBody (catchMethod, method, true);
             }
@@ -1016,8 +1024,10 @@ namespace ExceptionRewriter {
 				Method = catchMethod,
 				IsCatchAll = isCatchAll,
 				Mapping = newMapping,
+                /*
 				CatchReferencedVariables = catchReferencedVariables,
 				CatchReferencedArguments = catchReferencedArguments
+                */
 			};
 			return handler;
 		}
@@ -1210,8 +1220,8 @@ namespace ExceptionRewriter {
 
         private class EhRange {
             public ExceptionHandler Handler;
-            public int TryStartIndex, TryEndIndex, HandlerStartIndex, HandlerEndIndex;
             public int MinIndex, MaxIndex;
+            public Instruction OldTryStart, OldTryEnd, OldHandlerStart, OldHandlerEnd;
             public Instruction NewTryStart, NewTryEnd, NewHandlerStart, NewHandlerEnd;
         }
 
@@ -1253,14 +1263,20 @@ namespace ExceptionRewriter {
             foreach (var eh in sourceMethod.Body.ExceptionHandlers) {
                 var range = new EhRange {
                     Handler = eh,
-                    TryStartIndex = insns.IndexOf(eh.TryStart),
-                    TryEndIndex = insns.IndexOf(eh.TryEnd),
-                    HandlerStartIndex = insns.IndexOf(eh.HandlerStart),
-                    HandlerEndIndex = insns.IndexOf(eh.HandlerEnd)
+                    OldTryStart = eh.TryStart,
+                    OldTryEnd = eh.TryEnd,
+                    OldHandlerStart = eh.HandlerStart,
+                    OldHandlerEnd = eh.HandlerEnd
                 };
 
-                range.MinIndex = Math.Min(range.TryStartIndex, range.HandlerStartIndex);
-                range.MaxIndex = Math.Max(range.TryEndIndex, range.HandlerEndIndex);
+                int
+                    tryStartIndex = insns.IndexOf(eh.TryStart),
+                    tryEndIndex = insns.IndexOf(eh.TryEnd),
+                    handlerStartIndex = insns.IndexOf(eh.HandlerStart),
+                    handlerEndIndex = insns.IndexOf(eh.HandlerEnd);
+
+                range.MinIndex = Math.Min(tryStartIndex, handlerStartIndex);
+                range.MaxIndex = Math.Max(tryEndIndex, handlerEndIndex);
 
                 // Skip any handlers that span or contain the region we're extracting
                 if (range.MinIndex <= firstIndex)
@@ -1286,6 +1302,9 @@ namespace ExceptionRewriter {
 
                 var isExceptionControlFlow = (oldInsn.OpCode.Code == Code.Rethrow) ||
                     (oldInsn.OpCode.Code == Code.Leave) || (oldInsn.OpCode.Code == Code.Leave_S);
+
+                if (preserveControlFlow && isExceptionControlFlow)
+                    continue;
                
                 var newInsn = Nop(key + oldInsn.ToString());
                 newInsn.Offset = oldInsn.Offset;
@@ -1309,6 +1328,8 @@ namespace ExceptionRewriter {
             }
 
             PatchMany(sourceMethod, context, pairs);
+
+			CleanMethodBody (targetMethod, sourceMethod, false);
 
             // Copy over any exception handlers that were contained by the source range, remapping
             //  the start/end instructions of the handler and try blocks appropriately post-transform
@@ -1536,6 +1557,8 @@ namespace ExceptionRewriter {
         }
 
         private void StripUnreferencedNops (MethodDefinition method) {
+            return;
+
             var referenced = new HashSet<Instruction> ();
 
             foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1595,6 +1618,8 @@ namespace ExceptionRewriter {
             var pairs = (from k in groups select k.Key).ToList ();
             var context = new RewriteContext { Pairs = pairs };
 
+            var deadHandlers = new List<ExceptionHandler>();
+
             foreach (var group in groups) {
                 var endIndex = insns.IndexOf(group.Key.B);
                 if (endIndex < 0)
@@ -1642,8 +1667,11 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Add (newEh);
 
                 foreach (var eh in group)
-                    method.Body.ExceptionHandlers.Remove(eh);
+                    deadHandlers.Add(eh);
             }
+
+            foreach (var eh in deadHandlers)
+                method.Body.ExceptionHandlers.Remove(eh);
         }
 
         private void ConstructNewExceptionHandler (
@@ -1674,6 +1702,8 @@ namespace ExceptionRewriter {
                 var callCatchInsn = Instruction.Create (OpCodes.Call, h.Method);
                 // newInstructions.Add (callCatchInsn);
             }
+
+            newInstructions.Add (Instruction.Create (OpCodes.Rethrow));
         }
 
         private bool RewriteSingleFilter (
@@ -1917,9 +1947,14 @@ namespace ExceptionRewriter {
 			MethodDefinition method, ParameterDefinition fakeThis, 
 			HashSet<VariableReference> referencedVariables, HashSet<ParameterReference> referencedArguments
 		) {
-			foreach (var eh in method.Body.ExceptionHandlers)
+			foreach (var eh in method.Body.ExceptionHandlers) {
 				if (eh.FilterStart != null)
 					CollectReferencedLocals (method, fakeThis, eh.FilterStart, eh.HandlerStart, referencedVariables, referencedArguments);
+
+                // Also collect anything referenced by handlers because they get hoisted out
+                // FIXME: Only do this to blocks that have a filter hanging off them
+                CollectReferencedLocals (method, fakeThis, eh.HandlerStart, eh.HandlerEnd, referencedVariables, referencedArguments);
+            }
 		}
 
 		private void CollectReferencedLocals (
@@ -2245,14 +2280,14 @@ namespace ExceptionRewriter {
                         foreach (var filteredInsn in filtered)
                             target.Add (filteredInsn);
 
-                        UpdateRangeReferences (ranges, absoluteIndex, filtered.First(), filtered.Last());
+                        UpdateRangeReferences (ranges, insn, filtered.First(), filtered.Last());
                     } else {
                         target.Add (newInsn);
-                        UpdateRangeReferences (ranges, absoluteIndex, newInsn, newInsn);
+                        UpdateRangeReferences (ranges, insn, newInsn, newInsn);
                     }
                 } else {
     				target.Add (newInsn);
-                    UpdateRangeReferences (ranges, absoluteIndex, newInsn, newInsn);
+                    UpdateRangeReferences (ranges, insn, newInsn, newInsn);
                 }
 			}
 
@@ -2277,19 +2312,19 @@ namespace ExceptionRewriter {
 			}
 		}
 
-        private void UpdateRangeReference (ref Instruction target, int index, Instruction newInsn, int newIndex) {
-            if (index != newIndex)
+        private void UpdateRangeReference (ref Instruction target, Instruction compareWith, Instruction oldInsn, Instruction newInsn) {
+            if (oldInsn != compareWith)
                 return;
 
             target = newInsn;
         }
 
-        private void UpdateRangeReferences (List<EhRange> ranges, int absoluteIndex, Instruction firstNewInsn, Instruction lastNewInsn) {
+        private void UpdateRangeReferences (List<EhRange> ranges, Instruction oldInsn, Instruction firstNewInsn, Instruction lastNewInsn) {
             foreach (var range in ranges) {
-                UpdateRangeReference(ref range.NewTryStart, range.TryStartIndex, firstNewInsn, absoluteIndex);
-                UpdateRangeReference(ref range.NewHandlerStart, range.HandlerStartIndex, firstNewInsn, absoluteIndex);
-                UpdateRangeReference(ref range.NewTryEnd, range.TryEndIndex, lastNewInsn, absoluteIndex);
-                UpdateRangeReference(ref range.NewHandlerEnd, range.HandlerEndIndex, lastNewInsn, absoluteIndex);
+                UpdateRangeReference(ref range.NewTryStart, range.OldTryStart, oldInsn, firstNewInsn);
+                UpdateRangeReference(ref range.NewHandlerStart, range.OldHandlerStart, oldInsn, firstNewInsn);
+                UpdateRangeReference(ref range.NewTryEnd, range.OldTryEnd, oldInsn, lastNewInsn);
+                UpdateRangeReference(ref range.NewHandlerEnd, range.OldHandlerEnd, oldInsn, lastNewInsn);
             }
         }
     }
