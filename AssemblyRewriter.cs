@@ -1482,7 +1482,7 @@ namespace ExceptionRewriter {
 				Console.WriteLine ($"Rewriting {method.FullName}");
 
 			try {
-				ExtractExceptionFilters (method);
+				ProcessMethodImpl (method);
 				return 0;
 			} catch (Exception exc) {
 				Console.Error.WriteLine ($"Error rewriting {method.FullName}:");
@@ -1495,9 +1495,11 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private void ExtractExceptionFilters (MethodDefinition method) {
+		private void ProcessMethodImpl (MethodDefinition method) {
+            /*
             if (!method.FullName.Contains("NestedFiltersIn") && !method.FullName.Contains("Lopsided"))
                 return;
+            */
 
             CleanMethodBody(method, null, false);
 
@@ -1612,11 +1614,21 @@ namespace ExceptionRewriter {
                     TryEnd = group.Key.B,
                 };
 
-                if ((excGroup.TryEndPredecessor.OpCode.Code != Code.Leave) &&
-                    (excGroup.TryEndPredecessor.OpCode.Code != Code.Leave_S))
-                    throw new Exception("Try block does not end with a leave instruction");
+                Instruction exitPoint;
 
-                var exitPoint = (Instruction)excGroup.TryEndPredecessor.Operand;
+                switch (excGroup.TryEndPredecessor.OpCode.Code) {
+                    case Code.Throw:
+                    case Code.Rethrow:
+                        exitPoint = null;
+                        break;
+                    case Code.Leave:
+                    case Code.Leave_S:
+                        exitPoint = (Instruction)excGroup.TryEndPredecessor.Operand;
+                        break;
+                    default:
+                        throw new Exception("Try block does not end with a leave or throw instruction");
+                        break;
+                }
 
                 foreach (var eh in group) {
                     var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
@@ -1652,10 +1664,16 @@ namespace ExceptionRewriter {
 
                     teardownInstructions.Add (teardownEpilogue);
 
-                    var exitOffset = insns.IndexOf (exitPoint);
-                    if (exitOffset < 0)
-                        throw new Exception ("Exit point not found");
-                    InsertOps (insns, exitOffset, teardownInstructions.ToArray());
+                    int insertOffset;
+                    if (exitPoint != null) {
+                        insertOffset = insns.IndexOf (exitPoint);
+                        if (insertOffset < 0)
+                            throw new Exception ("Exit point not found");
+                    } else {
+                        var nextInsn = (from eh in @group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First();
+                        insertOffset = insns.IndexOf (nextInsn);
+                    }
+                    InsertOps (insns, insertOffset, teardownInstructions.ToArray());
 
                     // exitPoint = teardownPrologue;
                 }
@@ -1812,8 +1830,14 @@ namespace ExceptionRewriter {
 
                 // If the catch selected to rethrow then rethrow, otherwise exit the catch block
                 var rethrow = Instruction.Create (OpCodes.Rethrow);
-                newInstructions.Add (Instruction.Create (OpCodes.Brtrue, rethrow));
-                newInstructions.Add (Instruction.Create (OpCodes.Leave, exitPoint));
+                if (exitPoint != null) {
+                    newInstructions.Add (Instruction.Create (OpCodes.Brtrue, rethrow));
+                    newInstructions.Add (Instruction.Create (OpCodes.Leave, exitPoint));
+                } else {
+                    // There's no exit point, which means the try block ended with a throw/rethrow instead of a leave
+                    newInstructions.Add (Instruction.Create (OpCodes.Pop));
+                }
+
                 newInstructions.Add (rethrow);
                 newInstructions.Add (callCatchEpilogue);
             }
