@@ -1680,6 +1680,34 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Remove(eh);
         }
 
+        private Instruction[] InitializeExceptionFilter (
+            MethodDefinition method, 
+            TypeDefinition filterType, 
+            VariableDefinition filterVariable,
+            VariableDefinition closureVariable
+        ) {
+            var efilt = GetExceptionFilter (method.Module);
+
+            var result = new Instruction[] {
+                Instruction.Create (OpCodes.Newobj, filterType.Methods.First (m => m.Name == ".ctor")),
+                Instruction.Create (OpCodes.Stloc, filterVariable),
+				// Store the closure into the filter instance so it can access locals
+				Instruction.Create (OpCodes.Ldloc, filterVariable),
+                Instruction.Create (OpCodes.Ldloc, closureVariable),
+                Instruction.Create (OpCodes.Stfld, filterType.Fields.First (m => m.Name == "closure")),
+				// Then call Push on the filter instance
+				Instruction.Create (OpCodes.Ldloc, filterVariable),
+                Instruction.Create (OpCodes.Castclass, efilt),
+                Instruction.Create (OpCodes.Call, new MethodReference (
+                        "Push", method.Module.TypeSystem.Void, efilt
+                ) { HasThis = false, Parameters = {
+                        new ParameterDefinition (efilt)
+                } })
+            };
+
+            return result;
+        }
+
         private void ConstructNewExceptionHandler (
             MethodDefinition method, IGrouping<InstructionPair, ExceptionHandler> group, 
             ExcGroup excGroup, List<Instruction> newInstructions, VariableDefinition closureVar
@@ -1698,18 +1726,35 @@ namespace ExceptionRewriter {
             );
 
             var hasFallthrough = excGroup.Handlers.Any(h => h.FilterMethod == null);
+            var efilt = GetExceptionFilter (method.Module);
 
             foreach (var h in excGroup.Handlers) {
                 var callCatchPrologue = Nop ("Before call catch " + h.Method.Name);
                 var callCatchEpilogue = Nop ("After call catch " + h.Method.Name);
 
+                newInstructions.Add (callCatchPrologue);
+
                 if (h.FilterMethod != null) {
                     var callFilterInsn = Instruction.Create (OpCodes.Call, h.FilterMethod);
-                    // newInstructions.Add (callFilterInsn);
+                    newInstructions.Add (Instruction.Create (OpCodes.Ldloc, h.FilterVariable));
+                    newInstructions.Add (Instruction.Create (OpCodes.Castclass, efilt));
+                    newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
+                    var mref = new MethodReference(
+                        "ShouldRunHandler", method.Module.TypeSystem.Boolean, efilt
+                    ) {
+                        HasThis = true,
+                        Parameters = {
+                            new ParameterDefinition (method.Module.TypeSystem.Object)
+                        }
+                    };
+                    newInstructions.Add (Instruction.Create (OpCodes.Call, method.Module.ImportReference(mref)));
+                } else if (!h.IsCatchAll) {
+                    newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
+                    newInstructions.Add (Instruction.Create (OpCodes.Isinst, h.Handler.CatchType));
+                } else {
+                    newInstructions.Add (Instruction.Create (OpCodes.Ldc_I4_1));
                 }
 
-                newInstructions.Add (callCatchPrologue);
-                newInstructions.Add (Instruction.Create (OpCodes.Ldc_I4_0));
                 newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 if (!h.Method.IsStatic)
                     newInstructions.Add (Instruction.Create (OpCodes.Ldarg_0));
