@@ -955,33 +955,39 @@ namespace ExceptionRewriter {
 							insn.Operand = newOperandMr;
 					}
 
-                    if (range == null)
-					    switch (insn.OpCode.Code) {
-						    case Code.Leave:
-						    case Code.Leave_S:
-							    return new[] {
-								    Instruction.Create (OpCodes.Ldc_I4_0),
-								    Instruction.Create (OpCodes.Ret)
-							    };
-						    case Code.Rethrow:
-							    return new[] {
-								    Instruction.Create (OpCodes.Ldc_I4_1),
-								    Instruction.Create (OpCodes.Ret)
-							    };
-					    }
+                    var operandInsn = insn.Operand as Instruction;
+
+					switch (insn.OpCode.Code) {
+						case Code.Leave:
+						case Code.Leave_S:
+                            if (
+                                (range == null) || 
+                                // If the leave target is outside of the range we're extracting then we need to 
+                                //  turn it into a return since it's not possible to jump to it
+                                // (operandInsn.Offset > range.MaxIndex)
+                                false
+                            )
+                                return new[] {
+                                    Instruction.Create (OpCodes.Ldc_I4_0),
+                                    Instruction.Create (OpCodes.Ret)
+                                };
+                            else
+                                break;
+						case Code.Rethrow:
+                            if (range == null)
+                                return new[] {
+                                    Instruction.Create (OpCodes.Ldc_I4_1),
+                                    Instruction.Create (OpCodes.Ret)
+                                };
+                            else
+                                break;
+					}
 
                     return null;
 				}
 			);
 
 			CleanMethodBody (catchMethod, method, false);
-            /*
-            if (endsWithRethrow) {
-                var oldInsn = insns[i2 - 1];
-                insns[i2 - 1] = Rethrow ("Preserved rethrow");
-                Patch (method, context, oldInsn, insns[i2 - 1]);
-            }
-            */
 
             if (catchInsns.Count > 0) {
 			    var first = catchInsns[0];
@@ -991,37 +997,6 @@ namespace ExceptionRewriter {
 					    Instruction.Create (OpCodes.Ldarg, excParam)
 				    }
 			    );
-
-                /*
-			    FilterRange (catchMethod, 0, catchMethod.Body.Instructions.Count - 1, (i) => {
-				    if (needsLdind.Contains (i.Operand)) {
-					    if (IsStoreOperation (i.OpCode.Code)) {
-						    var operandVariable = i.Operand as VariableReference;
-						    var operandParameter = i.Operand as ParameterReference;
-						    var operandType = operandVariable?.VariableType ?? operandParameter.ParameterType;
-						    var newOperandType = FilterTypeReference (operandType, gpMapping);
-						    var byRefNewOperand = newOperandType as ByReferenceType;
-						
-						    var newTempLocal = new VariableDefinition (byRefNewOperand?.ElementType ?? newOperandType);
-						    catchMethod.Body.Variables.Add (newTempLocal);
-
-						    return new[] {
-							    Instruction.Create (OpCodes.Stloc, newTempLocal),
-							    i.Operand is VariableReference
-								    ? Instruction.Create (OpCodes.Ldloc, (VariableDefinition)i.Operand)
-								    : Instruction.Create (OpCodes.Ldarg, (ParameterDefinition)i.Operand),
-							    Instruction.Create (OpCodes.Ldloc, newTempLocal),
-							    Instruction.Create (SelectStindForOperand (i.Operand))
-						    };
-					    } else
-						    return new[] {
-							    i,
-							    Instruction.Create (SelectLdindForOperand (i.Operand))
-						    };
-				    } else
-					    return null;
-			    });
-                */
 
 			    CleanMethodBody (catchMethod, method, true);
             }
@@ -1637,6 +1612,12 @@ namespace ExceptionRewriter {
                     TryEnd = group.Key.B,
                 };
 
+                if ((excGroup.TryEndPredecessor.OpCode.Code != Code.Leave) &&
+                    (excGroup.TryEndPredecessor.OpCode.Code != Code.Leave_S))
+                    throw new Exception("Try block does not end with a leave instruction");
+
+                var exitPoint = (Instruction)excGroup.TryEndPredecessor.Operand;
+
                 foreach (var eh in group) {
                     var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
                     excGroup.Handlers.Add (catchBlock);
@@ -1645,25 +1626,57 @@ namespace ExceptionRewriter {
                         ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
                 }
 
-                var leaveTarget = Nop("Leave target");
+                var teardownPrologue = Nop ("Beginning of teardown");
+                var teardownEpilogue = Nop ("End of teardown");
+
+                {
+                    // Upon block exit we need to deactivate all our filters. We create teardown code
+                    //  and inject it at the exit point for the try block to ensure we tear down before
+                    //  anything else happens.
+
+                    var teardownInstructions = new List<Instruction> { teardownPrologue };
+                    foreach (var eh in excGroup.Handlers.ToArray ().Reverse ()) {
+                        if (eh.FilterType == null)
+                            continue;
+
+                        teardownInstructions.Add (Instruction.Create (OpCodes.Ldloc, eh.FilterVariable));
+                        teardownInstructions.Add (Instruction.Create (OpCodes.Castclass, efilt));
+                        teardownInstructions.Add (Instruction.Create (OpCodes.Call, new MethodReference (
+                                "Pop", method.Module.TypeSystem.Void, efilt
+                        ) { HasThis = false, Parameters = {
+                                new ParameterDefinition (efilt)
+                        } }));
+                    }
+
+                    teardownInstructions.Add (Instruction.Create (OpCodes.Endfinally));
+
+                    teardownInstructions.Add (teardownEpilogue);
+
+                    var exitOffset = insns.IndexOf (exitPoint);
+                    if (exitOffset < 0)
+                        throw new Exception ("Exit point not found");
+                    InsertOps (insns, exitOffset, teardownInstructions.ToArray());
+
+                    // exitPoint = teardownPrologue;
+                }
+
                 var newHandler = new List<Instruction> ();
                 var newStart = Nop ("Constructed handler start");
                 var newEnd = Nop ("Constructed handler end");
 
                 newHandler.Add (newStart);
-                ConstructNewExceptionHandler (method, group, excGroup, newHandler, closure);
+                ConstructNewExceptionHandler (method, group, excGroup, newHandler, closure, exitPoint);
                 newHandler.Add (newEnd);
-                // newHandler.Add (leaveTarget);
 
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
                     throw new Exception ("Failed to find TryEndPredecessor");
                 targetIndex += 1;
+
                 InsertOps (insns, targetIndex, newHandler.ToArray());
 
                 var newEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
                     CatchType = method.Module.TypeSystem.Object,
-                    HandlerType = ExceptionHandlerType.Catch,
                     HandlerStart = newStart,
                     HandlerEnd = newEnd,
                     TryStart = excGroup.TryStart,
@@ -1671,6 +1684,27 @@ namespace ExceptionRewriter {
                     FilterStart = null
                 };
                 method.Body.ExceptionHandlers.Add (newEh);
+
+                // Ensure we initialize and activate all exception filters for the try block before entering it
+                foreach (var eh in excGroup.Handlers) {
+                    if (eh.FilterType == null)
+                        continue;
+
+                    var filterInitInstructions = InitializeExceptionFilter(method, eh.FilterType, eh.FilterVariable, closure);
+                    var insertOffset = insns.IndexOf(excGroup.TryStart);
+                    InsertOps(insns, insertOffset, filterInitInstructions);
+                }
+
+                // Wrap everything in a try/finally to ensure that the exception filters are deactivated even if
+                //  we throw or return
+                var teardownEh = new ExceptionHandler(ExceptionHandlerType.Finally) {
+                    TryStart = excGroup.TryStart,
+                    TryEnd = teardownPrologue,
+                    HandlerStart = teardownPrologue,
+                    HandlerEnd = teardownEpilogue
+                };
+
+                method.Body.ExceptionHandlers.Add (teardownEh);
 
                 foreach (var eh in group)
                     deadHandlers.Add(eh);
@@ -1687,22 +1721,31 @@ namespace ExceptionRewriter {
             VariableDefinition closureVariable
         ) {
             var efilt = GetExceptionFilter (method.Module);
+            var skipInit = Nop ("Skip initializing filter " + filterType.Name);
 
             var result = new Instruction[] {
+                // If the filter is already initialized (we're running in a loop, etc) don't create a new instance
+                Nop ("Initializing filter " + filterType.Name),
+				Instruction.Create (OpCodes.Ldloc, filterVariable),
+                Instruction.Create (OpCodes.Brtrue, skipInit),
+
+                // Create a new instance of the filter
                 Instruction.Create (OpCodes.Newobj, filterType.Methods.First (m => m.Name == ".ctor")),
                 Instruction.Create (OpCodes.Stloc, filterVariable),
 				// Store the closure into the filter instance so it can access locals
 				Instruction.Create (OpCodes.Ldloc, filterVariable),
                 Instruction.Create (OpCodes.Ldloc, closureVariable),
                 Instruction.Create (OpCodes.Stfld, filterType.Fields.First (m => m.Name == "closure")),
-				// Then call Push on the filter instance
+                skipInit,
+
+				// Then call Push on the filter instance to activate it
 				Instruction.Create (OpCodes.Ldloc, filterVariable),
                 Instruction.Create (OpCodes.Castclass, efilt),
                 Instruction.Create (OpCodes.Call, new MethodReference (
                         "Push", method.Module.TypeSystem.Void, efilt
                 ) { HasThis = false, Parameters = {
                         new ParameterDefinition (efilt)
-                } })
+                } }),
             };
 
             return result;
@@ -1710,7 +1753,8 @@ namespace ExceptionRewriter {
 
         private void ConstructNewExceptionHandler (
             MethodDefinition method, IGrouping<InstructionPair, ExceptionHandler> group, 
-            ExcGroup excGroup, List<Instruction> newInstructions, VariableDefinition closureVar
+            ExcGroup excGroup, List<Instruction> newInstructions, VariableDefinition closureVar,
+            Instruction exitPoint
         ) {
             var excVar = new VariableDefinition (method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
@@ -1735,6 +1779,7 @@ namespace ExceptionRewriter {
                 newInstructions.Add (callCatchPrologue);
 
                 if (h.FilterMethod != null) {
+                    // Invoke the filter method and skip past the catch if it rejected the exception
                     var callFilterInsn = Instruction.Create (OpCodes.Call, h.FilterMethod);
                     newInstructions.Add (Instruction.Create (OpCodes.Ldloc, h.FilterVariable));
                     newInstructions.Add (Instruction.Create (OpCodes.Castclass, efilt));
@@ -1749,9 +1794,11 @@ namespace ExceptionRewriter {
                     };
                     newInstructions.Add (Instruction.Create (OpCodes.Call, method.Module.ImportReference(mref)));
                 } else if (!h.IsCatchAll) {
+                    // Skip past the catch if the exception is not an instance of the catch type
                     newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
                     newInstructions.Add (Instruction.Create (OpCodes.Isinst, h.Handler.CatchType));
                 } else {
+                    // Never skip the catch, it's a catch-all block.
                     newInstructions.Add (Instruction.Create (OpCodes.Ldc_I4_1));
                 }
 
@@ -1761,11 +1808,23 @@ namespace ExceptionRewriter {
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, closureVar));
                 newInstructions.Add (Instruction.Create (OpCodes.Call, h.Method));
-                newInstructions.Add (Instruction.Create (OpCodes.Pop));
+                // newInstructions.Add (Instruction.Create (OpCodes.Pop));
+
+                // If the catch selected to rethrow then rethrow, otherwise exit the catch block
+                var rethrow = Instruction.Create (OpCodes.Rethrow);
+                newInstructions.Add (Instruction.Create (OpCodes.Brtrue, rethrow));
+                newInstructions.Add (Instruction.Create (OpCodes.Leave, exitPoint));
+                newInstructions.Add (rethrow);
                 newInstructions.Add (callCatchEpilogue);
             }
 
+            // If none of our handlers matched, rethrow the exception as a fallback
             newInstructions.Add (Instruction.Create (OpCodes.Rethrow));
+
+            /*
+            // After the default rethrow, create a jump target to jump past it
+            newInstructions.Add (blockEpilogue);
+            */
         }
 
         private bool RewriteSingleFilter (
@@ -2056,12 +2115,12 @@ namespace ExceptionRewriter {
                 ? "Removed instruction"
                 : "Instruction";
 
+            return;
+
 			if (method.Body.Instructions.IndexOf (insn) < 0)
 				throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
 			else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
 				throw new Exception ($"{s} {insn} is present in old method for method {method.FullName}");
-
-            return;
         }
 
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
