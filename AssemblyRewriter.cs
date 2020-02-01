@@ -1845,11 +1845,7 @@ namespace ExceptionRewriter {
 
             foreach (var h in excGroup.Blocks) {
                 var callCatchPrologue = Nop ("Before call catch " + h.CatchMethod.Name);
-                var callCatchEpilogue = 
-                    exitPoint != null
-                        ? Instruction.Create (OpCodes.Leave, exitPoint)
-                        : Instruction.Create (OpCodes.Rethrow);
-                    //Nop ("After call catch " + h.CatchMethod.Name);
+                var callCatchEpilogue = Nop ("After call catch " + h.CatchMethod.Name);
 
                 newInstructions.Add (callCatchPrologue);
 
@@ -1913,6 +1909,12 @@ namespace ExceptionRewriter {
 
                 newInstructions.Add (callCatchEpilogue);
             }
+
+            newInstructions.Add(
+                exitPoint != null
+                    ? Instruction.Create(OpCodes.Leave, exitPoint)
+                    : Instruction.Create(OpCodes.Rethrow)
+            );
         }
 
         private bool RewriteSingleFilter (
