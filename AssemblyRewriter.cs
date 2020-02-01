@@ -1180,10 +1180,6 @@ namespace ExceptionRewriter {
 				    variableMapping: variableMapping, typeMapping: gpMapping, 
                     context: context,
                     preserveControlFlow: false
-                    /*,
-                    newFirstInstruction: Instruction.Create(OpCodes.Pop),
-                    newLastInstruction: Instruction.Create(OpCodes.Endfilter)
-                    */
 			    );
 			    var newClosureLocal = (VariableDefinition)newVariables[closure];
 
@@ -1261,7 +1257,6 @@ namespace ExceptionRewriter {
 			Dictionary<T, U> typeMapping,
             RewriteContext context, 
             bool preserveControlFlow,
-			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
             Func<Instruction, EhRange, Instruction[]> filter = null
 		)
 			where T : TypeReference
@@ -1332,7 +1327,7 @@ namespace ExceptionRewriter {
 
             CloneInstructions (
 				sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, 
-				targetInsns, variableMapping, typeMapping, ranges, onFailedRemap, filter
+				targetInsns, variableMapping, typeMapping, ranges, filter
 			);
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
@@ -2468,8 +2463,7 @@ namespace ExceptionRewriter {
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
             List<EhRange> ranges,
-			Func<Instruction, Instruction, Instruction> onFailedRemap = null,
-            Func<Instruction, EhRange, Instruction[]> filter = null
+            Func<Instruction, EhRange, Instruction[]> filter
 		)
 			where T : TypeReference
 			where U : TypeReference
@@ -2529,10 +2523,7 @@ namespace ExceptionRewriter {
                 if (operand != null) {
                     Instruction newOperand, newInsn;
 				    if (!mapping.TryGetValue(operand, out newOperand)) {
-					    if (onFailedRemap != null)
-						    newInsn = onFailedRemap (insn, operand);
-					    else
-						    throw new Exception ("Could not remap instruction operand for " + insn);
+						throw new Exception ("Could not remap instruction operand for " + insn);
 				    } else {
 					    newInsn = Instruction.Create (insn.OpCode, newOperand);
 				    }
