@@ -1868,11 +1868,13 @@ namespace ExceptionRewriter {
                         }
                     };
                     newInstructions.Add (Instruction.Create (OpCodes.Call, method.Module.ImportReference(mref)));
+                    // FIXME: Sometimes this jump target disappears?
                     newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 } else if (!h.IsCatchAll) {
                     // Skip past the catch if the exception is not an instance of the catch type
                     newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
                     newInstructions.Add (Instruction.Create (OpCodes.Isinst, h.Handler.CatchType));
+                    // FIXME: Sometimes this jump target disappears?
                     newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 } else {
                     // Never skip the catch, it's a catch-all block.
@@ -2214,17 +2216,6 @@ namespace ExceptionRewriter {
 		{
 			var insns = method.Body.Instructions;
 
-            // NOTE: Disabling this will break the leave target ordering check
-            // FIXME: Turning this on breaks everything? Why is this possible?
-            bool renumber = false;
-
-            int offset = 0;
-			foreach (var i in insns) {
-                if (renumber)
-				    i.Offset = offset;
-                offset += i.GetSize();
-            }
-
 			for (int idx = 0; idx < insns.Count; idx++) {
                 var i = insns[idx];
 
@@ -2267,10 +2258,12 @@ namespace ExceptionRewriter {
 				if (opInsn != null) {
                     CheckInRange(opInsn, method, oldMethod, removedInstructions);
 
+                    /*
                     if ((i.OpCode.Code == Code.Leave) || (i.OpCode.Code == Code.Leave_S)) {
                         if (renumber && (i.Offset > opInsn.Offset))
                             throw new Exception ($"Leave target {opInsn} precedes leave instruction");
                     }
+                    */
 				} else if (opArg != null) {
 					if ((opArg.Name == "__this") && method.HasThis) {
 						// HACK: method.Body.ThisParameter is unreliable for confusing reasons, and isn't
@@ -2289,13 +2282,6 @@ namespace ExceptionRewriter {
                         CheckInRange(target, method, oldMethod, removedInstructions);
                 }
 			}
-
-            offset = 0;
-			foreach (var i in insns) {
-                if (renumber)
-				    i.Offset = offset;
-                offset += i.GetSize();
-            }
 
 			if (verify)
 			foreach (var p in method.Parameters)
@@ -2471,7 +2457,6 @@ namespace ExceptionRewriter {
 
             var mapping = new Dictionary<Instruction, Instruction> ();
 
-            int newOffset = 0;
 			for (int n = 0; n < count; n++) {
                 var absoluteIndex = n + sourceIndex;
 				var insn = sourceInsns[absoluteIndex];
@@ -2484,27 +2469,20 @@ namespace ExceptionRewriter {
                     if (filtered != null) {
                         mapping[insn] = filtered.First();
 
-                        foreach (var filteredInsn in filtered) {
-                            filteredInsn.Offset = newOffset;
+                        foreach (var filteredInsn in filtered)
     				        target.Add (filteredInsn);
-                            newOffset += filteredInsn.GetSize();
-                        }
 
                         UpdateRangeReferences (ranges, insn, filtered.First(), filtered.Last());
                     } else {
                         mapping[insn] = newInsn;
 
-                        newInsn.Offset = newOffset;
     				    target.Add (newInsn);
-                        newOffset += newInsn.GetSize();
 
                         UpdateRangeReferences (ranges, insn, newInsn, newInsn);
                     }
                 } else {
                     mapping[insn] = newInsn;
-                    newInsn.Offset = newOffset;
     				target.Add (newInsn);
-                    newOffset += newInsn.GetSize();
 
                     UpdateRangeReferences (ranges, insn, newInsn, newInsn);
                 }
