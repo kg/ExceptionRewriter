@@ -1682,6 +1682,8 @@ namespace ExceptionRewriter {
                         ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
                 }
 
+                var teardownEnclosureLeaveTarget = Nop ("Leave target outside of teardown");
+                var teardownEnclosureLeave = Instruction.Create (OpCodes.Leave, teardownEnclosureLeaveTarget);
                 var teardownPrologue = Nop ("Beginning of teardown");
                 var teardownEpilogue = Nop ("End of teardown");
 
@@ -1690,7 +1692,7 @@ namespace ExceptionRewriter {
                     //  and inject it at the exit point for the try block to ensure we tear down before
                     //  anything else happens.
 
-                    var teardownInstructions = new List<Instruction> { teardownPrologue };
+                    var teardownInstructions = new List<Instruction> { teardownEnclosureLeave, teardownPrologue };
                     foreach (var eh in excGroup.Blocks.ToArray ().Reverse ()) {
                         if (eh.FilterType == null)
                             continue;
@@ -1705,8 +1707,8 @@ namespace ExceptionRewriter {
                     }
 
                     teardownInstructions.Add (Instruction.Create (OpCodes.Endfinally));
-
                     teardownInstructions.Add (teardownEpilogue);
+                    teardownInstructions.Add (teardownEnclosureLeaveTarget);
 
                     int insertOffset;
                     if (exitPoint != null) {
@@ -1724,11 +1726,12 @@ namespace ExceptionRewriter {
 
                 var newHandler = new List<Instruction> ();
                 var newStart = Nop ("Constructed handler start");
-                var newEnd = Nop ("Constructed handler end");
 
                 newHandler.Add (newStart);
                 ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, exitPoint);
-                newHandler.Add (newEnd);
+
+                // We'd put a helpful nop here but peverify gets angry
+                var newEnd = newHandler[newHandler.Count - 1];
 
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
@@ -1861,19 +1864,23 @@ namespace ExceptionRewriter {
                         }
                     };
                     newInstructions.Add (Instruction.Create (OpCodes.Call, method.Module.ImportReference(mref)));
+                    newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 } else if (!h.IsCatchAll) {
                     // Skip past the catch if the exception is not an instance of the catch type
                     newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
                     newInstructions.Add (Instruction.Create (OpCodes.Isinst, h.Handler.CatchType));
+                    newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 } else {
                     // Never skip the catch, it's a catch-all block.
-                    newInstructions.Add (Instruction.Create (OpCodes.Ldc_I4_1));
                 }
 
-                newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 if (!h.CatchMethod.IsStatic)
                     newInstructions.Add (Instruction.Create (OpCodes.Ldarg_0));
+
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
+                if (h.Handler.CatchType != null)
+                    newInstructions.Add (Instruction.Create (OpCodes.Castclass, h.Handler.CatchType));
+
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, closureVar));
                 newInstructions.Add (Instruction.Create (OpCodes.Call, h.CatchMethod));
 
@@ -1899,6 +1906,9 @@ namespace ExceptionRewriter {
                     newInstructions.Add (switchTargets[l]);
 
                 newInstructions.Add (callCatchEpilogue);
+
+                // FIXME: Insert an extra padding rethrow after the epilogue because jumps will target it sometimes :/
+                newInstructions.Add (Nop("Padding after epilogue"));
             }
         }
 
