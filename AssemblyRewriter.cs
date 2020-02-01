@@ -2210,12 +2210,13 @@ namespace ExceptionRewriter {
                 ? "Removed instruction"
                 : "Instruction";
 
-            return;
-
-			if (method.Body.Instructions.IndexOf (insn) < 0)
-				throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
-			else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
-				throw new Exception ($"{s} {insn} is present in old method for method {method.FullName}");
+            // FIXME
+            if (false) {
+			    if (method.Body.Instructions.IndexOf (insn) < 0)
+				    throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
+			    else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
+				    throw new Exception ($"{s} {insn} is present in old method for method {method.FullName}");
+            }
         }
 
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
@@ -2268,6 +2269,7 @@ namespace ExceptionRewriter {
 					continue;
 
 				var opInsn = i.Operand as Instruction;
+                var opInsns = i.Operand as Instruction[];
 				var opArg = i.Operand as ParameterDefinition;
 				var opVar = i.Operand as VariableDefinition;
 
@@ -2291,7 +2293,10 @@ namespace ExceptionRewriter {
 						throw new Exception ($"Local {opVar} for opcode {i} is missing for method {method.FullName}");
 					else if (oldMethod != null && oldMethod.Body.Variables.IndexOf (opVar) >= 0)
 						throw new Exception ($"Local {opVar} for opcode {i} is present in old method for method {method.FullName}");
-				}
+				} else if (opInsns != null) {
+                    foreach (var target in opInsns)
+                        CheckInRange(target, method, oldMethod, removedInstructions);
+                }
 			}
 
             offset = 0;
@@ -2327,40 +2332,7 @@ namespace ExceptionRewriter {
                 }
             }
 		}
-
-		private bool TryRemapInstruction (
-			Instruction old,
-			Collection<Instruction> oldBody, 
-			Collection<Instruction> newBody,
-			int offset,
-			out Instruction result
-		) {
-			result = null;
-			if (old == null)
-				return false;
-
-			int idx = oldBody.IndexOf (old);
-			var newIdx = idx + offset;
-			if ((newIdx < 0) || (newIdx >= newBody.Count))
-				return false;
-
-			result = newBody[newIdx];
-			return true;
-		}
-
-		private Instruction RemapInstruction (
-			Instruction old,
-			Collection<Instruction> oldBody, 
-			Collection<Instruction> newBody,
-			int offset = 0
-		) {
-			Instruction result;
-			if (!TryRemapInstruction (old, oldBody, newBody, offset, out result))
-				return null;
-
-			return result;
-		}
-
+        
 		private Instruction CreateRemappedInstruction (
 			object oldOperand, OpCode oldCode, object operand
 		) {
@@ -2507,6 +2479,8 @@ namespace ExceptionRewriter {
 			if (sourceIndex < 0)
 				throw new ArgumentOutOfRangeException ("sourceIndex");
 
+            var mapping = new Dictionary<Instruction, Instruction> ();
+
             int newOffset = 0;
 			for (int n = 0; n < count; n++) {
                 var absoluteIndex = n + sourceIndex;
@@ -2518,6 +2492,8 @@ namespace ExceptionRewriter {
 
                     var filtered = filter (newInsn, range);
                     if (filtered != null) {
+                        mapping[insn] = filtered.First();
+
                         foreach (var filteredInsn in filtered) {
                             filteredInsn.Offset = newOffset;
     				        target.Add (filteredInsn);
@@ -2526,6 +2502,8 @@ namespace ExceptionRewriter {
 
                         UpdateRangeReferences (ranges, insn, filtered.First(), filtered.Last());
                     } else {
+                        mapping[insn] = newInsn;
+
                         newInsn.Offset = newOffset;
     				    target.Add (newInsn);
                         newOffset += newInsn.GetSize();
@@ -2533,6 +2511,7 @@ namespace ExceptionRewriter {
                         UpdateRangeReferences (ranges, insn, newInsn, newInsn);
                     }
                 } else {
+                    mapping[insn] = newInsn;
                     newInsn.Offset = newOffset;
     				target.Add (newInsn);
                     newOffset += newInsn.GetSize();
@@ -2549,7 +2528,7 @@ namespace ExceptionRewriter {
 
                 if (operand != null) {
                     Instruction newOperand, newInsn;
-				    if (!TryRemapInstruction (operand, sourceInsns, target, 0 - sourceIndex, out newOperand)) {
+				    if (!mapping.TryGetValue(operand, out newOperand)) {
 					    if (onFailedRemap != null)
 						    newInsn = onFailedRemap (insn, operand);
 					    else
@@ -2560,20 +2539,10 @@ namespace ExceptionRewriter {
     				target[i] = newInsn;
                 } else if (operands != null) {
                     for (int j = 0; j < operands.Length; j++) {
-                        var elt = operands[j];
+                        Instruction newElt, elt = operands[j];
+                        if (!mapping.TryGetValue(elt, out newElt))
+                            throw new Exception ($"Switch target {elt} not found in table of cloned instructions");
 
-                        // FIXME
-                        var eltIndex = sourceInsns.IndexOf(elt);
-                        if (eltIndex < 0)
-                            continue;
-                            // throw new Exception ($"Switch target {elt} not found in source method");
-
-                        eltIndex -= sourceIndex;
-                        if (eltIndex < 0)
-                            continue;
-                            // throw new Exception ($"Switch target {elt} outside of clone range");
-
-                        var newElt = target[eltIndex];
                         operands[j] = newElt;
                     }
                 } else
