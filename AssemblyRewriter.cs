@@ -1590,6 +1590,11 @@ namespace ExceptionRewriter {
                 var operand = insn.Operand as Instruction;
                 if (operand != null)
                     referenced.Add (operand);
+
+                var operands = insn.Operand as Instruction[];
+                if (operands != null)
+                    foreach (var i in operands)
+                        referenced.Add(i);
             }
 
             var old = insns.ToArray ();
@@ -1864,13 +1869,11 @@ namespace ExceptionRewriter {
                         }
                     };
                     newInstructions.Add (Instruction.Create (OpCodes.Call, method.Module.ImportReference(mref)));
-                    // FIXME: Sometimes this jump target disappears?
                     newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 } else if (!h.IsCatchAll) {
                     // Skip past the catch if the exception is not an instance of the catch type
                     newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
                     newInstructions.Add (Instruction.Create (OpCodes.Isinst, h.Handler.CatchType));
-                    // FIXME: Sometimes this jump target disappears?
                     newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
                 } else {
                     // Never skip the catch, it's a catch-all block.
@@ -1889,23 +1892,22 @@ namespace ExceptionRewriter {
                 // Either rethrow or leave depending on the value returned by the handler
                 var rethrow = Instruction.Create (OpCodes.Rethrow);
                 // Create instructions for handling each possible leave target (in addition to 0 which is rethrow)
-                var switchTargets = new Instruction[h.LeaveTargets.Count + 1];
+                var switchTargets = new Instruction[h.LeaveTargets.Count + 2];
                 switchTargets[0] = rethrow;
 
                 for (int l = 0; l < h.LeaveTargets.Count; l++)
                     switchTargets[l + 1] = Instruction.Create (OpCodes.Leave, h.LeaveTargets[l]);
 
+                switchTargets[switchTargets.Length - 1] = Instruction.Create (OpCodes.Ldstr, "what");
+
                 // Use the return value from the handler to select one of the targets we just created
                 newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
-
-                // After the switch we fall-through to the rethrow, but this shouldn't ever happen
-                newInstructions.Add (rethrow);
 
                 // After the fallback, add each of our leave targets.
                 // These need to be after the fallthrough so they aren't hit unless targeted by the switch
                 // It's okay to add them by themselves since they're all either rethrow or leave opcodes.
-                for (int l = 1; l < switchTargets.Length; l++)
-                    newInstructions.Add (switchTargets[l]);
+                foreach (var st in switchTargets)
+                    newInstructions.Add (st);
 
                 newInstructions.Add (callCatchEpilogue);
             }
