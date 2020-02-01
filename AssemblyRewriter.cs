@@ -1902,19 +1902,11 @@ namespace ExceptionRewriter {
                 } else {
                     // There's no exit point, which means the try block ended with a throw/rethrow instead of a leave
                     newInstructions.Add (Instruction.Create (OpCodes.Pop));
+                    newInstructions.Add (rethrow);
                 }
 
-                newInstructions.Add (rethrow);
                 newInstructions.Add (callCatchEpilogue);
             }
-
-            // If none of our handlers matched, rethrow the exception as a fallback
-            newInstructions.Add (Instruction.Create (OpCodes.Rethrow));
-
-            /*
-            // After the default rethrow, create a jump target to jump past it
-            newInstructions.Add (blockEpilogue);
-            */
         }
 
         private bool RewriteSingleFilter (
@@ -2447,7 +2439,7 @@ namespace ExceptionRewriter {
                 var insns = (Instruction[])newOperand;
                 var newInsns = new Instruction[insns.Length];
                 insns.CopyTo (newInsns, 0);
-                return Instruction.Create (OpCodes.Switch, newInsns);
+                return Instruction.Create (i.OpCode, newInsns);
 			} else if (newOperand != null) {
 				throw new NotImplementedException (i.OpCode.ToString () + " " + newOperand.GetType().FullName);
 			} else {
