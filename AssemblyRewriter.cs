@@ -221,6 +221,8 @@ namespace ExceptionRewriter {
                 g.TryEndPredecessor = Patch (g.TryEndPredecessor, old, replacement);
 
                 foreach (var h in g.Blocks) {
+                    for (int l = 0; l < h.LeaveTargets.Count; l++)
+                        h.LeaveTargets[l] = Patch (h.LeaveTargets[l], old, replacement);
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, old, replacement);
                     Patch (h.Handler, old, replacement);
                 }
@@ -281,6 +283,8 @@ namespace ExceptionRewriter {
                 g.TryEndPredecessor = Patch (g.TryEndPredecessor, pairs);
 
                 foreach (var h in g.Blocks) {
+                    for (int l = 0; l < h.LeaveTargets.Count; l++)
+                        h.LeaveTargets[l] = Patch (h.LeaveTargets[l], pairs);
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, pairs);
                     Patch (h.Handler, pairs);
                 }
@@ -882,17 +886,18 @@ namespace ExceptionRewriter {
 			}
 		}
 
+        /// <summary>
+        /// Extract a catch block into an independent method that accepts an exception parameter and a closure
+        /// The catch method returns 0 to indicate that the exception should be rethrown or [1-n] to indicate a target within the
+        ///  parent function that should be leave'd to
+        /// </summary>
 		private ExcBlock ExtractCatch (
-			MethodDefinition method, ExceptionHandler eh, VariableDefinition closure, ParameterDefinition fakeThis, ExcGroup group, RewriteContext context
+			MethodDefinition method, ExceptionHandler eh, 
+            VariableDefinition closure, ParameterDefinition fakeThis, 
+            ExcGroup group, RewriteContext context
 		) {
 			var insns = method.Body.Instructions;
 			var closureType = closure.VariableType;
-
-            /*
-			var catchReferencedVariables = new HashSet<VariableReference> ();
-			var catchReferencedArguments = new HashSet<ParameterReference> ();
-			CollectReferencedLocals (method, fakeThis, eh.HandlerStart, eh.HandlerEnd, catchReferencedVariables, catchReferencedArguments);
-            */
 
 			var catchMethod = new MethodDefinition (
 				method.Name + "__catch" + (CatchCount++),
@@ -911,11 +916,6 @@ namespace ExceptionRewriter {
 			};
 			var closureVariable = new VariableDefinition (closureType);
 			var needsLdind = new HashSet<object> ();
-
-            /*
-			GenerateParameters (catchMethod, catchReferencedArguments, paramMapping, needsLdind);
-			GenerateParameters (catchMethod, catchReferencedVariables, paramMapping, needsLdind);
-            */
 
 			catchMethod.Parameters.Add (excParam);
 			catchMethod.Parameters.Add (closureParam);
@@ -937,6 +937,8 @@ namespace ExceptionRewriter {
 
             if (i2 <= i1)
                 throw new Exception("Hit beginning of handler while rewinding past rethrows");
+
+            var leaveTargets = new List<Instruction> ();
 
 			// FIXME: Use generic parameter mapping to replace GP type references
 			var newMapping = ExtractRangeToMethod (
@@ -968,35 +970,36 @@ namespace ExceptionRewriter {
 						case Code.Leave:
 						case Code.Leave_S:
                             if (
-                                (range == null) || 
-                                // If the leave target is outside of the range we're extracting then we need to 
-                                //  turn it into a return since it's not possible to jump to it
-                                // (operandInsn.Offset > range.MaxIndex)
-                                false
-                            )
+                                (range == null)
+                            ) {
+                                var targetIndex = leaveTargets.IndexOf(operandInsn) + 1;
+                                if (targetIndex <= 0) {
+                                    targetIndex = leaveTargets.Count + 1;
+                                    leaveTargets.Add (operandInsn);
+                                }
+
                                 return new[] {
-                                    Nop ("Leave"),
+                                    Nop ($"Leave to target #{targetIndex} ({operandInsn})"),
+                                    Instruction.Create (OpCodes.Ldc_I4, targetIndex),
+                                    GeneratedRet ()
+                                };
+                            } else
+                                break;
+
+						case Code.Rethrow:
+                            if (range == null)
+                                return new[] {
+                                    Nop ("Rethrow"),
                                     Instruction.Create (OpCodes.Ldc_I4_0),
                                     GeneratedRet ()
                                 };
                             else
                                 break;
-						case Code.Rethrow:
-                            if (range == null)
-                                return new[] {
-                                    Nop ("Rethrow"),
-                                    Instruction.Create (OpCodes.Ldc_I4_1),
-                                    GeneratedRet ()
-                                };
-                            else
-                                break;
+
                         case Code.Ret:
-                            return new[] {
-                                Nop ("Ret"),
-                                Instruction.Create (OpCodes.Ldc_I4_M1),
-                                GeneratedRet ()
-                            };
-                        }
+                            // It's not valid to ret from inside a filter or catch: https://docs.microsoft.com/en-us/dotnet/api/system.reflection.emit.opcodes.ret
+                            throw new Exception("Unexpected ret inside catch block");
+                    }
 
                     return null;
 				}
@@ -1022,10 +1025,7 @@ namespace ExceptionRewriter {
 				CatchMethod = catchMethod,
 				IsCatchAll = isCatchAll,
 				Mapping = newMapping,
-                /*
-				CatchReferencedVariables = catchReferencedVariables,
-				CatchReferencedArguments = catchReferencedArguments
-                */
+                LeaveTargets = leaveTargets
 			};
 			return handler;
 		}
@@ -1395,13 +1395,11 @@ namespace ExceptionRewriter {
 
 			public ExceptionHandler Handler;
 			public TypeDefinition FilterType;
-			internal VariableDefinition FilterVariable;
+			public VariableDefinition FilterVariable;
 			public MethodDefinition CatchMethod, FilterMethod;
-
 			public Instruction FirstFilterInsn;
-			internal HashSet<VariableReference> CatchReferencedVariables;
-			internal HashSet<ParameterReference> CatchReferencedArguments;
-			internal Dictionary<object, object> Mapping;
+            public List<Instruction> LeaveTargets;
+			public Dictionary<object, object> Mapping;
 
             public ExcBlock () {
                 ID = NextID++;
@@ -1868,10 +1866,30 @@ namespace ExceptionRewriter {
                 newInstructions.Add (Instruction.Create (OpCodes.Call, h.CatchMethod));
                 // newInstructions.Add (Instruction.Create (OpCodes.Pop));
 
-                // If the catch selected to rethrow then rethrow, otherwise exit the catch block
+                // Either rethrow or leave  depending on the value returned by the handler
                 var rethrow = Instruction.Create (OpCodes.Rethrow);
                 if (exitPoint != null) {
-                    newInstructions.Add (Instruction.Create (OpCodes.Brtrue, rethrow));
+                    // We need to dup before each time we check the retval and decide where to go
+                    newInstructions.Add (Nop ($"Rethrow check"));
+                    newInstructions.Add (Instruction.Create (OpCodes.Dup));
+                    newInstructions.Add (Instruction.Create (OpCodes.Brfalse, rethrow));
+
+                    for (int l = 0; l < h.LeaveTargets.Count; l++) {
+                        var leaveTarget = h.LeaveTargets[l];
+                        var skipLeave = Nop ("Skip leave");
+                        newInstructions.Add (Nop ($"Leave target check #{l + 1} ({leaveTarget})"));
+                        newInstructions.Add (Instruction.Create (OpCodes.Dup));
+                        newInstructions.Add (Instruction.Create (OpCodes.Ldc_I4, l + 1));
+                        newInstructions.Add (Instruction.Create (OpCodes.Ceq));
+                        newInstructions.Add (Instruction.Create (OpCodes.Brfalse, skipLeave));
+                        newInstructions.Add (Instruction.Create (OpCodes.Leave, leaveTarget));
+                        newInstructions.Add (skipLeave);
+                    }
+
+                    // If we fell through all the way we have an extra copy of the retval on the stack
+                    newInstructions.Add (Instruction.Create (OpCodes.Pop));
+                    // Fall through to wherever we would have normally
+                    // FIXME: Is it valid for this to happen?
                     newInstructions.Add (Instruction.Create (OpCodes.Leave, exitPoint));
                 } else {
                     // There's no exit point, which means the try block ended with a throw/rethrow instead of a leave
