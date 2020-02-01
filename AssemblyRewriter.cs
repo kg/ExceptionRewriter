@@ -158,7 +158,7 @@ namespace ExceptionRewriter {
 				// Make temporary copy of the types and methods lists because we mutate them while iterating
 				foreach (var type in mod.GetTypes ())
 					foreach (var meth in type.Methods.ToArray ())
-						errorCount += ProcessMethod (meth);
+						errorCount += RewriteMethod (meth);
 			}
 
 			return errorCount;
@@ -218,7 +218,9 @@ namespace ExceptionRewriter {
                 g.FirstPushInstruction = Patch (g.FirstPushInstruction, old, replacement);
                 g.TryStart = Patch (g.TryStart, old, replacement);
                 g.TryEnd = Patch (g.TryEnd, old, replacement);
-                g.TryEndPredecessor = Patch (g.TryEndPredecessor, old, replacement);
+
+                // HACK: Preserve the predecessor because it's used to locate jump targets
+                // g.TryEndPredecessor = Patch (g.TryEndPredecessor, old, replacement);
 
                 foreach (var h in g.Handlers) {
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, old, replacement);
@@ -278,7 +280,9 @@ namespace ExceptionRewriter {
                 g.FirstPushInstruction = Patch (g.FirstPushInstruction, pairs);
                 g.TryStart = Patch (g.TryStart, pairs);
                 g.TryEnd = Patch (g.TryEnd, pairs);
-                g.TryEndPredecessor = Patch (g.TryEndPredecessor, pairs);
+
+                // HACK: Preserve the predecessor because it's used to locate jump targets
+                // g.TryEndPredecessor = Patch (g.TryEndPredecessor, pairs);
 
                 foreach (var h in g.Handlers) {
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, pairs);
@@ -702,8 +706,6 @@ namespace ExceptionRewriter {
 				}
 			);
 
-			CleanMethodBody (method, null, false);
-
 			var ctorRef = new MethodReference (
 				".ctor", method.DeclaringType.Module.TypeSystem.Void, closureTypeReference
 			) {
@@ -776,10 +778,8 @@ namespace ExceptionRewriter {
 				if (result.Length == 1 && result[0] == insn)
 					continue;
 
-				if (insn != result[0]) {
+				if (insn != result[0])
 					remapTableFirst[insn] = result[0];
-					instructions[i] = result[0];
-				}
 				for (int j = result.Length - 1; j >= 1; j--)
 					instructions.Insert (i + 1, result[j]);
 
@@ -791,9 +791,17 @@ namespace ExceptionRewriter {
 
 			for (int i = 0; i < instructions.Count; i++) {
 				var insn = instructions[i];
+
+                Instruction newInsn;
+                if (remapTableFirst.TryGetValue (insn, out newInsn)) {
+                    instructions[i] = newInsn;
+                    insn = newInsn;
+                }
+
 				var operand = insn.Operand as Instruction;
 				if (operand == null)
 					continue;
+
 				Instruction newOperand;
 				if (!remapTableFirst.TryGetValue (operand, out newOperand))
 					continue;
@@ -801,17 +809,15 @@ namespace ExceptionRewriter {
 				insn.Operand = newOperand;
 			}
 
-			// CHANGE #2: Removed clean
 			foreach (var eh in method.Body.ExceptionHandlers) {
 				eh.FilterStart = PostFilterRange (remapTableFirst, eh.FilterStart);
 				eh.TryStart = PostFilterRange (remapTableFirst, eh.TryStart);
-				eh.TryEnd = PostFilterRange (remapTableFirst, eh.TryEnd);
+				eh.TryEnd = PostFilterRange (remapTableLast, eh.TryEnd);
 				eh.HandlerStart = PostFilterRange (remapTableFirst, eh.HandlerStart);
-				eh.HandlerEnd = PostFilterRange (remapTableFirst, eh.HandlerEnd);
+				eh.HandlerEnd = PostFilterRange (remapTableLast, eh.HandlerEnd);
 			}
 
-			// CHANGE #3: Added clean
-			CleanMethodBody (method, null, false);
+			CleanMethodBody (method, null, true);
 		}
 
 		private void GenerateParameters (
@@ -1455,7 +1461,7 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private int ProcessMethod (MethodDefinition method)
+		private int RewriteMethod (MethodDefinition method)
 		{
 			if (!method.HasBody)
 				return 0;
@@ -1482,7 +1488,7 @@ namespace ExceptionRewriter {
 				Console.WriteLine ($"Rewriting {method.FullName}");
 
 			try {
-				ProcessMethodImpl (method);
+				RewriteMethodImpl (method);
 				return 0;
 			} catch (Exception exc) {
 				Console.Error.WriteLine ($"Error rewriting {method.FullName}:");
@@ -1495,13 +1501,15 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private void ProcessMethodImpl (MethodDefinition method) {
+		private void RewriteMethodImpl (MethodDefinition method) {
             /*
             if (!method.FullName.Contains("NestedFiltersIn") && !method.FullName.Contains("Lopsided"))
                 return;
             */
 
-            CleanMethodBody(method, null, false);
+            // Clean up the method body and verify it before rewriting so that any existing violations of
+            //  expectations aren't erroneously blamed on later transforms
+            CleanMethodBody(method, null, true);
 
             var efilt = GetExceptionFilter(method.Module);
             var excType = GetException(method.Module);
@@ -1603,17 +1611,26 @@ namespace ExceptionRewriter {
 
             var deadHandlers = new List<ExceptionHandler>();
 
-            foreach (var group in groups) {
-                var endIndex = insns.IndexOf(group.Key.B);
-                if (endIndex < 0)
-                    throw new Exception($"End instruction [{group.Key.B}] not found in method body");
+            var excGroups = (from @group in groups
+                             let a = @group.Key.A
+                             let b = @group.Key.B
+                             let endIndex = insns.IndexOf(b)
+                             let predecessor = insns[endIndex - 1]
+                             select new {
+                                 @group,
+                                 excGroup = new ExcGroup {
+                                     TryStart = a,
+                                     TryEndPredecessor = predecessor,
+                                     TryEnd = b,
+                                 },
+                                 endIndex                                 
+                             }).ToList();
 
-                var excGroup = new ExcGroup {
-                    TryStart = group.Key.A,
-                    TryEndPredecessor = insns[endIndex - 1],
-                    TryEnd = group.Key.B,
-                };
+            foreach (var eg in excGroups)
+                context.NewGroups.Add(eg.excGroup);
 
+            foreach (var eg in excGroups) {
+                var excGroup = eg.excGroup;
                 Instruction exitPoint;
 
                 switch (excGroup.TryEndPredecessor.OpCode.Code) {
@@ -1630,7 +1647,7 @@ namespace ExceptionRewriter {
                         break;
                 }
 
-                foreach (var eh in group) {
+                foreach (var eh in eg.group) {
                     var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
                     excGroup.Handlers.Add (catchBlock);
 
@@ -1670,7 +1687,7 @@ namespace ExceptionRewriter {
                         if (insertOffset < 0)
                             throw new Exception ("Exit point not found");
                     } else {
-                        var nextInsn = (from eh in @group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First();
+                        var nextInsn = (from eh in eg.@group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First();
                         insertOffset = insns.IndexOf (nextInsn);
                     }
                     InsertOps (insns, insertOffset, teardownInstructions.ToArray());
@@ -1683,7 +1700,7 @@ namespace ExceptionRewriter {
                 var newEnd = Nop ("Constructed handler end");
 
                 newHandler.Add (newStart);
-                ConstructNewExceptionHandler (method, group, excGroup, newHandler, closure, exitPoint);
+                ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, exitPoint);
                 newHandler.Add (newEnd);
 
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
@@ -1724,7 +1741,7 @@ namespace ExceptionRewriter {
 
                 method.Body.ExceptionHandlers.Add (teardownEh);
 
-                foreach (var eh in group)
+                foreach (var eh in eg.@group)
                     deadHandlers.Add(eh);
             }
 
@@ -2150,7 +2167,8 @@ namespace ExceptionRewriter {
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
-            bool renumber = false;
+            // NOTE: Disabling this will break the leave target ordering check
+            bool renumber = true;
 
 			foreach (var i in insns) {
                 if (renumber || i.Offset == 0)
@@ -2200,7 +2218,7 @@ namespace ExceptionRewriter {
                     CheckInRange(opInsn, method, oldMethod, removedInstructions);
 
                     if ((i.OpCode.Code == Code.Leave) || (i.OpCode.Code == Code.Leave_S)) {
-                        if (i.Offset > opInsn.Offset)
+                        if (renumber && (i.Offset > opInsn.Offset))
                             throw new Exception ($"Leave target {opInsn} precedes leave instruction");
                     }
 				} else if (opArg != null) {
