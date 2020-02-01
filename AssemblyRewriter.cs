@@ -218,11 +218,9 @@ namespace ExceptionRewriter {
                 g.FirstPushInstruction = Patch (g.FirstPushInstruction, old, replacement);
                 g.TryStart = Patch (g.TryStart, old, replacement);
                 g.TryEnd = Patch (g.TryEnd, old, replacement);
+                g.TryEndPredecessor = Patch (g.TryEndPredecessor, old, replacement);
 
-                // HACK: Preserve the predecessor because it's used to locate jump targets
-                // g.TryEndPredecessor = Patch (g.TryEndPredecessor, old, replacement);
-
-                foreach (var h in g.Handlers) {
+                foreach (var h in g.Blocks) {
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, old, replacement);
                     Patch (h.Handler, old, replacement);
                 }
@@ -280,11 +278,9 @@ namespace ExceptionRewriter {
                 g.FirstPushInstruction = Patch (g.FirstPushInstruction, pairs);
                 g.TryStart = Patch (g.TryStart, pairs);
                 g.TryEnd = Patch (g.TryEnd, pairs);
+                g.TryEndPredecessor = Patch (g.TryEndPredecessor, pairs);
 
-                // HACK: Preserve the predecessor because it's used to locate jump targets
-                // g.TryEndPredecessor = Patch (g.TryEndPredecessor, pairs);
-
-                foreach (var h in g.Handlers) {
+                foreach (var h in g.Blocks) {
                     h.FirstFilterInsn = Patch (h.FirstFilterInsn, pairs);
                     Patch (h.Handler, pairs);
                 }
@@ -550,6 +546,11 @@ namespace ExceptionRewriter {
 			return result;
 		}
 
+        private Instruction GeneratedRet ()
+        {
+            return Instruction.Create (OpCodes.Ret);
+        }
+
         private Instruction Nop (string description = null) 
         {
             var result = Instruction.Create (OpCodes.Nop);
@@ -812,9 +813,9 @@ namespace ExceptionRewriter {
 			foreach (var eh in method.Body.ExceptionHandlers) {
 				eh.FilterStart = PostFilterRange (remapTableFirst, eh.FilterStart);
 				eh.TryStart = PostFilterRange (remapTableFirst, eh.TryStart);
-				eh.TryEnd = PostFilterRange (remapTableLast, eh.TryEnd);
+				eh.TryEnd = PostFilterRange (remapTableFirst, eh.TryEnd);
 				eh.HandlerStart = PostFilterRange (remapTableFirst, eh.HandlerStart);
-				eh.HandlerEnd = PostFilterRange (remapTableLast, eh.HandlerEnd);
+				eh.HandlerEnd = PostFilterRange (remapTableFirst, eh.HandlerEnd);
 			}
 
 			CleanMethodBody (method, null, true);
@@ -974,20 +975,28 @@ namespace ExceptionRewriter {
                                 false
                             )
                                 return new[] {
+                                    Nop ("Leave"),
                                     Instruction.Create (OpCodes.Ldc_I4_0),
-                                    Instruction.Create (OpCodes.Ret)
+                                    GeneratedRet ()
                                 };
                             else
                                 break;
 						case Code.Rethrow:
                             if (range == null)
                                 return new[] {
+                                    Nop ("Rethrow"),
                                     Instruction.Create (OpCodes.Ldc_I4_1),
-                                    Instruction.Create (OpCodes.Ret)
+                                    GeneratedRet ()
                                 };
                             else
                                 break;
-					}
+                        case Code.Ret:
+                            return new[] {
+                                Nop ("Ret"),
+                                Instruction.Create (OpCodes.Ldc_I4_M1),
+                                GeneratedRet ()
+                            };
+                        }
 
                     return null;
 				}
@@ -1010,7 +1019,7 @@ namespace ExceptionRewriter {
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
 			var handler = new ExcBlock {
 				Handler = eh,
-				Method = catchMethod,
+				CatchMethod = catchMethod,
 				IsCatchAll = isCatchAll,
 				Mapping = newMapping,
                 /*
@@ -1090,6 +1099,11 @@ namespace ExceptionRewriter {
 			}
 		}
 
+        private bool IsEndfilter (Instruction insn) {
+            return (insn.OpCode.Code == Code.Endfilter) ||
+                (insn.Operand as string == "extracted endfilter");
+        }
+
 		private void ExtractFilter (
 			MethodDefinition method, ExceptionHandler eh, 
             VariableDefinition closure, ParameterDefinition fakeThis, 
@@ -1138,7 +1152,7 @@ namespace ExceptionRewriter {
                 throw new Exception("Handler size was 0 or less");
 
             var endfilter = insns[i2 - 1];
-            if (endfilter.OpCode.Code != Code.Endfilter)
+            if (!IsEndfilter(endfilter))
                 throw new Exception("Filter did not end with an endfilter");
 
             {
@@ -1162,7 +1176,7 @@ namespace ExceptionRewriter {
                     throw new Exception("Filter body was empty");
 
 			    var oldFilterInsn = filterInsns[filterInsns.Count - 1];
-                if (oldFilterInsn.OpCode.Code != Code.Endfilter)
+                if (!IsEndfilter(oldFilterInsn))
                     throw new Exception("Unexpected last instruction");
 
                 var filterReplacement = Instruction.Create (OpCodes.Ret);
@@ -1284,19 +1298,19 @@ namespace ExceptionRewriter {
             for (int i = firstIndex; i <= lastIndex; i++) {
                 var oldInsn = insns[i];
                 
-                // Do not erase existing placeholder nops
-                if ((oldInsn.OpCode.Code == Code.Nop) && (oldInsn.Operand != null))
+                if (oldInsn.OpCode.Code == Code.Nop)
                     continue;
-                    // throw new Exception($"Extracting already-extracted instruction {oldInsn}");
 
                 var isExceptionControlFlow = (oldInsn.OpCode.Code == Code.Rethrow) ||
                     (oldInsn.OpCode.Code == Code.Leave) || (oldInsn.OpCode.Code == Code.Leave_S);
 
                 if (preserveControlFlow && isExceptionControlFlow)
                     continue;
-               
-                var newInsn = Nop(key + oldInsn.ToString());
-                newInsn.Offset = oldInsn.Offset;
+
+                var nopText = oldInsn.OpCode.Code == Code.Endfilter
+                    ? "extracted endfilter"
+                    : key + oldInsn.ToString();
+                var newInsn = Nop(nopText);
                 pairs.Add(oldInsn, newInsn);
             }
 
@@ -1347,8 +1361,6 @@ namespace ExceptionRewriter {
                 sourceMethod.Body.ExceptionHandlers.Remove(range.Handler);
             }
 
-            StripUnreferencedNops(targetMethod);
-
 			return variableMapping;
 		}
 
@@ -1362,8 +1374,8 @@ namespace ExceptionRewriter {
             private static int NextID = 0;
 
             public readonly int ID;
-			public Instruction TryStart, TryEnd, TryEndPredecessor;
-			public List<ExcBlock> Handlers = new List<ExcBlock> ();
+			public Instruction TryStart, TryEnd, TryEndPredecessor, OriginalTryEndPredecessor;
+			public List<ExcBlock> Blocks = new List<ExcBlock> ();
 			internal Instruction FirstPushInstruction;
 
             public ExcGroup () {
@@ -1384,7 +1396,7 @@ namespace ExceptionRewriter {
 			public ExceptionHandler Handler;
 			public TypeDefinition FilterType;
 			internal VariableDefinition FilterVariable;
-			public MethodDefinition Method, FilterMethod;
+			public MethodDefinition CatchMethod, FilterMethod;
 
 			public Instruction FirstFilterInsn;
 			internal HashSet<VariableReference> CatchReferencedVariables;
@@ -1396,7 +1408,7 @@ namespace ExceptionRewriter {
             }
 
             public override string ToString () {
-                return $"Handler #{ID} {(FilterMethod ?? Method).FullName}";
+                return $"Handler #{ID} {(FilterMethod ?? CatchMethod).FullName}";
             }
         }
 
@@ -1502,10 +1514,8 @@ namespace ExceptionRewriter {
 		}
 
 		private void RewriteMethodImpl (MethodDefinition method) {
-            /*
             if (!method.FullName.Contains("NestedFiltersIn") && !method.FullName.Contains("Lopsided"))
                 return;
-            */
 
             // Clean up the method body and verify it before rewriting so that any existing violations of
             //  expectations aren't erroneously blamed on later transforms
@@ -1620,6 +1630,7 @@ namespace ExceptionRewriter {
                                  @group,
                                  excGroup = new ExcGroup {
                                      TryStart = a,
+                                     OriginalTryEndPredecessor = predecessor,
                                      TryEndPredecessor = predecessor,
                                      TryEnd = b,
                                  },
@@ -1633,14 +1644,15 @@ namespace ExceptionRewriter {
                 var excGroup = eg.excGroup;
                 Instruction exitPoint;
 
-                switch (excGroup.TryEndPredecessor.OpCode.Code) {
+                switch (excGroup.OriginalTryEndPredecessor.OpCode.Code) {
                     case Code.Throw:
                     case Code.Rethrow:
                         exitPoint = null;
                         break;
                     case Code.Leave:
                     case Code.Leave_S:
-                        exitPoint = (Instruction)excGroup.TryEndPredecessor.Operand;
+                        exitPoint = (excGroup.TryEndPredecessor.Operand as Instruction) ?? 
+                            (excGroup.OriginalTryEndPredecessor.Operand as Instruction);
                         break;
                     default:
                         throw new Exception("Try block does not end with a leave or throw instruction");
@@ -1649,7 +1661,7 @@ namespace ExceptionRewriter {
 
                 foreach (var eh in eg.group) {
                     var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
-                    excGroup.Handlers.Add (catchBlock);
+                    excGroup.Blocks.Add (catchBlock);
 
                     if (eh.FilterStart != null)
                         ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
@@ -1664,7 +1676,7 @@ namespace ExceptionRewriter {
                     //  anything else happens.
 
                     var teardownInstructions = new List<Instruction> { teardownPrologue };
-                    foreach (var eh in excGroup.Handlers.ToArray ().Reverse ()) {
+                    foreach (var eh in excGroup.Blocks.ToArray ().Reverse ()) {
                         if (eh.FilterType == null)
                             continue;
 
@@ -1721,7 +1733,7 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Add (newEh);
 
                 // Ensure we initialize and activate all exception filters for the try block before entering it
-                foreach (var eh in excGroup.Handlers) {
+                foreach (var eh in excGroup.Blocks) {
                     if (eh.FilterType == null)
                         continue;
 
@@ -1742,11 +1754,17 @@ namespace ExceptionRewriter {
                 method.Body.ExceptionHandlers.Add (teardownEh);
 
                 foreach (var eh in eg.@group)
-                    deadHandlers.Add(eh);
+                    method.Body.ExceptionHandlers.Remove(eh);
             }
 
-            foreach (var eh in deadHandlers)
-                method.Body.ExceptionHandlers.Remove(eh);
+            foreach (var eg in context.NewGroups) {
+                foreach (var eb in eg.Blocks) {
+                    if (eb.FilterMethod != null)
+                        StripUnreferencedNops(eb.FilterMethod);
+                    if (eb.CatchMethod != null)
+                        StripUnreferencedNops(eb.CatchMethod);
+                }
+            }
         }
 
         private Instruction[] InitializeExceptionFilter (
@@ -1796,7 +1814,7 @@ namespace ExceptionRewriter {
 
             newInstructions.Add (Instruction.Create (OpCodes.Stloc, excVar));
 
-            excGroup.Handlers.Sort(
+            excGroup.Blocks.Sort(
                 (lhs, rhs) => {
                     var l = (lhs.FilterMethod != null) ? 0 : 1;
                     var r = (rhs.FilterMethod != null) ? 0 : 1;
@@ -1804,12 +1822,12 @@ namespace ExceptionRewriter {
                 }
             );
 
-            var hasFallthrough = excGroup.Handlers.Any(h => h.FilterMethod == null);
+            var hasFallthrough = excGroup.Blocks.Any(h => h.FilterMethod == null);
             var efilt = GetExceptionFilter (method.Module);
 
-            foreach (var h in excGroup.Handlers) {
-                var callCatchPrologue = Nop ("Before call catch " + h.Method.Name);
-                var callCatchEpilogue = Nop ("After call catch " + h.Method.Name);
+            foreach (var h in excGroup.Blocks) {
+                var callCatchPrologue = Nop ("Before call catch " + h.CatchMethod.Name);
+                var callCatchEpilogue = Nop ("After call catch " + h.CatchMethod.Name);
 
                 newInstructions.Add (callCatchPrologue);
 
@@ -1838,11 +1856,11 @@ namespace ExceptionRewriter {
                 }
 
                 newInstructions.Add (Instruction.Create (OpCodes.Brfalse, callCatchEpilogue));
-                if (!h.Method.IsStatic)
+                if (!h.CatchMethod.IsStatic)
                     newInstructions.Add (Instruction.Create (OpCodes.Ldarg_0));
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, closureVar));
-                newInstructions.Add (Instruction.Create (OpCodes.Call, h.Method));
+                newInstructions.Add (Instruction.Create (OpCodes.Call, h.CatchMethod));
                 // newInstructions.Add (Instruction.Create (OpCodes.Pop));
 
                 // If the catch selected to rethrow then rethrow, otherwise exit the catch block
@@ -2167,14 +2185,17 @@ namespace ExceptionRewriter {
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
 		{
 			var insns = method.Body.Instructions;
+
             // NOTE: Disabling this will break the leave target ordering check
-            bool renumber = true;
+            // FIXME: Turning this on breaks everything? Why is this possible?
+            bool renumber = false;
 
+            int offset = 0;
 			foreach (var i in insns) {
-                if (renumber || i.Offset == 0)
-				    i.Offset = insns.IndexOf (i);
+                if (renumber)
+				    i.Offset = offset;
+                offset += i.GetSize();
             }
-
 
 			for (int idx = 0; idx < insns.Count; idx++) {
                 var i = insns[idx];
@@ -2237,9 +2258,11 @@ namespace ExceptionRewriter {
 				}
 			}
 
+            offset = 0;
 			foreach (var i in insns) {
-                if (renumber || i.Offset == 0)
-				    i.Offset = insns.IndexOf (i);
+                if (renumber)
+				    i.Offset = offset;
+                offset += i.GetSize();
             }
 
 			if (verify)
