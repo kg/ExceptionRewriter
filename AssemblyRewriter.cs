@@ -1524,6 +1524,7 @@ namespace ExceptionRewriter {
 
 		private void RewriteMethodImpl (MethodDefinition method) {
             if (
+                false &&
                 !method.FullName.Contains("NestedFiltersIn") && 
                 !method.FullName.Contains("Lopsided") &&
                 !method.FullName.Contains("TestReturns") &&
@@ -1875,35 +1876,27 @@ namespace ExceptionRewriter {
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
                 newInstructions.Add (Instruction.Create (OpCodes.Ldloc, closureVar));
                 newInstructions.Add (Instruction.Create (OpCodes.Call, h.CatchMethod));
-                // newInstructions.Add (Instruction.Create (OpCodes.Pop));
 
                 // Either rethrow or leave depending on the value returned by the handler
                 var rethrow = Instruction.Create (OpCodes.Rethrow);
-                if (exitPoint != null) {
-                    // Create instructions for handling each possible leave target (in addition to 0 which is rethrow)
-                    var switchTargets = new Instruction[h.LeaveTargets.Count + 1];
-                    switchTargets[0] = Instruction.Create (OpCodes.Rethrow);
+                // Create instructions for handling each possible leave target (in addition to 0 which is rethrow)
+                var switchTargets = new Instruction[h.LeaveTargets.Count + 1];
+                switchTargets[0] = rethrow;
 
-                    for (int l = 0; l < h.LeaveTargets.Count; l++)
-                        switchTargets[l + 1] = Instruction.Create (OpCodes.Leave, h.LeaveTargets[l]);
+                for (int l = 0; l < h.LeaveTargets.Count; l++)
+                    switchTargets[l + 1] = Instruction.Create (OpCodes.Leave, h.LeaveTargets[l]);
 
-                    // Use the return value from the handler to select one of the targets we just created
-                    newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
+                // Use the return value from the handler to select one of the targets we just created
+                newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
 
-                    // Add a fallthrough leave for situations where none of the targets was selected
-                    // FIXME: Is it valid for this to ever happen? Should we rethrow instead?
-                    newInstructions.Add (Instruction.Create (OpCodes.Leave, exitPoint));
+                // After the switch we fall-through to the rethrow, but this shouldn't ever happen
+                newInstructions.Add (rethrow);
 
-                    // After the fallback, add each of our leave targets.
-                    // These need to be after the fallthrough so they aren't hit unless targeted by the switch
-                    // It's okay to add them by themselves since they're all either rethrow or leave opcodes.
-                    foreach (var st in switchTargets)
-                        newInstructions.Add(st);
-                } else {
-                    // There's no exit point, which means the try block ended with a throw/rethrow instead of a leave
-                    newInstructions.Add (Instruction.Create (OpCodes.Pop));
-                    newInstructions.Add (rethrow);
-                }
+                // After the fallback, add each of our leave targets.
+                // These need to be after the fallthrough so they aren't hit unless targeted by the switch
+                // It's okay to add them by themselves since they're all either rethrow or leave opcodes.
+                for (int l = 1; l < switchTargets.Length; l++)
+                    newInstructions.Add (switchTargets[l]);
 
                 newInstructions.Add (callCatchEpilogue);
             }
@@ -2439,7 +2432,7 @@ namespace ExceptionRewriter {
                 var insns = (Instruction[])newOperand;
                 var newInsns = new Instruction[insns.Length];
                 insns.CopyTo (newInsns, 0);
-                return Instruction.Create (i.OpCode, newInsns);
+                return Instruction.Create (code, newInsns);
 			} else if (newOperand != null) {
 				throw new NotImplementedException (i.OpCode.ToString () + " " + newOperand.GetType().FullName);
 			} else {
