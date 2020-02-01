@@ -207,6 +207,14 @@ namespace ExceptionRewriter {
 			for (int i = 0; i < body.Count; i++) {
 				if (body[i].Operand == old)
 					body[i] = Instruction.Create (body[i].OpCode, replacement);
+
+                var opInsns = body[i].Operand as Instruction[];
+                if (opInsns != null) {
+                    for (int j = 0; j < opInsns.Length; j++) {
+                        if (opInsns[j] == old)
+                            opInsns[j] = replacement;
+                    }
+                }
 			}
 
             foreach (var p in context.Pairs) {
@@ -269,6 +277,14 @@ namespace ExceptionRewriter {
                 var opInsn = body[i].Operand as Instruction;
                 if (opInsn != null && pairs.TryGetValue (opInsn, out replacement))
                     body[i].Operand = replacement;
+
+                var opInsns = body[i].Operand as Instruction[];
+                if (opInsns != null) {
+                    for (int j = 0; j < opInsns.Length; j++) {
+                        if (pairs.TryGetValue (opInsns[j], out replacement))
+                            opInsns[j] = replacement;
+                    }
+                }
 			}
 
             foreach (var p in context.Pairs) {
@@ -1316,7 +1332,7 @@ namespace ExceptionRewriter {
 
             CloneInstructions (
 				sourceMethod, fakeThis, firstIndex, lastIndex - firstIndex + 1, 
-				targetInsns, 0, variableMapping, typeMapping, ranges, onFailedRemap, filter
+				targetInsns, variableMapping, typeMapping, ranges, onFailedRemap, filter
 			);
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
@@ -1866,31 +1882,28 @@ namespace ExceptionRewriter {
                 newInstructions.Add (Instruction.Create (OpCodes.Call, h.CatchMethod));
                 // newInstructions.Add (Instruction.Create (OpCodes.Pop));
 
-                // Either rethrow or leave  depending on the value returned by the handler
+                // Either rethrow or leave depending on the value returned by the handler
                 var rethrow = Instruction.Create (OpCodes.Rethrow);
                 if (exitPoint != null) {
-                    // We need to dup before each time we check the retval and decide where to go
-                    newInstructions.Add (Nop ($"Rethrow check"));
-                    newInstructions.Add (Instruction.Create (OpCodes.Dup));
-                    newInstructions.Add (Instruction.Create (OpCodes.Brfalse, rethrow));
+                    // Create instructions for handling each possible leave target (in addition to 0 which is rethrow)
+                    var switchTargets = new Instruction[h.LeaveTargets.Count + 1];
+                    switchTargets[0] = Instruction.Create (OpCodes.Rethrow);
 
-                    for (int l = 0; l < h.LeaveTargets.Count; l++) {
-                        var leaveTarget = h.LeaveTargets[l];
-                        var skipLeave = Nop ("Skip leave");
-                        newInstructions.Add (Nop ($"Leave target check #{l + 1} ({leaveTarget})"));
-                        newInstructions.Add (Instruction.Create (OpCodes.Dup));
-                        newInstructions.Add (Instruction.Create (OpCodes.Ldc_I4, l + 1));
-                        newInstructions.Add (Instruction.Create (OpCodes.Ceq));
-                        newInstructions.Add (Instruction.Create (OpCodes.Brfalse, skipLeave));
-                        newInstructions.Add (Instruction.Create (OpCodes.Leave, leaveTarget));
-                        newInstructions.Add (skipLeave);
-                    }
+                    for (int l = 0; l < h.LeaveTargets.Count; l++)
+                        switchTargets[l + 1] = Instruction.Create (OpCodes.Leave, h.LeaveTargets[l]);
 
-                    // If we fell through all the way we have an extra copy of the retval on the stack
-                    newInstructions.Add (Instruction.Create (OpCodes.Pop));
-                    // Fall through to wherever we would have normally
-                    // FIXME: Is it valid for this to happen?
+                    // Use the return value from the handler to select one of the targets we just created
+                    newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
+
+                    // Add a fallthrough leave for situations where none of the targets was selected
+                    // FIXME: Is it valid for this to ever happen? Should we rethrow instead?
                     newInstructions.Add (Instruction.Create (OpCodes.Leave, exitPoint));
+
+                    // After the fallback, add each of our leave targets.
+                    // These need to be after the fallthrough so they aren't hit unless targeted by the switch
+                    // It's okay to add them by themselves since they're all either rethrow or leave opcodes.
+                    foreach (var st in switchTargets)
+                        newInstructions.Add(st);
                 } else {
                     // There's no exit point, which means the try block ended with a throw/rethrow instead of a leave
                     newInstructions.Add (Instruction.Create (OpCodes.Pop));
@@ -2372,6 +2385,25 @@ namespace ExceptionRewriter {
 				throw new Exception (operand.ToString ());
 		}
 
+        private object RemapOperandForClone<T, U> (
+            object operand,
+			Dictionary<object, object> variableMapping,
+			Dictionary<T, U> typeMapping
+        )
+			where T : TypeReference
+			where U : TypeReference
+		{
+			object newOperand = operand;
+			if (variableMapping != null && variableMapping.ContainsKey (operand))
+				newOperand = variableMapping[operand];
+			else if (typeMapping != null) {
+				var operandTr = operand as T;
+				if (operandTr != null && typeMapping.ContainsKey (operandTr))
+					newOperand = typeMapping[operandTr];
+			}
+            return newOperand;
+        }
+
 		private Instruction CloneInstruction<T, U> (
 			Instruction i, 
 			ParameterDefinition fakeThis,
@@ -2393,14 +2425,7 @@ namespace ExceptionRewriter {
 			if (operand == null)
 				return Instruction.Create (code);
 
-			object newOperand = operand;
-			if (variableMapping != null && variableMapping.ContainsKey (operand))
-				newOperand = variableMapping[operand];
-			else if (typeMapping != null) {
-				var operandTr = operand as T;
-				if (operandTr != null && typeMapping.ContainsKey (operandTr))
-					newOperand = typeMapping[operandTr];
-			}
+            var newOperand = RemapOperandForClone(operand, variableMapping, typeMapping);
 
             if (code.Code == Code.Nop) {
                 var result = Instruction.Create(OpCodes.Nop);
@@ -2451,6 +2476,11 @@ namespace ExceptionRewriter {
 				return (Instruction)m.Invoke (null, new object[] {
 					code, newOperand
 				});
+            } else if (newOperand is Instruction[]) {
+                var insns = (Instruction[])newOperand;
+                var newInsns = new Instruction[insns.Length];
+                insns.CopyTo (newInsns, 0);
+                return Instruction.Create (OpCodes.Switch, newInsns);
 			} else if (newOperand != null) {
 				throw new NotImplementedException (i.OpCode.ToString () + " " + newOperand.GetType().FullName);
 			} else {
@@ -2463,7 +2493,6 @@ namespace ExceptionRewriter {
 			ParameterDefinition fakeThis,
 			int sourceIndex, int count,
 			Mono.Collections.Generic.Collection<Instruction> target,
-			int targetIndex,
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
             List<EhRange> ranges,
@@ -2473,12 +2502,15 @@ namespace ExceptionRewriter {
 			where T : TypeReference
 			where U : TypeReference
 		{
+            var sourceInsns = sourceMethod.Body.Instructions;
+
 			if (sourceIndex < 0)
 				throw new ArgumentOutOfRangeException ("sourceIndex");
 
+            int newOffset = 0;
 			for (int n = 0; n < count; n++) {
                 var absoluteIndex = n + sourceIndex;
-				var insn = sourceMethod.Body.Instructions[absoluteIndex];
+				var insn = sourceInsns[absoluteIndex];
 				var newInsn = CloneInstruction (insn, fakeThis, sourceMethod, variableMapping, typeMapping);
 
                 if (filter != null) {
@@ -2486,16 +2518,25 @@ namespace ExceptionRewriter {
 
                     var filtered = filter (newInsn, range);
                     if (filtered != null) {
-                        foreach (var filteredInsn in filtered)
-                            target.Add (filteredInsn);
+                        foreach (var filteredInsn in filtered) {
+                            filteredInsn.Offset = newOffset;
+    				        target.Add (filteredInsn);
+                            newOffset += filteredInsn.GetSize();
+                        }
 
                         UpdateRangeReferences (ranges, insn, filtered.First(), filtered.Last());
                     } else {
-                        target.Add (newInsn);
+                        newInsn.Offset = newOffset;
+    				    target.Add (newInsn);
+                        newOffset += newInsn.GetSize();
+
                         UpdateRangeReferences (ranges, insn, newInsn, newInsn);
                     }
                 } else {
+                    newInsn.Offset = newOffset;
     				target.Add (newInsn);
+                    newOffset += newInsn.GetSize();
+
                     UpdateRangeReferences (ranges, insn, newInsn, newInsn);
                 }
 			}
@@ -2504,20 +2545,39 @@ namespace ExceptionRewriter {
 			for (int i = 0; i < target.Count; i++) {
 				var insn = target[i];
 				var operand = insn.Operand as Instruction;
-				if (operand == null)
-					continue;
+                var operands = insn.Operand as Instruction[];
 
-				Instruction newOperand, newInsn;
-				if (!TryRemapInstruction (operand, sourceMethod.Body.Instructions, target, targetIndex - sourceIndex, out newOperand)) {
-					if (onFailedRemap != null)
-						newInsn = onFailedRemap (insn, operand);
-					else
-						throw new Exception ("Could not remap instruction operand for " + insn);
-				} else {
-					newInsn = Instruction.Create (insn.OpCode, newOperand);
-				}
+                if (operand != null) {
+                    Instruction newOperand, newInsn;
+				    if (!TryRemapInstruction (operand, sourceInsns, target, 0 - sourceIndex, out newOperand)) {
+					    if (onFailedRemap != null)
+						    newInsn = onFailedRemap (insn, operand);
+					    else
+						    throw new Exception ("Could not remap instruction operand for " + insn);
+				    } else {
+					    newInsn = Instruction.Create (insn.OpCode, newOperand);
+				    }
+    				target[i] = newInsn;
+                } else if (operands != null) {
+                    for (int j = 0; j < operands.Length; j++) {
+                        var elt = operands[j];
 
-				target[i] = newInsn;
+                        // FIXME
+                        var eltIndex = sourceInsns.IndexOf(elt);
+                        if (eltIndex < 0)
+                            continue;
+                            // throw new Exception ($"Switch target {elt} not found in source method");
+
+                        eltIndex -= sourceIndex;
+                        if (eltIndex < 0)
+                            continue;
+                            // throw new Exception ($"Switch target {elt} outside of clone range");
+
+                        var newElt = target[eltIndex];
+                        operands[j] = newElt;
+                    }
+                } else
+                    continue;
 			}
 		}
 
