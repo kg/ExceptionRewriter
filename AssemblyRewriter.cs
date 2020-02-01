@@ -1730,15 +1730,15 @@ namespace ExceptionRewriter {
                 newHandler.Add (newStart);
                 ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, exitPoint);
 
-                // We'd put a helpful nop here but peverify gets angry
-                var newEnd = newHandler[newHandler.Count - 1];
-
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
                     throw new Exception ("Failed to find TryEndPredecessor");
                 targetIndex += 1;
 
                 InsertOps (insns, targetIndex, newHandler.ToArray());
+
+                var endOffset = insns.IndexOf(newHandler[newHandler.Count - 1]);
+                var newEnd = insns[endOffset + 1];
 
                 var newEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
                     CatchType = method.Module.TypeSystem.Object,
@@ -1845,7 +1845,11 @@ namespace ExceptionRewriter {
 
             foreach (var h in excGroup.Blocks) {
                 var callCatchPrologue = Nop ("Before call catch " + h.CatchMethod.Name);
-                var callCatchEpilogue = Nop ("After call catch " + h.CatchMethod.Name);
+                var callCatchEpilogue = 
+                    exitPoint != null
+                        ? Instruction.Create (OpCodes.Leave, exitPoint)
+                        : Instruction.Create (OpCodes.Rethrow);
+                    //Nop ("After call catch " + h.CatchMethod.Name);
 
                 newInstructions.Add (callCatchPrologue);
 
@@ -1906,9 +1910,6 @@ namespace ExceptionRewriter {
                     newInstructions.Add (switchTargets[l]);
 
                 newInstructions.Add (callCatchEpilogue);
-
-                // FIXME: Insert an extra padding rethrow after the epilogue because jumps will target it sometimes :/
-                newInstructions.Add (Nop("Padding after epilogue"));
             }
         }
 
