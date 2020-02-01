@@ -1514,7 +1514,12 @@ namespace ExceptionRewriter {
 		}
 
 		private void RewriteMethodImpl (MethodDefinition method) {
-            if (!method.FullName.Contains("NestedFiltersIn") && !method.FullName.Contains("Lopsided"))
+            if (
+                !method.FullName.Contains("NestedFiltersIn") && 
+                !method.FullName.Contains("Lopsided") &&
+                !method.FullName.Contains("TestReturns") &&
+                !method.FullName.Contains("TestReturnValue")
+            )
                 return;
 
             // Clean up the method body and verify it before rewriting so that any existing violations of
