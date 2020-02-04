@@ -1341,9 +1341,7 @@ namespace ExceptionRewriter {
                 insns[i] = newInsn;
             }
 
-            PatchMany(sourceMethod, context, pairs);
-
-			CleanMethodBody (targetMethod, sourceMethod, false);
+            PatchMany (sourceMethod, context, pairs);
 
             // Copy over any exception handlers that were contained by the source range, remapping
             //  the start/end instructions of the handler and try blocks appropriately post-transform
@@ -1371,6 +1369,8 @@ namespace ExceptionRewriter {
                 //  any remaining catch or filter blocks
                 sourceMethod.Body.ExceptionHandlers.Remove(range.Handler);
             }
+
+			CleanMethodBody (targetMethod, sourceMethod, false);
 
 			return variableMapping;
 		}
@@ -1575,6 +1575,8 @@ namespace ExceptionRewriter {
         }
 
         private void StripUnreferencedNops (MethodDefinition method) {
+            return;
+
             var referenced = new HashSet<Instruction> ();
 
             foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1898,7 +1900,7 @@ namespace ExceptionRewriter {
                 for (int l = 0; l < h.LeaveTargets.Count; l++)
                     switchTargets[l + 1] = Instruction.Create (OpCodes.Leave, h.LeaveTargets[l]);
 
-                switchTargets[switchTargets.Length - 1] = Instruction.Create (OpCodes.Ldstr, "what");
+                switchTargets[switchTargets.Length - 1] = Instruction.Create (OpCodes.Nop);
 
                 // Use the return value from the handler to select one of the targets we just created
                 newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
@@ -2208,7 +2210,7 @@ namespace ExceptionRewriter {
                 : "Instruction";
 
             // FIXME
-            if (false) {
+            if (true) {
 			    if (method.Body.Instructions.IndexOf (insn) < 0)
 				    throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
 			    else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
@@ -2503,17 +2505,21 @@ namespace ExceptionRewriter {
 				    if (!mapping.TryGetValue(operand, out newOperand)) {
 						throw new Exception ("Could not remap instruction operand for " + insn);
 				    } else {
-					    newInsn = Instruction.Create (insn.OpCode, newOperand);
+                        insn.Operand = newOperand;
 				    }
-    				target[i] = newInsn;
                 } else if (operands != null) {
+                    var newOperands = new Instruction[operands.Length];
                     for (int j = 0; j < operands.Length; j++) {
                         Instruction newElt, elt = operands[j];
-                        if (!mapping.TryGetValue(elt, out newElt))
+                        if (!mapping.TryGetValue (elt, out newElt))
                             throw new Exception ($"Switch target {elt} not found in table of cloned instructions");
 
-                        operands[j] = newElt;
+                        var index = target.IndexOf (newElt);
+                        if (index < 0)
+                            throw new Exception ($"New switch target {newElt} not found in output method");
+                        newOperands[j] = newElt;
                     }
+                    insn.Operand = newOperands;
                 } else
                     continue;
 			}
