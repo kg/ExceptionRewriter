@@ -227,6 +227,7 @@ namespace ExceptionRewriter {
                 g.TryStart = Patch (g.TryStart, old, replacement);
                 g.TryEnd = Patch (g.TryEnd, old, replacement);
                 g.TryEndPredecessor = Patch (g.TryEndPredecessor, old, replacement);
+                g.ExitPoint = Patch (g.ExitPoint, old, replacement);
 
                 foreach (var h in g.Blocks) {
                     for (int l = 0; l < h.LeaveTargets.Count; l++)
@@ -297,6 +298,7 @@ namespace ExceptionRewriter {
                 g.TryStart = Patch (g.TryStart, pairs);
                 g.TryEnd = Patch (g.TryEnd, pairs);
                 g.TryEndPredecessor = Patch (g.TryEndPredecessor, pairs);
+                g.ExitPoint = Patch (g.ExitPoint, pairs);
 
                 foreach (var h in g.Blocks) {
                     for (int l = 0; l < h.LeaveTargets.Count; l++)
@@ -1386,6 +1388,7 @@ namespace ExceptionRewriter {
 
             public readonly int ID;
 			public Instruction TryStart, TryEnd, TryEndPredecessor, OriginalTryEndPredecessor;
+            public Instruction ExitPoint, OriginalExitPoint;
 			public List<ExcBlock> Blocks = new List<ExcBlock> ();
 			internal Instruction FirstPushInstruction;
 
@@ -1632,6 +1635,27 @@ namespace ExceptionRewriter {
             });
         }
 
+        private void ComputeExitPoint (ExcGroup excGroup) {
+            switch (excGroup.OriginalTryEndPredecessor.OpCode.Code) {
+                case Code.Throw:
+                case Code.Rethrow:
+                    excGroup.ExitPoint = 
+                        excGroup.OriginalExitPoint = null;
+                    break;
+                case Code.Leave:
+                case Code.Leave_S:
+                    excGroup.ExitPoint = (excGroup.TryEndPredecessor.Operand as Instruction) ?? 
+                        (excGroup.OriginalTryEndPredecessor.Operand as Instruction) ??
+                        excGroup.ExitPoint;
+                    excGroup.OriginalExitPoint = (excGroup.OriginalTryEndPredecessor.Operand as Instruction) ??
+                        excGroup.OriginalExitPoint;
+                    break;
+                default:
+                    throw new Exception("Try block does not end with a leave or throw instruction");
+                    break;
+            }
+        }
+
         private void ExtractFiltersAndCatchBlocks (
             MethodDefinition method, TypeReference efilt, 
             ParameterDefinition fakeThis, VariableDefinition closure, 
@@ -1664,22 +1688,7 @@ namespace ExceptionRewriter {
 
             foreach (var eg in excGroups) {
                 var excGroup = eg.excGroup;
-                Instruction exitPoint;
-
-                switch (excGroup.OriginalTryEndPredecessor.OpCode.Code) {
-                    case Code.Throw:
-                    case Code.Rethrow:
-                        exitPoint = null;
-                        break;
-                    case Code.Leave:
-                    case Code.Leave_S:
-                        exitPoint = (excGroup.TryEndPredecessor.Operand as Instruction) ?? 
-                            (excGroup.OriginalTryEndPredecessor.Operand as Instruction);
-                        break;
-                    default:
-                        throw new Exception("Try block does not end with a leave or throw instruction");
-                        break;
-                }
+                ComputeExitPoint(excGroup);
 
                 foreach (var eh in eg.group) {
                     var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
@@ -1718,24 +1727,10 @@ namespace ExceptionRewriter {
                     teardownInstructions.Add (teardownEnclosureLeaveTarget);
 
                     int insertOffset;
-                    if (exitPoint != null) {
-                        // We need to recalculate the exit point because previous steps may have replaced it with a nop.
-                        switch (excGroup.OriginalTryEndPredecessor.OpCode.Code) {
-                            case Code.Throw:
-                            case Code.Rethrow:
-                                exitPoint = null;
-                                break;
-                            case Code.Leave:
-                            case Code.Leave_S:
-                                exitPoint = (excGroup.TryEndPredecessor.Operand as Instruction) ?? 
-                                    (excGroup.OriginalTryEndPredecessor.Operand as Instruction);
-                                break;
-                            default:
-                                throw new Exception("Try block does not end with a leave or throw instruction");
-                                break;
-                        }
+                    ComputeExitPoint(excGroup);
 
-                        insertOffset = insns.IndexOf (exitPoint);
+                    if (excGroup.ExitPoint != null) {
+                        insertOffset = insns.IndexOf (excGroup.ExitPoint);
                         if (insertOffset < 0)
                             throw new Exception ("Exit point not found");
                     } else {
@@ -1751,7 +1746,7 @@ namespace ExceptionRewriter {
                 var newStart = Nop ("Constructed handler start");
 
                 newHandler.Add (newStart);
-                ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, exitPoint);
+                ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, excGroup.ExitPoint);
 
                 var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
@@ -2215,24 +2210,20 @@ namespace ExceptionRewriter {
 			}
 		}
 
-        private void CheckInRange (Instruction insn, MethodDefinition method, MethodDefinition oldMethod, List<Instruction> removedInstructions) {
+        private void CheckInRange (Instruction insn, MethodDefinition method, MethodDefinition oldMethod, string context = "") {
             if (insn == null)
                 return;
-
-            var s = ((removedInstructions != null) && removedInstructions.Contains(insn))
-                ? "Removed instruction"
-                : "Instruction";
 
             // FIXME
             if (true) {
 			    if (method.Body.Instructions.IndexOf (insn) < 0)
-				    throw new Exception ($"{s} {insn} is missing from method {method.FullName}");
+				    throw new Exception ($"Instruction {insn} is missing from method {method.FullName} {context}");
 			    else if (oldMethod != null && oldMethod.Body.Instructions.IndexOf (insn) >= 0)
-				    throw new Exception ($"{s} {insn} is present in old method for method {method.FullName}");
+				    throw new Exception ($"Instruction {insn} is present in old method for method {method.FullName} {context}");
             }
         }
 
-		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify, List<Instruction> removedInstructions = null) 
+		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify) 
 		{
 			var insns = method.Body.Instructions;
 
@@ -2278,7 +2269,7 @@ namespace ExceptionRewriter {
 				var opVar = i.Operand as VariableDefinition;
 
 				if (opInsn != null) {
-                    CheckInRange(opInsn, method, oldMethod, removedInstructions);
+                    CheckInRange(opInsn, method, oldMethod, $"(operand of {i.OpCode} instruction)");
 
                     /*
                     if ((i.OpCode.Code == Code.Leave) || (i.OpCode.Code == Code.Leave_S)) {
@@ -2301,7 +2292,7 @@ namespace ExceptionRewriter {
 						throw new Exception ($"Local {opVar} for opcode {i} is present in old method for method {method.FullName}");
 				} else if (opInsns != null) {
                     foreach (var target in opInsns)
-                        CheckInRange(target, method, oldMethod, removedInstructions);
+                        CheckInRange(target, method, oldMethod, $"(operand of {i.OpCode} instruction)");
                 }
 			}
 
@@ -2317,11 +2308,11 @@ namespace ExceptionRewriter {
 
             if (verify)
             foreach (var eh in method.Body.ExceptionHandlers) {
-                CheckInRange(eh.HandlerStart, method, oldMethod, removedInstructions);
-                CheckInRange(eh.HandlerEnd, method, oldMethod, removedInstructions);
-                CheckInRange(eh.FilterStart, method, oldMethod, removedInstructions);
-                CheckInRange(eh.TryStart, method, oldMethod, removedInstructions);
-                CheckInRange(eh.TryEnd, method, oldMethod, removedInstructions);
+                CheckInRange(eh.HandlerStart, method, oldMethod, "(handler start)");
+                CheckInRange(eh.HandlerEnd, method, oldMethod, "(handler end)");
+                CheckInRange(eh.FilterStart, method, oldMethod, "(filter start)");
+                CheckInRange(eh.TryStart, method, oldMethod, "(try start)");
+                CheckInRange(eh.TryEnd, method, oldMethod, "(try end)");
 
                 if (eh.TryStart != null) {
                     var tryStartIndex = insns.IndexOf(eh.TryStart);
