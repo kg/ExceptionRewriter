@@ -1719,6 +1719,22 @@ namespace ExceptionRewriter {
 
                     int insertOffset;
                     if (exitPoint != null) {
+                        // We need to recalculate the exit point because previous steps may have replaced it with a nop.
+                        switch (excGroup.OriginalTryEndPredecessor.OpCode.Code) {
+                            case Code.Throw:
+                            case Code.Rethrow:
+                                exitPoint = null;
+                                break;
+                            case Code.Leave:
+                            case Code.Leave_S:
+                                exitPoint = (excGroup.TryEndPredecessor.Operand as Instruction) ?? 
+                                    (excGroup.OriginalTryEndPredecessor.Operand as Instruction);
+                                break;
+                            default:
+                                throw new Exception("Try block does not end with a leave or throw instruction");
+                                break;
+                        }
+
                         insertOffset = insns.IndexOf (exitPoint);
                         if (insertOffset < 0)
                             throw new Exception ("Exit point not found");
@@ -1747,7 +1763,7 @@ namespace ExceptionRewriter {
                 var endOffset = insns.IndexOf(newHandler[newHandler.Count - 1]);
                 var newEnd = insns[endOffset + 1];
 
-                var newEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
+                var catchEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
                     CatchType = method.Module.TypeSystem.Object,
                     HandlerStart = newStart,
                     HandlerEnd = newEnd,
@@ -1755,7 +1771,6 @@ namespace ExceptionRewriter {
                     TryEnd = newStart,
                     FilterStart = null
                 };
-                method.Body.ExceptionHandlers.Add (newEh);
 
                 // Ensure we initialize and activate all exception filters for the try block before entering it
                 foreach (var eh in excGroup.Blocks) {
@@ -1776,6 +1791,7 @@ namespace ExceptionRewriter {
                     HandlerEnd = teardownEpilogue
                 };
 
+                method.Body.ExceptionHandlers.Add (catchEh);
                 method.Body.ExceptionHandlers.Add (teardownEh);
 
                 foreach (var eh in eg.@group)
@@ -1894,13 +1910,11 @@ namespace ExceptionRewriter {
                 // Either rethrow or leave depending on the value returned by the handler
                 var rethrow = Instruction.Create (OpCodes.Rethrow);
                 // Create instructions for handling each possible leave target (in addition to 0 which is rethrow)
-                var switchTargets = new Instruction[h.LeaveTargets.Count + 2];
+                var switchTargets = new Instruction[h.LeaveTargets.Count + 1];
                 switchTargets[0] = rethrow;
 
                 for (int l = 0; l < h.LeaveTargets.Count; l++)
                     switchTargets[l + 1] = Instruction.Create (OpCodes.Leave, h.LeaveTargets[l]);
-
-                switchTargets[switchTargets.Length - 1] = Instruction.Create (OpCodes.Nop);
 
                 // Use the return value from the handler to select one of the targets we just created
                 newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
@@ -2224,6 +2238,8 @@ namespace ExceptionRewriter {
 
 			for (int idx = 0; idx < insns.Count; idx++) {
                 var i = insns[idx];
+                if (i.OpCode.Code == Code.Nop)
+                    continue;
 
 				OpCode newOpcode;
 				if (ShortFormRemappings.TryGetValue (i.OpCode.Code, out newOpcode))
@@ -2503,7 +2519,8 @@ namespace ExceptionRewriter {
                 if (operand != null) {
                     Instruction newOperand, newInsn;
 				    if (!mapping.TryGetValue(operand, out newOperand)) {
-						throw new Exception ("Could not remap instruction operand for " + insn);
+                        if (insn.OpCode.Code != Code.Nop)
+						    throw new Exception ("Could not remap instruction operand for " + insn);
 				    } else {
                         insn.Operand = newOperand;
 				    }
