@@ -203,6 +203,8 @@ namespace ExceptionRewriter {
 
 		private void Patch (MethodDefinition method, RewriteContext context, Instruction old, Instruction replacement) 
 		{
+            context.ReplacedInstructions[old] = replacement;
+
 			var body = method.Body.Instructions;
 			for (int i = 0; i < body.Count; i++) {
 				if (body[i].Operand == old)
@@ -271,6 +273,9 @@ namespace ExceptionRewriter {
 
 		private void PatchMany (MethodDefinition method, RewriteContext context, Dictionary<Instruction, Instruction> pairs) 
         {
+            foreach (var kvp in pairs)
+                context.ReplacedInstructions[kvp.Key] = kvp.Value;
+
 			var body = method.Body.Instructions;
             Instruction replacement;
 
@@ -1286,10 +1291,10 @@ namespace ExceptionRewriter {
                 };
 
                 int
-                    tryStartIndex = insns.IndexOf(eh.TryStart),
-                    tryEndIndex = insns.IndexOf(eh.TryEnd),
-                    handlerStartIndex = insns.IndexOf(eh.HandlerStart),
-                    handlerEndIndex = insns.IndexOf(eh.HandlerEnd);
+                    tryStartIndex = Find(context, insns, eh.TryStart),
+                    tryEndIndex = Find(context, insns, eh.TryEnd),
+                    handlerStartIndex = Find(context, insns, eh.HandlerStart),
+                    handlerEndIndex = Find(context, insns, eh.HandlerEnd);
 
                 range.MinIndex = Math.Min(tryStartIndex, handlerStartIndex);
                 range.MaxIndex = Math.Max(tryEndIndex, handlerEndIndex);
@@ -1381,6 +1386,7 @@ namespace ExceptionRewriter {
             public List<InstructionPair> Pairs;
             public List<ExcGroup> NewGroups = new List<ExcGroup>();
             public List<FilterToInsert> FiltersToInsert = new List<FilterToInsert>();
+            public Dictionary<Instruction, Instruction> ReplacedInstructions = new Dictionary<Instruction, Instruction>();
         }
 
 		public class ExcGroup {
@@ -1656,6 +1662,22 @@ namespace ExceptionRewriter {
             }
         }
 
+        private int Find (RewriteContext ctx, Collection<Instruction> insns, Instruction instruction) {
+            var result = insns.IndexOf(instruction);
+
+            if (result < 0) {
+                Instruction newInstruction;
+                while (ctx.ReplacedInstructions.TryGetValue(instruction, out newInstruction)) {
+                    result = insns.IndexOf(newInstruction);
+                    if (result >= 0)
+                        return result;
+                    instruction = newInstruction;
+                }
+            }
+
+            return result;
+        }
+
         private void ExtractFiltersAndCatchBlocks (
             MethodDefinition method, TypeReference efilt, 
             ParameterDefinition fakeThis, VariableDefinition closure, 
@@ -1670,7 +1692,7 @@ namespace ExceptionRewriter {
             var excGroups = (from @group in groups
                              let a = @group.Key.A
                              let b = @group.Key.B
-                             let endIndex = insns.IndexOf(b)
+                             let endIndex = Find(context, insns, b)
                              let predecessor = insns[endIndex - 1]
                              select new {
                                  @group,
@@ -1727,12 +1749,15 @@ namespace ExceptionRewriter {
                     teardownInstructions.Add (teardownEnclosureLeaveTarget);
 
                     int insertOffset;
-                    ComputeExitPoint(excGroup);
 
                     if (excGroup.ExitPoint != null) {
-                        insertOffset = insns.IndexOf (excGroup.ExitPoint);
+                        insertOffset = Find (context, insns, excGroup.ExitPoint);
                         if (insertOffset < 0)
-                            throw new Exception ("Exit point not found");
+                            ComputeExitPoint(excGroup);
+
+                        insertOffset = Find (context, insns, excGroup.ExitPoint);
+                        if (insertOffset < 0)
+                            throw new Exception ($"Exit point not found: {excGroup.ExitPoint}");
                     } else {
                         var nextInsn = (from eh in eg.@group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First();
                         insertOffset = insns.IndexOf (nextInsn);
@@ -1748,14 +1773,14 @@ namespace ExceptionRewriter {
                 newHandler.Add (newStart);
                 ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, excGroup.ExitPoint);
 
-                var targetIndex = insns.IndexOf(excGroup.TryEndPredecessor);
+                var targetIndex = Find(context, insns, excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
                     throw new Exception ("Failed to find TryEndPredecessor");
                 targetIndex += 1;
 
                 InsertOps (insns, targetIndex, newHandler.ToArray());
 
-                var endOffset = insns.IndexOf(newHandler[newHandler.Count - 1]);
+                var endOffset = Find(context, insns, newHandler[newHandler.Count - 1]);
                 var newEnd = insns[endOffset + 1];
 
                 var catchEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
@@ -1773,7 +1798,7 @@ namespace ExceptionRewriter {
                         continue;
 
                     var filterInitInstructions = InitializeExceptionFilter(method, eh.FilterType, eh.FilterVariable, closure);
-                    var insertOffset = insns.IndexOf(excGroup.TryStart);
+                    var insertOffset = Find(context, insns, excGroup.TryStart);
                     InsertOps(insns, insertOffset, filterInitInstructions);
                 }
 
@@ -1941,7 +1966,7 @@ namespace ExceptionRewriter {
             var newGroups = context.NewGroups;
             var filtersToInsert = context.FiltersToInsert;
 
-            var endIndex = insns.IndexOf(group.Key.B);
+            var endIndex = Find(context, insns, group.Key.B);
             if (endIndex < 0)
                 throw new Exception($"End instruction {group.Key.B} not found in method body");
             var excGroup = new ExcGroup {
