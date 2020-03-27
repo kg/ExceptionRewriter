@@ -12,6 +12,7 @@ namespace ExceptionRewriter {
         public bool Mono = false;
 		public bool EnableGenerics = false;
 		public bool Verbose = false;
+        public bool Audit = false;
 		public bool AbortOnError = true;
 		public bool EnableSymbols = false;
 		internal bool Overwrite;
@@ -1527,7 +1528,12 @@ namespace ExceptionRewriter {
 				}
 			}
 
-			if (Options.Verbose)
+            if (Options.Audit) {
+				Console.WriteLine ($"{method.FullName} contains {method.Body.ExceptionHandlers.Count(eh => eh.FilterStart != null)} exception filter(s)");
+                return 0;
+            }
+
+            if (Options.Verbose)
 				Console.WriteLine ($"Rewriting {method.FullName}");
 
 			try {
