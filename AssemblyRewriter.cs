@@ -794,7 +794,9 @@ namespace ExceptionRewriter {
 			int firstIndex, int lastIndex, RewriteContext context,
             Func<Instruction, Instruction[]> filter
 		) {
-			var remapTableFirst = new Dictionary<Instruction, Instruction> ();
+			CleanMethodBody (method, null, true);
+
+            var remapTableFirst = new Dictionary<Instruction, Instruction> ();
 			var remapTableLast = new Dictionary<Instruction, Instruction> ();
 			var instructions = method.Body.Instructions;
 
@@ -830,14 +832,22 @@ namespace ExceptionRewriter {
                 }
 
 				var operand = insn.Operand as Instruction;
-				if (operand == null)
-					continue;
+                var operandInsns = insn.Operand as Instruction[];
+                if (operandInsns != null) {
+                    var newInsns = new Instruction[operandInsns.Length];
+                    for (int j = 0; j < newInsns.Length; j++) {
+                        if (!remapTableFirst.TryGetValue(operandInsns[j], out newInsns[j]))
+                            newInsns[j] = operandInsns[j];
+                    }
 
-				Instruction newOperand;
-				if (!remapTableFirst.TryGetValue (operand, out newOperand))
-					continue;
+                    insn.Operand = newInsns;
+                } else if (operand != null) {
+				    Instruction newOperand;
+				    if (!remapTableFirst.TryGetValue (operand, out newOperand))
+					    continue;
 
-				insn.Operand = newOperand;
+				    insn.Operand = newOperand;
+                }
 			}
 
 			foreach (var eh in method.Body.ExceptionHandlers) {
