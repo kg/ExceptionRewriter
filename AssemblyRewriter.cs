@@ -2250,6 +2250,9 @@ namespace ExceptionRewriter {
 
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify) 
 		{
+            // FIXME
+            verify = false;
+
 			var insns = method.Body.Instructions;
 
 			for (int idx = 0; idx < insns.Count; idx++) {
