@@ -29,9 +29,9 @@ namespace ExceptionRewriter {
 					var src = argv[i];
 					var dst = options.Overwrite || options.Audit ? src : argv[i + 1];
 
-                    if (options.Audit)
+					if (options.Audit)
 						Console.WriteLine ($"{src}{Environment.NewLine}====");
-                    else if (options.Verbose)
+					else if (options.Verbose)
 						Console.WriteLine ($"{Path.GetFileName (src)} -> {Path.GetFullPath (dst)}...{Environment.NewLine}====");
 					else if (argv.Length > step)
 						Console.WriteLine ($"{Path.GetFileName (src)} -> {Path.GetFullPath (dst)}");
@@ -49,25 +49,25 @@ namespace ExceptionRewriter {
 						var arw = new AssemblyRewriter (def, options);
 						int errorCount = arw.Rewrite ();
 
-                        if (!options.Audit) {
-						    if (errorCount > 0 && false) {
-							    Console.Error.WriteLine ($"Not saving due to error(s): {dst}");
-							    exitCode += 1;
-						    } else {
-							    var shouldWriteSymbols = options.EnableSymbols && def.MainModule.SymbolReader != null;
+						if (!options.Audit) {
+							if (errorCount > 0 && false) {
+								Console.Error.WriteLine ($"Not saving due to error(s): {dst}");
+								exitCode += 1;
+							} else {
+								var shouldWriteSymbols = options.EnableSymbols && def.MainModule.SymbolReader != null;
 
-							    def.Write (dst + ".tmp", new WriterParameters {
-								    WriteSymbols = shouldWriteSymbols
-							    });
+								def.Write (dst + ".tmp", new WriterParameters {
+									WriteSymbols = shouldWriteSymbols
+								});
 
-							    File.Copy (dst + ".tmp", dst, true);
-							    if (File.Exists (dst + ".pdb")) {
-								    File.Copy (dst + ".pdb", dst.Replace (".exe", ".pdb"), true);
-								    File.Delete (dst + ".pdb");
-							    }
-							    File.Delete (dst + ".tmp");
-						    }
-                        }
+								File.Copy (dst + ".tmp", dst, true);
+								if (File.Exists (dst + ".pdb")) {
+									File.Copy (dst + ".pdb", dst.Replace (".exe", ".pdb"), true);
+									File.Delete (dst + ".pdb");
+								}
+								File.Delete (dst + ".tmp");
+							}
+						}
 					}
 
 				}
@@ -87,15 +87,15 @@ namespace ExceptionRewriter {
 				return;
 
 			switch (arg) {
-                case "--audit":
-                    options.Audit = true;
-                    options.AbortOnError = false;
-                    options.Verbose = true;
-                    options.EnableGenerics = true;
-                    break;
-                case "--mono":
-                    options.Mono = true;
-                    break;
+				case "--audit":
+					options.Audit = true;
+					options.AbortOnError = false;
+					options.Verbose = true;
+					options.EnableGenerics = true;
+					break;
+				case "--mono":
+					options.Mono = true;
+					break;
 				case "--overwrite":
 					options.Overwrite = true;
 					break;
