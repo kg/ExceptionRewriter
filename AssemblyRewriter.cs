@@ -1667,6 +1667,14 @@ namespace ExceptionRewriter {
             }
         }
 
+        private Instruction Branch (RewriteContext ctx, OpCode opCode, Instruction target) {
+            Instruction newTarget;
+            while (ctx.ReplacedInstructions.TryGetValue(target, out newTarget))
+                target = newTarget;
+
+            return Instruction.Create(opCode, target);
+        }
+
         private int Find (RewriteContext ctx, Collection<Instruction> insns, Instruction instruction) {
             var result = insns.IndexOf(instruction);
 
@@ -1726,7 +1734,7 @@ namespace ExceptionRewriter {
                 }
 
                 var teardownEnclosureLeaveTarget = Nop ("Leave target outside of teardown");
-                var teardownEnclosureLeave = Instruction.Create (OpCodes.Leave, teardownEnclosureLeaveTarget);
+                var teardownEnclosureLeave = Branch (context, OpCodes.Leave, teardownEnclosureLeaveTarget);
                 var teardownPrologue = Nop ("Beginning of teardown");
                 var teardownEpilogue = Nop ("End of teardown");
 
@@ -1776,7 +1784,7 @@ namespace ExceptionRewriter {
                 var newStart = Nop ("Constructed handler start");
 
                 newHandler.Add (newStart);
-                ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, excGroup.ExitPoint);
+                ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, excGroup.ExitPoint, context);
 
                 var targetIndex = Find(context, insns, excGroup.TryEndPredecessor);
                 if (targetIndex < 0)
@@ -1873,7 +1881,7 @@ namespace ExceptionRewriter {
         private void ConstructNewExceptionHandler (
             MethodDefinition method, IGrouping<InstructionPair, ExceptionHandler> group, 
             ExcGroup excGroup, List<Instruction> newInstructions, VariableDefinition closureVar,
-            Instruction exitPoint
+            Instruction exitPoint, RewriteContext context
         ) {
             var excVar = new VariableDefinition (method.Module.TypeSystem.Object);
             method.Body.Variables.Add(excVar);
@@ -1939,7 +1947,7 @@ namespace ExceptionRewriter {
                 switchTargets[0] = rethrow;
 
                 for (int l = 0; l < h.LeaveTargets.Count; l++)
-                    switchTargets[l + 1] = Instruction.Create (OpCodes.Leave, h.LeaveTargets[l]);
+                    switchTargets[l + 1] = Branch (context, OpCodes.Leave, h.LeaveTargets[l]);
 
                 // Use the return value from the handler to select one of the targets we just created
                 newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
@@ -1955,8 +1963,8 @@ namespace ExceptionRewriter {
 
             newInstructions.Add(
                 exitPoint != null
-                    ? Instruction.Create(OpCodes.Leave, exitPoint)
-                    : Instruction.Create(OpCodes.Rethrow)
+                    ? Branch (context, OpCodes.Leave, exitPoint)
+                    : Instruction.Create (OpCodes.Rethrow)
             );
         }
 
