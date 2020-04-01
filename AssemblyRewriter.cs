@@ -686,6 +686,12 @@ namespace ExceptionRewriter {
 			foreach (var kvp in extractedVariables)
 				closureTypeDefinition.Fields.Add (kvp.Value);
 
+			var stashVariables = new Dictionary<ParameterDefinition, VariableDefinition> ();
+			foreach (var pd in method.Parameters) {
+				stashVariables[pd] = new VariableDefinition(pd.ParameterType);
+				method.Body.Variables.Add(stashVariables[pd]);
+			}
+
 			FilterRange (
 				method, 0, insns.Count - 1, context, (insn) => {
 					var variable = (insn.Operand as VariableDefinition) 
@@ -709,11 +715,23 @@ namespace ExceptionRewriter {
 						// HACK: Because we have no way to swap values on the stack, we have to keep the
 						//  existing local but use it as a temporary store point before flushing into the
 						//  closure
+						VariableDefinition stashVariable = null;
 						Instruction reload;
+
+						// FIXME: We can't reuse an argument as a temporary store point, we need to create a temporary
+						if ((insn.OpCode.Code == Code.Starg) || (insn.OpCode.Code == Code.Starg_S))
+							;
+
 						if (variable != null)
 							reload = Instruction.Create (OpCodes.Ldloc, variable);
-						else
-							reload = Instruction.Create (OpCodes.Ldarg, arg);
+						else {
+							stashVariable = stashVariables[arg];
+							reload = Instruction.Create (OpCodes.Ldloc, stashVariable);
+							insn.OpCode = OpCodes.Stloc;
+							insn.Operand = stashVariable;
+						}
+
+						;
 
 						return new[] {
 							insn, 
@@ -725,7 +743,9 @@ namespace ExceptionRewriter {
 						var newInsn = Instruction.Create (OpCodes.Ldloc, closureVar);
 						var loadOp =
 							((insn.OpCode.Code == Code.Ldloca) ||
-							(insn.OpCode.Code == Code.Ldloca_S))
+							(insn.OpCode.Code == Code.Ldloca_S) ||
+							(insn.OpCode.Code == Code.Ldarga) ||
+							(insn.OpCode.Code == Code.Ldarga_S))
 								? OpCodes.Ldflda
 								: OpCodes.Ldfld;
 						return new[] {
@@ -962,8 +982,6 @@ namespace ExceptionRewriter {
 			var handlerFirstIndex = insns.IndexOf (eh.HandlerStart);
 			var handlerLastIndex = insns.IndexOf (eh.HandlerEnd) - 1;
 
-			Console.WriteLine($"Extracting catch [{eh.HandlerStart}] - [{insns[handlerLastIndex]}]");
-
 			// CHANGE #4: Adding method earlier
 			method.DeclaringType.Methods.Add (catchMethod);
 
@@ -987,6 +1005,10 @@ namespace ExceptionRewriter {
 				// FIXME: Identify when we want to preserve control flow and when we don't
 				preserveControlFlow: false,
 				filter: (insn, range) => {
+					var operandParameter = insn.Operand as ParameterDefinition;
+					if ((operandParameter != null) && !operandParameter.Name.Contains("closure"))
+						;
+
 					var operandTr = insn.Operand as TypeReference;
 					if (operandTr != null) {
 						var newOperandTr = FilterTypeReference (operandTr, gpMapping);
@@ -1193,8 +1215,6 @@ namespace ExceptionRewriter {
 				throw new Exception("Filter did not end with an endfilter");
 
 			{
-				Console.WriteLine($"Extracting filter [{eh.FilterStart}] - [{endfilter}]");
-
 				var variableMapping = new Dictionary<object, object> ();
 				var newVariables = ExtractRangeToMethod (
 					method, filterMethod, fakeThis, i1, i2 - 1, 
@@ -1285,6 +1305,16 @@ namespace ExceptionRewriter {
 		{
 			var insns = sourceMethod.Body.Instructions;
 			var targetInsns = targetMethod.Body.Instructions;
+
+			foreach (var param in sourceMethod.Parameters) {
+				if (variableMapping.ContainsKey (param))
+					continue;
+
+				// FIXME: A parameter being referenced when the range is extracted indicates that something went wrong,
+				//  so this is for diagnostic purposes
+				var newParam = new ParameterDefinition ("dead_" + param.Name, param.Attributes, param.ParameterType);
+				variableMapping[param] = newParam;
+			}
 
 			foreach (var loc in sourceMethod.Body.Variables) {
 				if (variableMapping.ContainsKey (loc))
@@ -1573,11 +1603,11 @@ namespace ExceptionRewriter {
 				? null
 				: new ParameterDefinition("__this", ParameterAttributes.None, method.DeclaringType);
 
+			var context = new RewriteContext ();
+
 			var filterReferencedVariables = new HashSet<VariableReference>();
 			var filterReferencedArguments = new HashSet<ParameterReference>();
-			CollectReferencedLocals(method, fakeThis, filterReferencedVariables, filterReferencedArguments);
-
-			var context = new RewriteContext ();
+			CollectReferencedLocals (context, method, fakeThis, filterReferencedVariables, filterReferencedArguments);
 
 			var closure = ConvertToClosure(
 				method, fakeThis, filterReferencedVariables, filterReferencedArguments,
@@ -1985,25 +2015,25 @@ namespace ExceptionRewriter {
 		}
 
 		private void CollectReferencedLocals (
-			MethodDefinition method, ParameterDefinition fakeThis, 
+			RewriteContext context, MethodDefinition method, ParameterDefinition fakeThis, 
 			HashSet<VariableReference> referencedVariables, HashSet<ParameterReference> referencedArguments
 		) {
 			foreach (var eh in method.Body.ExceptionHandlers) {
 				if (eh.FilterStart != null)
-					CollectReferencedLocals (method, fakeThis, eh.FilterStart, eh.HandlerStart, referencedVariables, referencedArguments);
+					CollectReferencedLocals (context, method, fakeThis, eh.FilterStart, eh.HandlerStart, referencedVariables, referencedArguments);
 
 				// Also collect anything referenced by handlers because they get hoisted out
 				// FIXME: Only do this to blocks that have a filter hanging off them
-				CollectReferencedLocals (method, fakeThis, eh.HandlerStart, eh.HandlerEnd, referencedVariables, referencedArguments);
+				CollectReferencedLocals (context, method, fakeThis, eh.HandlerStart, eh.HandlerEnd, referencedVariables, referencedArguments);
 			}
 		}
 
 		private void CollectReferencedLocals (
-			MethodDefinition method, ParameterDefinition fakeThis, Instruction first, Instruction last, 
+			RewriteContext context, MethodDefinition method, ParameterDefinition fakeThis, Instruction first, Instruction last, 
 			HashSet<VariableReference> referencedVariables, HashSet<ParameterReference> referencedArguments
 		) {
 			var insns = method.Body.Instructions;
-			int i = insns.IndexOf (first), i2 = insns.IndexOf (last);
+			int i = Find (context, insns, first), i2 = Find (context, insns, last);
 			if ((i < 0) || (i2 < 0))
 				throw new ArgumentException ("First and/or last instruction(s) not found in method body");
 
@@ -2011,7 +2041,7 @@ namespace ExceptionRewriter {
 				var insn = insns[i];
 				var vd = (insn.Operand as VariableReference) 
 					?? LookupNumberedVariable (insn.OpCode.Code, method.Body.Variables); 
-				var pd = insn.Operand as ParameterReference
+				var pd = insn.Operand as ParameterDefinition
 					?? LookupNumberedArgument (insn.OpCode.Code, fakeThis, method.Parameters);
 
 				// FIXME
