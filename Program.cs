@@ -30,11 +30,11 @@ namespace ExceptionRewriter {
 					var dst = options.Overwrite || options.Audit ? src : argv[i + 1];
 
 					if (options.Audit)
-						Console.WriteLine ($"{src}{Environment.NewLine}====");
+						Console.WriteLine ($"// {src}{Environment.NewLine}====");
 					else if (options.Verbose)
-						Console.WriteLine ($"{Path.GetFileName (src)} -> {Path.GetFullPath (dst)}...{Environment.NewLine}====");
+						Console.WriteLine ($"// {Path.GetFileName (src)} -> {Path.GetFullPath (dst)}...{Environment.NewLine}====");
 					else if (argv.Length > step)
-						Console.WriteLine ($"{Path.GetFileName (src)} -> {Path.GetFullPath (dst)}");
+						Console.WriteLine ($"// {Path.GetFileName (src)} -> {Path.GetFullPath (dst)}");
 
 					var assemblyResolver = new DefaultAssemblyResolver ();
 					assemblyResolver.AddSearchDirectory (Path.GetDirectoryName (src));
@@ -51,7 +51,7 @@ namespace ExceptionRewriter {
 
 						if (!options.Audit) {
 							if (errorCount > 0 && false) {
-								Console.Error.WriteLine ($"Not saving due to error(s): {dst}");
+								Console.Error.WriteLine ($"// Not saving due to error(s): {dst}");
 								exitCode += 1;
 							} else {
 								var shouldWriteSymbols = options.EnableSymbols && def.MainModule.SymbolReader != null;
@@ -70,6 +70,7 @@ namespace ExceptionRewriter {
 						}
 					}
 
+                    Console.WriteLine();
 				}
 
 				return exitCode;

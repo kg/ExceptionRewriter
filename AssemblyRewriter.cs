@@ -1564,14 +1564,15 @@ namespace ExceptionRewriter {
 			}
 
 			if (Options.Verbose)
-				Console.WriteLine ($"Rewriting {method.FullName}");
+				Console.WriteLine ($"// {method.FullName}...");
 
 			try {
 				RewriteMethodImpl (method);
 				return 0;
 			} catch (Exception exc) {
-				Console.Error.WriteLine ($"Error rewriting {method.FullName}:");
+				Console.Error.WriteLine ($"// Error rewriting {method.FullName}:");
 				Console.Error.WriteLine (exc);
+				Console.Error.WriteLine ();
 
 				if (Options.AbortOnError)
 					throw;
@@ -1581,15 +1582,6 @@ namespace ExceptionRewriter {
 		}
 
 		private void RewriteMethodImpl (MethodDefinition method) {
-			if (
-				false &&
-				!method.FullName.Contains("NestedFiltersIn") && 
-				!method.FullName.Contains("Lopsided") &&
-				!method.FullName.Contains("TestReturns") &&
-				!method.FullName.Contains("TestReturnValue")
-			)
-				return;
-
 			// Clean up the method body and verify it before rewriting so that any existing violations of
 			//  expectations aren't erroneously blamed on later transforms
 			CleanMethodBody(method, null, true);
