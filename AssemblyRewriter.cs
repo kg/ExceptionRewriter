@@ -765,12 +765,16 @@ namespace ExceptionRewriter {
 							};
 						}
 					} else {
+						// FIXME: If any of the args are ref/out, we need to generate an epilogue that flushes the closure values
+						//  into the args at function exit
+						var wasRefType = (arg?.ParameterType ?? variable?.VariableType).IsByReference;
 						var newInsn = Instruction.Create(OpCodes.Ldloc, result.ClosureVariable);
 						var loadOp =
 							((insn.OpCode.Code == Code.Ldloca) ||
 							(insn.OpCode.Code == Code.Ldloca_S) ||
 							(insn.OpCode.Code == Code.Ldarga) ||
-							(insn.OpCode.Code == Code.Ldarga_S))
+							(insn.OpCode.Code == Code.Ldarga_S) ||
+							wasRefType)
 								? OpCodes.Ldflda
 								: OpCodes.Ldfld;
 						return new[] {
