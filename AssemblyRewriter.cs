@@ -683,14 +683,24 @@ namespace ExceptionRewriter {
 			if (!isStatic)
 				extractedVariables[fakeThis] = new FieldDefinition ("__this", FieldAttributes.Public, thisType);
 
-			foreach (var kvp in extractedVariables)
+            var setters = new Dictionary<FieldDefinition, MethodDefinition>();
+
+			foreach (var kvp in extractedVariables) {
 				closureTypeDefinition.Fields.Add (kvp.Value);
 
-			var stashVariables = new Dictionary<ParameterDefinition, VariableDefinition> ();
-			foreach (var pd in method.Parameters) {
-				stashVariables[pd] = new VariableDefinition(pd.ParameterType);
-				method.Body.Variables.Add(stashVariables[pd]);
-			}
+                // FIXME: Handle ref/out
+                var paramValue = new ParameterDefinition("value", ParameterAttributes.None, kvp.Value.FieldType);
+                var paramClosure = new ParameterDefinition("closure", ParameterAttributes.None, closureTypeReference);
+                var setMethod = new MethodDefinition("set_" + kvp.Value.Name, MethodAttributes.Static | MethodAttributes.Public, method.Module.TypeSystem.Void) {
+                    Parameters = {
+                        paramValue,
+                        paramClosure
+                    }
+                };
+                closureTypeDefinition.Methods.Add(setMethod);
+
+                setters.Add(kvp.Value, setMethod);
+            }
 
 			FilterRange (
 				method, 0, insns.Count - 1, context, (insn) => {
@@ -712,32 +722,15 @@ namespace ExceptionRewriter {
 						return null;
 
 					if (IsStoreOperation (insn.OpCode.Code)) {
-						// HACK: Because we have no way to swap values on the stack, we have to keep the
-						//  existing local but use it as a temporary store point before flushing into the
-						//  closure
-						VariableDefinition stashVariable = null;
-						Instruction reload;
-
 						// FIXME: We can't reuse an argument as a temporary store point, we need to create a temporary
 						if ((insn.OpCode.Code == Code.Starg) || (insn.OpCode.Code == Code.Starg_S))
 							;
 
-						if (variable != null)
-							reload = Instruction.Create (OpCodes.Ldloc, variable);
-						else {
-							stashVariable = stashVariables[arg];
-							reload = Instruction.Create (OpCodes.Ldloc, stashVariable);
-							insn.OpCode = OpCodes.Stloc;
-							insn.Operand = stashVariable;
-						}
+                        var setter = setters[matchingField];
 
-						;
-
-						return new[] {
-							insn, 
-							Instruction.Create (OpCodes.Ldloc, closureVar),
-							reload,
-							Instruction.Create (OpCodes.Stfld, matchingField)
+                        return new[] {
+                            Instruction.Create (OpCodes.Ldloc, closureVar),
+                            Instruction.Create (OpCodes.Call, setter)
 						};
 					} else {
 						var newInsn = Instruction.Create (OpCodes.Ldloc, closureVar);
@@ -789,6 +782,9 @@ namespace ExceptionRewriter {
 			}
 
 			InsertOps (insns, 0, toInject.ToArray ());
+
+            foreach (var v in variables)
+                method.Body.Variables.Remove((VariableDefinition)v);
 
 			CleanMethodBody (method, null, true);
 
