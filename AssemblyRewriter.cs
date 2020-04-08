@@ -613,51 +613,69 @@ namespace ExceptionRewriter {
 			return ctorMethod;
 		}
 
-		private VariableDefinition ConvertToClosure (
+		public class ClosureInfo {
+			public MethodDefinition Method;
+			public HashSet<VariableReference> Variables;
+			public HashSet<ParameterReference> Parameters;
+
+			public VariableDefinition ClosureVariable;
+			public TypeDefinition TypeDefinition;
+			public TypeReference TypeReference;
+
+			public Dictionary<FieldDefinition, MethodDefinition> Setters = new Dictionary<FieldDefinition, MethodDefinition>();
+			public Dictionary<FieldDefinition, MethodDefinition> RefSetters = new Dictionary<FieldDefinition, MethodDefinition>();
+		}
+
+		private ClosureInfo ConvertToClosure (
 			MethodDefinition method, ParameterDefinition fakeThis, 
 			HashSet<VariableReference> variables, HashSet<ParameterReference> parameters, 
-			out TypeDefinition closureTypeDefinition, out TypeReference closureTypeReference,
 			RewriteContext context
 		) {
+			var result = new ClosureInfo {
+				Method = method,
+				Variables = variables,
+				Parameters = parameters
+			};
+
 			var insns = method.Body.Instructions;
-			closureTypeDefinition = new TypeDefinition (
-				method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString (),
+			result.TypeDefinition = new TypeDefinition(
+				method.DeclaringType.Namespace, method.Name + "__closure" + (ClosureIndex++).ToString(),
 				TypeAttributes.Class | TypeAttributes.NestedPublic
 			);
-			closureTypeDefinition.BaseType = method.Module.TypeSystem.Object;
-			method.DeclaringType.NestedTypes.Add (closureTypeDefinition);
+			result.TypeDefinition.BaseType = method.Module.TypeSystem.Object;
+			method.DeclaringType.NestedTypes.Add(result.TypeDefinition);
 
-			var functionGpMapping = new Dictionary<TypeReference, GenericParameter> ();
-			CopyGenericParameters (method.DeclaringType, closureTypeDefinition, functionGpMapping);
-			CopyGenericParameters (method, closureTypeDefinition, functionGpMapping);
+			var functionGpMapping = new Dictionary<TypeReference, GenericParameter>();
+			CopyGenericParameters(method.DeclaringType, result.TypeDefinition, functionGpMapping);
+			CopyGenericParameters(method, result.TypeDefinition, functionGpMapping);
 
 			var isGeneric = method.DeclaringType.HasGenericParameters || method.HasGenericParameters;
-			var thisGenType = new GenericInstanceType (method.DeclaringType);
+			var thisGenType = new GenericInstanceType(method.DeclaringType);
 			var thisType = isGeneric ? thisGenType : (TypeReference)method.DeclaringType;
-			var genClosureTypeReference = new GenericInstanceType (closureTypeDefinition);
+			var genClosureTypeReference = new GenericInstanceType(result.TypeDefinition);
 
 			foreach (var p in method.DeclaringType.GenericParameters) {
-				thisGenType.GenericArguments.Add (functionGpMapping[p]);
-				genClosureTypeReference.GenericArguments.Add (functionGpMapping[p]);
+				thisGenType.GenericArguments.Add(functionGpMapping[p]);
+				genClosureTypeReference.GenericArguments.Add(functionGpMapping[p]);
 			}
 
 			foreach (var p in method.GenericParameters)
-				genClosureTypeReference.GenericArguments.Add (functionGpMapping[p]);
+				genClosureTypeReference.GenericArguments.Add(functionGpMapping[p]);
 
 			if ((method.DeclaringType.GenericParameters.Count + method.GenericParameters.Count) > 0)
-				closureTypeReference = genClosureTypeReference;
+				result.TypeReference = genClosureTypeReference;
 			else
-				closureTypeReference = closureTypeDefinition;
+				result.TypeReference = result.TypeDefinition;
 
-			var ctorMethod = CreateConstructor (closureTypeDefinition);
+			var ctorMethod = CreateConstructor(result.TypeDefinition);
 
 			var isStatic = method.IsStatic;
 
 			var localCount = 0;
-			var closureVar = new VariableDefinition (closureTypeReference);
+			result.ClosureVariable = new VariableDefinition(result.TypeReference);
 
-			var extractedVariables = variables.ToDictionary (
-				v => (object)v, 
+			var extractedVariables = variables.ToDictionary(
+				v => (object)v,
 				v => {
 					var vd = v.Resolve();
 
@@ -665,52 +683,38 @@ namespace ExceptionRewriter {
 					if ((method.DebugInformation == null) || !method.DebugInformation.TryGetName(vd, out variableName))
 						variableName = "__local_" + method.Body.Variables.IndexOf(vd);
 
-					return new FieldDefinition (variableName, FieldAttributes.Public, FilterTypeReference (v.VariableType, functionGpMapping));
+					return new FieldDefinition(variableName, FieldAttributes.Public, FilterTypeReference(v.VariableType, functionGpMapping));
 				}
 			);
 
-			method.Body.Variables.Add (closureVar);
+			method.Body.Variables.Add(result.ClosureVariable);
 
 			for (int i = 0; i < method.Parameters.Count; i++) {
 				var p = method.Parameters[i];
-				if (!parameters.Contains (p))
+				if (!parameters.Contains(p))
 					continue;
 
 				var name = (p.Name != null) ? "arg_" + p.Name : "arg" + i;
-				extractedVariables[p] = new FieldDefinition (name, FieldAttributes.Public, FilterTypeReference (p.ParameterType, functionGpMapping));
+				var fieldType = FilterTypeReference(p.ParameterType, functionGpMapping);
+				if (fieldType.IsByReference)
+					fieldType = fieldType.GetElementType();
+				extractedVariables[p] = new FieldDefinition(name, FieldAttributes.Public, fieldType);
 			}
 
 			if (!isStatic)
-				extractedVariables[fakeThis] = new FieldDefinition ("__this", FieldAttributes.Public, thisType);
+				extractedVariables[fakeThis] = new FieldDefinition("__this", FieldAttributes.Public, thisType);
 
-            var setters = new Dictionary<FieldDefinition, MethodDefinition>();
-
-			foreach (var kvp in extractedVariables) {
-				closureTypeDefinition.Fields.Add (kvp.Value);
-
-                // FIXME: Handle ref/out
-                var paramValue = new ParameterDefinition("value", ParameterAttributes.None, kvp.Value.FieldType);
-                var paramClosure = new ParameterDefinition("closure", ParameterAttributes.None, closureTypeReference);
-                var setMethod = new MethodDefinition("set_" + kvp.Value.Name, MethodAttributes.Static | MethodAttributes.Public, method.Module.TypeSystem.Void) {
-                    Parameters = {
-                        paramValue,
-                        paramClosure
-                    }
-                };
-                closureTypeDefinition.Methods.Add(setMethod);
-
-                setters.Add(kvp.Value, setMethod);
-            }
+			GenerateSetters (method, result, extractedVariables);
 
 			FilterRange (
 				method, 0, insns.Count - 1, context, (insn) => {
-					var variable = (insn.Operand as VariableDefinition) 
-						?? LookupNumberedVariable (insn.OpCode.Code, method.Body.Variables);
+					var variable = (insn.Operand as VariableDefinition)
+						?? LookupNumberedVariable(insn.OpCode.Code, method.Body.Variables);
 					var arg = (insn.Operand as ParameterDefinition)
-						?? LookupNumberedArgument (insn.OpCode.Code, isStatic ? null : fakeThis, method.Parameters);
+						?? LookupNumberedArgument(insn.OpCode.Code, isStatic ? null : fakeThis, method.Parameters);
 
 					// FIXME
-					if (variable == closureVar)
+					if (variable == result.ClosureVariable)
 						return null;
 
 					if ((variable == null) && (arg == null))
@@ -718,22 +722,33 @@ namespace ExceptionRewriter {
 
 					FieldDefinition matchingField;
 					var lookupKey = (object)variable ?? arg;
-					if (!extractedVariables.TryGetValue (lookupKey, out matchingField))
+					if (!extractedVariables.TryGetValue(lookupKey, out matchingField))
 						return null;
 
-					if (IsStoreOperation (insn.OpCode.Code)) {
+					if (IsStoreOperation(insn.OpCode.Code)) {
 						// FIXME: We can't reuse an argument as a temporary store point, we need to create a temporary
 						if ((insn.OpCode.Code == Code.Starg) || (insn.OpCode.Code == Code.Starg_S))
 							;
 
-                        var setter = setters[matchingField];
+						if ((arg != null) && arg.ParameterType.IsByReference) {
+							// For ref/out parameters, we need to perform a store through into both the closure and the parameter to keep them in sync.
+							var setter = result.RefSetters[matchingField];
 
-                        return new[] {
-                            Instruction.Create (OpCodes.Ldloc, closureVar),
-                            Instruction.Create (OpCodes.Call, setter)
-						};
+							return new[] {
+								Instruction.Create (OpCodes.Ldarga, arg),
+								Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
+								Instruction.Create (OpCodes.Call, setter)
+							};
+						} else {
+							var setter = result.Setters[matchingField];
+
+							return new[] {
+								Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
+								Instruction.Create (OpCodes.Call, setter)
+							};
+						}
 					} else {
-						var newInsn = Instruction.Create (OpCodes.Ldloc, closureVar);
+						var newInsn = Instruction.Create(OpCodes.Ldloc, result.ClosureVariable);
 						var loadOp =
 							((insn.OpCode.Code == Code.Ldloca) ||
 							(insn.OpCode.Code == Code.Ldloca_S) ||
@@ -742,53 +757,117 @@ namespace ExceptionRewriter {
 								? OpCodes.Ldflda
 								: OpCodes.Ldfld;
 						return new[] {
-							newInsn, 
+							newInsn,
 							Instruction.Create (loadOp, matchingField)
 						};
 					}
 				}
 			);
 
-			var ctorRef = new MethodReference (
-				".ctor", method.DeclaringType.Module.TypeSystem.Void, closureTypeReference
+			var ctorRef = new MethodReference(
+				".ctor", method.DeclaringType.Module.TypeSystem.Void, result.TypeReference
 			) {
 				// CallingConvention = MethodCallingConvention.ThisCall,
 				ExplicitThis = false,
 				HasThis = true
 			};
 
-			var toInject = new List<Instruction> () {
+			var toInject = new List<Instruction>() {
 				Instruction.Create (OpCodes.Newobj, ctorRef),
-				Instruction.Create (OpCodes.Stloc, closureVar)
+				Instruction.Create (OpCodes.Stloc, result.ClosureVariable)
 			};
 
 			if (!isStatic) {
-				toInject.AddRange (new[] {
-					Instruction.Create (OpCodes.Ldloc, closureVar),
+				toInject.AddRange(new[] {
+					Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
 					Instruction.Create (OpCodes.Ldarg, fakeThis),
 					Instruction.Create (OpCodes.Stfld, extractedVariables[fakeThis])
 				});
 			}
 
 			foreach (var p in method.Parameters) {
-				if (!parameters.Contains (p))
+				if (!parameters.Contains(p))
 					continue;
 
-				toInject.AddRange (new[] {
-					Instruction.Create (OpCodes.Ldloc, closureVar),
+				toInject.AddRange(new[] {
+					Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
 					Instruction.Create (OpCodes.Ldarg, p),
 					Instruction.Create (OpCodes.Stfld, extractedVariables[p])
 				});
 			}
 
-			InsertOps (insns, 0, toInject.ToArray ());
+			InsertOps(insns, 0, toInject.ToArray());
 
-            foreach (var v in variables)
-                method.Body.Variables.Remove((VariableDefinition)v);
+			foreach (var v in variables)
+				method.Body.Variables.Remove((VariableDefinition)v);
 
-			CleanMethodBody (method, null, true);
+			CleanMethodBody(method, null, true);
 
-			return closureVar;
+			return result;
+		}
+
+		private static void GenerateSetters (MethodDefinition method, ClosureInfo result, Dictionary<object, FieldDefinition> extractedVariables) {
+			foreach (var kvp in extractedVariables) {
+				result.TypeDefinition.Fields.Add(kvp.Value);
+
+				{
+					var paramValue = new ParameterDefinition("value", ParameterAttributes.None, kvp.Value.FieldType);
+					var paramClosure = new ParameterDefinition("closure", ParameterAttributes.None, result.TypeReference);
+					var setMethod = new MethodDefinition("set_" + kvp.Value.Name, MethodAttributes.Static | MethodAttributes.Public, method.Module.TypeSystem.Void) {
+						Parameters = {
+							paramValue,
+							paramClosure
+						}
+					};
+					result.TypeDefinition.Methods.Add(setMethod);
+					result.Setters.Add(kvp.Value, setMethod);
+
+					setMethod.Body = new MethodBody(setMethod);
+					var insns = setMethod.Body.Instructions;
+					insns.Add(Instruction.Create(OpCodes.Ldarg_1));
+					insns.Add(Instruction.Create(OpCodes.Ldarg_0));
+					insns.Add(Instruction.Create(OpCodes.Stfld, kvp.Value));
+					insns.Add(Instruction.Create(OpCodes.Ret));
+				}
+
+				var arg = kvp.Key as ParameterDefinition;
+				if (arg == null)
+					continue;
+
+				if (!arg.ParameterType.IsByReference)
+					continue;
+
+				{
+					var paramValue = new ParameterDefinition("value", ParameterAttributes.None, kvp.Value.FieldType);
+					var wrappedType = kvp.Value.FieldType.IsByReference ? kvp.Value.FieldType : new ByReferenceType(kvp.Value.FieldType);
+					var paramArg = new ParameterDefinition("argument", ParameterAttributes.None, wrappedType);
+					var paramClosure = new ParameterDefinition("closure", ParameterAttributes.None, result.TypeReference);
+					var setMethod = new MethodDefinition("setThru_" + kvp.Value.Name, MethodAttributes.Static | MethodAttributes.Public, method.Module.TypeSystem.Void) {
+						Parameters = {
+							paramValue,
+							paramArg,
+							paramClosure
+						}
+					};
+					result.TypeDefinition.Methods.Add(setMethod);
+					result.RefSetters.Add(kvp.Value, setMethod);
+
+					setMethod.Body = new MethodBody(setMethod);
+					var insns = setMethod.Body.Instructions;
+					insns.Add(Instruction.Create(OpCodes.Ldarg_2));
+					insns.Add(Instruction.Create(OpCodes.Ldarg_0));
+					insns.Add(Instruction.Create(OpCodes.Stfld, kvp.Value));
+					insns.Add(Instruction.Create(OpCodes.Ldarg_1));
+					insns.Add(Instruction.Create(OpCodes.Ldarg_0));
+					insns.Add(Instruction.Create(StindForType(wrappedType)));
+					insns.Add(Instruction.Create(OpCodes.Ret));
+				}
+			}
+		}
+
+		private static OpCode StindForType (TypeReference type) {
+			// FIXME
+			return OpCodes.Stind_Ref;
 		}
 
 		private int CatchCount;
@@ -1584,8 +1663,6 @@ namespace ExceptionRewriter {
 
 			var efilt = GetExceptionFilter(method.Module);
 			var excType = GetException(method.Module);
-			TypeDefinition closureTypeDefinition;
-			TypeReference closureTypeReference;
 
 			var fakeThis = method.IsStatic
 				? null
@@ -1597,9 +1674,8 @@ namespace ExceptionRewriter {
 			var filterReferencedArguments = new HashSet<ParameterReference>();
 			CollectReferencedLocals (context, method, fakeThis, filterReferencedVariables, filterReferencedArguments);
 
-			var closure = ConvertToClosure(
-				method, fakeThis, filterReferencedVariables, filterReferencedArguments,
-				out closureTypeDefinition, out closureTypeReference, context
+			var closureInfo = ConvertToClosure(
+				method, fakeThis, filterReferencedVariables, filterReferencedArguments, context
 			);
 
 			CleanMethodBody(method, null, true);
@@ -1610,7 +1686,7 @@ namespace ExceptionRewriter {
 			insns.Append (Nop ("footer"));
 			*/
 
-			ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closure, insns, context);
+			ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closureInfo.ClosureVariable, insns, context);
 
 			StripUnreferencedNops (method);
 
