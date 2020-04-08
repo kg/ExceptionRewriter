@@ -618,6 +618,7 @@ namespace ExceptionRewriter {
 			public HashSet<VariableReference> Variables;
 			public HashSet<ParameterReference> Parameters;
 
+			public MethodDefinition Constructor;
 			public VariableDefinition ClosureVariable;
 			public TypeDefinition TypeDefinition;
 			public TypeReference TypeReference;
@@ -667,8 +668,6 @@ namespace ExceptionRewriter {
 			else
 				result.TypeReference = result.TypeDefinition;
 
-			var ctorMethod = CreateConstructor(result.TypeDefinition);
-
 			var isStatic = method.IsStatic;
 
 			var localCount = 0;
@@ -704,7 +703,25 @@ namespace ExceptionRewriter {
 			if (!isStatic)
 				extractedVariables[fakeThis] = new FieldDefinition("__this", FieldAttributes.Public, thisType);
 
-			GenerateSetters (method, result, extractedVariables);
+			result.Constructor = CreateConstructor (result.TypeDefinition);
+
+			{
+				var ctorInsns = result.Constructor.Body.Instructions;
+				ctorInsns.RemoveAt(ctorInsns.Count - 1);
+
+				foreach (var param in parameters) {
+					var pd = new ParameterDefinition(param.Name, ParameterAttributes.None, param.ParameterType);
+					result.Constructor.Parameters.Add(pd);
+
+					ctorInsns.Add(Instruction.Create(OpCodes.Ldarg_0));
+					ctorInsns.Add(Instruction.Create(OpCodes.Ldarg, pd));
+					ctorInsns.Add(Instruction.Create(OpCodes.Stfld, extractedVariables[param]));
+				}
+
+				ctorInsns.Add(Instruction.Create(OpCodes.Ret));
+			}
+
+			GenerateClosureSetters (method, result, extractedVariables);
 
 			FilterRange (
 				method, 0, insns.Count - 1, context, (insn) => {
@@ -764,37 +781,14 @@ namespace ExceptionRewriter {
 				}
 			);
 
-			var ctorRef = new MethodReference(
-				".ctor", method.DeclaringType.Module.TypeSystem.Void, result.TypeReference
-			) {
-				// CallingConvention = MethodCallingConvention.ThisCall,
-				ExplicitThis = false,
-				HasThis = true
-			};
+			var toInject = new List<Instruction>();
+			foreach (var param in parameters)
+				toInject.Add(Instruction.Create (OpCodes.Ldarg, (ParameterDefinition)param));
 
-			var toInject = new List<Instruction>() {
-				Instruction.Create (OpCodes.Newobj, ctorRef),
-				Instruction.Create (OpCodes.Stloc, result.ClosureVariable)
-			};
-
-			if (!isStatic) {
-				toInject.AddRange(new[] {
-					Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
-					Instruction.Create (OpCodes.Ldarg, fakeThis),
-					Instruction.Create (OpCodes.Stfld, extractedVariables[fakeThis])
-				});
-			}
-
-			foreach (var p in method.Parameters) {
-				if (!parameters.Contains(p))
-					continue;
-
-				toInject.AddRange(new[] {
-					Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
-					Instruction.Create (OpCodes.Ldarg, p),
-					Instruction.Create (OpCodes.Stfld, extractedVariables[p])
-				});
-			}
+			toInject.AddRange( new[] {
+				Instruction.Create(OpCodes.Newobj, result.Constructor),
+				Instruction.Create(OpCodes.Stloc, result.ClosureVariable)
+			});
 
 			InsertOps(insns, 0, toInject.ToArray());
 
@@ -806,7 +800,7 @@ namespace ExceptionRewriter {
 			return result;
 		}
 
-		private static void GenerateSetters (MethodDefinition method, ClosureInfo result, Dictionary<object, FieldDefinition> extractedVariables) {
+		private static void GenerateClosureSetters (MethodDefinition method, ClosureInfo result, Dictionary<object, FieldDefinition> extractedVariables) {
 			foreach (var kvp in extractedVariables) {
 				result.TypeDefinition.Fields.Add(kvp.Value);
 
