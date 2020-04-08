@@ -1627,8 +1627,6 @@ namespace ExceptionRewriter {
 		}
 
 		private void StripUnreferencedNops (MethodDefinition method) {
-			return;
-
 			var referenced = new HashSet<Instruction> ();
 
 			foreach (var eh in method.Body.ExceptionHandlers) {
