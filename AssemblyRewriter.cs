@@ -1137,11 +1137,10 @@ namespace ExceptionRewriter {
 				}
 			);
 
+			StripUnreferencedNops (catchMethod);
 			CleanMethodBody (catchMethod, method, false);
 
 			if (catchInsns.Count > 0) {
-				var first = catchInsns[0];
-
 				InsertOps (
 					catchInsns, 0, new[] {
 						Instruction.Create (OpCodes.Ldarg, excParam)
@@ -1149,6 +1148,17 @@ namespace ExceptionRewriter {
 				);
 
 				CleanMethodBody (catchMethod, method, true);
+			} else {
+				throw new Exception("Catch body was empty");
+				/*
+				// FIXME
+				InsertOps(
+					catchInsns, 0, new[] {
+						Instruction.Create (OpCodes.Ldc_I4_M1),
+						Instruction.Create (OpCodes.Ret)
+					}
+				);
+				*/
 			}
 
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
