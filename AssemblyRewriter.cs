@@ -796,8 +796,11 @@ namespace ExceptionRewriter {
 
 			InsertOps(insns, 0, toInject.ToArray());
 
+			// FIXME: Removing variables will break any ldloc_n instructions
+			/*
 			foreach (var v in variables)
 				method.Body.Variables.Remove((VariableDefinition)v);
+			*/
 
 			CleanMethodBody(method, null, true);
 
@@ -1076,7 +1079,6 @@ namespace ExceptionRewriter {
 				typeMapping: gpMapping,
 				context: context,
 				// FIXME: Identify when we want to preserve control flow and when we don't
-				preserveControlFlow: false,
 				filter: (insn, range) => {
 					var operandParameter = insn.Operand as ParameterDefinition;
 					if ((operandParameter != null) && !operandParameter.Name.Contains("closure"))
@@ -1149,8 +1151,6 @@ namespace ExceptionRewriter {
 
 				CleanMethodBody (catchMethod, method, true);
 			} else {
-				throw new Exception("Catch body was empty");
-				/*
 				// FIXME
 				InsertOps(
 					catchInsns, 0, new[] {
@@ -1158,7 +1158,6 @@ namespace ExceptionRewriter {
 						Instruction.Create (OpCodes.Ret)
 					}
 				);
-				*/
 			}
 
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
@@ -1302,8 +1301,7 @@ namespace ExceptionRewriter {
 				var newVariables = ExtractRangeToMethod (
 					method, filterMethod, fakeThis, i1, i2 - 1, 
 					variableMapping: variableMapping, typeMapping: gpMapping, 
-					context: context,
-					preserveControlFlow: false
+					context: context
 				);
 				var newClosureLocal = (VariableDefinition)newVariables[closure];
 
@@ -1360,8 +1358,8 @@ namespace ExceptionRewriter {
 		private class EhRange {
 			public ExceptionHandler Handler;
 			public int MinIndex, MaxIndex;
-			public Instruction OldTryStart, OldTryEnd, OldHandlerStart, OldHandlerEnd;
-			public Instruction NewTryStart, NewTryEnd, NewHandlerStart, NewHandlerEnd;
+			public Instruction OldTryStart, OldTryEnd, OldHandlerStart, OldHandlerEnd, OldFilterStart;
+			public Instruction NewTryStart, NewTryEnd, NewHandlerStart, NewHandlerEnd, NewFilterStart;
 		}
 
 		private EhRange FindRangeForOffset (List<EhRange> ranges, int offset) {
@@ -1380,7 +1378,6 @@ namespace ExceptionRewriter {
 			Dictionary<object, object> variableMapping,
 			Dictionary<T, U> typeMapping,
 			RewriteContext context, 
-			bool preserveControlFlow,
 			Func<Instruction, EhRange, Instruction[]> filter = null
 		)
 			where T : TypeReference
@@ -1414,7 +1411,8 @@ namespace ExceptionRewriter {
 					OldTryStart = eh.TryStart,
 					OldTryEnd = eh.TryEnd,
 					OldHandlerStart = eh.HandlerStart,
-					OldHandlerEnd = eh.HandlerEnd
+					OldHandlerEnd = eh.HandlerEnd,
+					OldFilterStart = eh.FilterStart
 				};
 
 				int
@@ -1446,12 +1444,6 @@ namespace ExceptionRewriter {
 				if (oldInsn.OpCode.Code == Code.Nop)
 					continue;
 
-				var isExceptionControlFlow = (oldInsn.OpCode.Code == Code.Rethrow) ||
-					(oldInsn.OpCode.Code == Code.Leave) || (oldInsn.OpCode.Code == Code.Leave_S);
-
-				if (preserveControlFlow && isExceptionControlFlow)
-					continue;
-
 				var nopText = oldInsn.OpCode.Code == Code.Endfilter
 					? "extracted endfilter"
 					: key + oldInsn.ToString();
@@ -1480,16 +1472,10 @@ namespace ExceptionRewriter {
 			// Copy over any exception handlers that were contained by the source range, remapping
 			//  the start/end instructions of the handler and try blocks appropriately post-transform
 			foreach (var range in ranges) {
-				if (
-					(range.Handler.HandlerType != ExceptionHandlerType.Catch) &&
-					(range.Handler.HandlerType != ExceptionHandlerType.Finally)
-				)
-					continue;
-
 				var newEh = new ExceptionHandler (range.Handler.HandlerType) {
 					CatchType = range.Handler.CatchType,
-					FilterStart = null,
 					HandlerType = range.Handler.HandlerType,
+					FilterStart = range.NewFilterStart,
 					HandlerStart = range.NewHandlerStart,
 					HandlerEnd = range.NewHandlerEnd,
 					TryStart = range.NewTryStart,
@@ -1707,6 +1693,9 @@ namespace ExceptionRewriter {
 		}
 
 		private void StripUnreferencedNops (MethodDefinition method) {
+			// FIXME
+			return;
+
 			var referenced = new HashSet<Instruction> ();
 
 			foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1833,6 +1822,9 @@ namespace ExceptionRewriter {
 								 },
 								 endIndex                                 
 							 }).ToList();
+
+			if (method.FullName.Contains("Lopsided"))
+				;
 
 			foreach (var eg in excGroups)
 				context.NewGroups.Add(eg.excGroup);
@@ -2461,6 +2453,7 @@ namespace ExceptionRewriter {
 			foreach (var range in ranges) {
 				UpdateRangeReference(ref range.NewTryStart, range.OldTryStart, oldInsn, firstNewInsn);
 				UpdateRangeReference(ref range.NewHandlerStart, range.OldHandlerStart, oldInsn, firstNewInsn);
+				UpdateRangeReference(ref range.NewFilterStart, range.OldFilterStart, oldInsn, firstNewInsn);
 				UpdateRangeReference(ref range.NewTryEnd, range.OldTryEnd, oldInsn, lastNewInsn);
 				UpdateRangeReference(ref range.NewHandlerEnd, range.OldHandlerEnd, oldInsn, lastNewInsn);
 			}
