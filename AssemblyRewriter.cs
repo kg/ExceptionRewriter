@@ -715,6 +715,8 @@ namespace ExceptionRewriter {
 
 					ctorInsns.Add(Instruction.Create(OpCodes.Ldarg_0));
 					ctorInsns.Add(Instruction.Create(OpCodes.Ldarg, pd));
+					if (pd.ParameterType.IsByReference)
+						ctorInsns.Add(Instruction.Create(SelectLdindForOperand(pd)));
 					ctorInsns.Add(Instruction.Create(OpCodes.Stfld, extractedVariables[param]));
 				}
 
@@ -860,15 +862,10 @@ namespace ExceptionRewriter {
 					insns.Add(Instruction.Create(OpCodes.Stfld, kvp.Value));
 					insns.Add(Instruction.Create(OpCodes.Ldarg_1));
 					insns.Add(Instruction.Create(OpCodes.Ldarg_0));
-					insns.Add(Instruction.Create(StindForType(wrappedType)));
+					insns.Add(Instruction.Create(SelectStindForOperand(wrappedType)));
 					insns.Add(Instruction.Create(OpCodes.Ret));
 				}
 			}
-		}
-
-		private static OpCode StindForType (TypeReference type) {
-			// FIXME
-			return OpCodes.Stind_Ref;
 		}
 
 		private int CatchCount;
@@ -1171,11 +1168,11 @@ namespace ExceptionRewriter {
 			return handler;
 		}
 
-		private OpCode SelectStindForOperand (object operand) 
+		private static OpCode SelectStindForOperand (object operand) 
 		{
 			var vr = operand as VariableReference;
 			var pr = operand as ParameterReference;
-			var operandType = (vr != null) ? vr.VariableType : pr.ParameterType;
+			var operandType = (operand as TypeReference) ?? ((vr != null) ? vr.VariableType : pr.ParameterType);
 
 			switch (operandType.FullName) {
 				case "System.Byte":
@@ -1207,11 +1204,11 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private OpCode SelectLdindForOperand (object operand) 
+		private static OpCode SelectLdindForOperand (object operand) 
 		{
 			var vr = operand as VariableReference;
 			var pr = operand as ParameterReference;
-			var operandType = (vr != null) ? vr.VariableType : pr.ParameterType;
+			var operandType = (operand as TypeReference) ?? ((vr != null) ? vr.VariableType : pr.ParameterType);
 
 			switch (operandType.FullName) {
 				case "System.Byte":
