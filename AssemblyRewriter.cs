@@ -15,6 +15,7 @@ namespace ExceptionRewriter {
 		public bool Audit = false;
 		public bool AbortOnError = true;
 		public bool EnableSymbols = false;
+        public bool Mark = false;
 		internal bool Overwrite;
 	}
 
@@ -58,6 +59,8 @@ namespace ExceptionRewriter {
 			{Code.Starg, OpCodes.Stloc },
 			{Code.Starg_S, OpCodes.Stloc }
 		};
+
+        private Dictionary<MethodDefinition, ClosureInfo> ClosureInfos = new Dictionary<MethodDefinition, ClosureInfo>();
 
 		public AssemblyRewriter (AssemblyDefinition assembly, RewriteOptions options) 
 		{
@@ -157,9 +160,13 @@ namespace ExceptionRewriter {
 
 			foreach (var mod in Assembly.Modules) {
 				// Make temporary copy of the types and methods lists because we mutate them while iterating
-				foreach (var type in mod.GetTypes ())
-					foreach (var meth in type.Methods.ToArray ())
-						errorCount += RewriteMethod (meth);
+				foreach (var type in mod.GetTypes ()) {
+                    var queue = new Queue<MethodDefinition>(type.Methods);
+                    while (queue.Count > 0) {
+                        var meth = queue.Dequeue();
+						errorCount += RewriteMethod (meth, queue);
+                    }
+                }
 			}
 
 			return errorCount;
@@ -619,13 +626,27 @@ namespace ExceptionRewriter {
 			public HashSet<ParameterReference> Parameters;
 
 			public MethodDefinition Constructor;
-			public VariableDefinition ClosureVariable;
+			public object ClosureStorage;
 			public TypeDefinition TypeDefinition;
 			public TypeReference TypeReference;
 
 			public Dictionary<FieldDefinition, MethodDefinition> Setters = new Dictionary<FieldDefinition, MethodDefinition>();
 			public Dictionary<FieldDefinition, MethodDefinition> RefSetters = new Dictionary<FieldDefinition, MethodDefinition>();
-		}
+
+            public ClosureInfo Clone () {
+                return new ClosureInfo {
+                    Method = Method,
+                    Variables = Variables,
+                    Parameters = Parameters,
+                    Constructor = Constructor,
+                    ClosureStorage = null,
+                    TypeDefinition = TypeDefinition,
+                    TypeReference = TypeReference,
+                    Setters = Setters,
+                    RefSetters = RefSetters
+                };
+            }
+        }
 
 		private ClosureInfo ConvertToClosure (
 			MethodDefinition method, ParameterDefinition fakeThis, 
@@ -671,7 +692,8 @@ namespace ExceptionRewriter {
 			var isStatic = method.IsStatic;
 
 			var localCount = 0;
-			result.ClosureVariable = new VariableDefinition(result.TypeReference);
+            var closureVariable = new VariableDefinition(result.TypeReference);
+			result.ClosureStorage = closureVariable;
 
 			var extractedVariables = variables.ToDictionary(
 				v => (object)v,
@@ -686,7 +708,7 @@ namespace ExceptionRewriter {
 				}
 			);
 
-			method.Body.Variables.Add(result.ClosureVariable);
+			method.Body.Variables.Add(closureVariable);
 
 			for (int i = 0; i < method.Parameters.Count; i++) {
 				var p = method.Parameters[i];
@@ -733,7 +755,7 @@ namespace ExceptionRewriter {
 						?? LookupNumberedArgument(insn.OpCode.Code, isStatic ? null : fakeThis, method.Parameters);
 
 					// FIXME
-					if (variable == result.ClosureVariable)
+					if (variable == result.ClosureStorage)
 						return null;
 
 					if ((variable == null) && (arg == null))
@@ -755,14 +777,14 @@ namespace ExceptionRewriter {
 
 							return new[] {
 								Instruction.Create (OpCodes.Ldarga, arg),
-								Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
+								Instruction.Create (OpCodes.Ldloc, (VariableDefinition)result.ClosureStorage),
 								Instruction.Create (OpCodes.Call, setter)
 							};
 						} else {
 							var setter = result.Setters[matchingField];
 
 							return new[] {
-								Instruction.Create (OpCodes.Ldloc, result.ClosureVariable),
+								Instruction.Create (OpCodes.Ldloc, (VariableDefinition)result.ClosureStorage),
 								Instruction.Create (OpCodes.Call, setter)
 							};
 						}
@@ -770,7 +792,7 @@ namespace ExceptionRewriter {
 						// FIXME: If any of the args are ref/out, we need to generate an epilogue that flushes the closure values
 						//  into the args at function exit
 						var wasRefType = (arg?.ParameterType ?? variable?.VariableType).IsByReference;
-						var newInsn = Instruction.Create(OpCodes.Ldloc, result.ClosureVariable);
+						var newInsn = Instruction.Create(OpCodes.Ldloc, (VariableDefinition)result.ClosureStorage);
 						var loadOp =
 							((insn.OpCode.Code == Code.Ldloca) ||
 							(insn.OpCode.Code == Code.Ldloca_S) ||
@@ -793,7 +815,7 @@ namespace ExceptionRewriter {
 
 			toInject.AddRange( new[] {
 				Instruction.Create(OpCodes.Newobj, result.Constructor),
-				Instruction.Create(OpCodes.Stloc, result.ClosureVariable)
+				Instruction.Create(OpCodes.Stloc, (VariableDefinition)result.ClosureStorage)
 			});
 
 			InsertOps(insns, 0, toInject.ToArray());
@@ -1023,11 +1045,12 @@ namespace ExceptionRewriter {
 		/// </summary>
 		private ExcBlock ExtractCatch (
 			MethodDefinition method, ExceptionHandler eh, 
-			VariableDefinition closure, ParameterDefinition fakeThis, 
+			ClosureInfo closureInfo, ParameterDefinition fakeThis, 
 			ExcGroup group, RewriteContext context
 		) {
 			var insns = method.Body.Instructions;
-			var closureType = closure.VariableType;
+            var closure = closureInfo.ClosureStorage;
+            var closureType = closureInfo.TypeReference;
 
 			var catchMethod = new MethodDefinition (
 				method.Name + "__catch" + (CatchCount++),
@@ -1149,12 +1172,8 @@ namespace ExceptionRewriter {
 				CleanMethodBody (catchMethod, method, true);
 			} else {
 				// FIXME
-				InsertOps(
-					catchInsns, 0, new[] {
-						Instruction.Create (OpCodes.Ldc_I4_M1),
-						Instruction.Create (OpCodes.Ret)
-					}
-				);
+                method.DeclaringType.Methods.Remove (catchMethod);
+                catchMethod = null;
 			}
 
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
@@ -1242,14 +1261,31 @@ namespace ExceptionRewriter {
 				(insn.Operand as string == "extracted endfilter");
 		}
 
+        private Instruction GenerateSet (object variableOrParameter) {
+            var loc = variableOrParameter as VariableDefinition;
+            if (loc != null)
+                return Instruction.Create(OpCodes.Stloc, loc);
+            else
+                return Instruction.Create(OpCodes.Starg, (ParameterDefinition)variableOrParameter);
+        }
+
+        private Instruction GenerateLoad (object variableOrParameter) {
+            var loc = variableOrParameter as VariableDefinition;
+            if (loc != null)
+                return Instruction.Create(OpCodes.Ldloc, loc);
+            else
+                return Instruction.Create(OpCodes.Ldarg, (ParameterDefinition)variableOrParameter);
+        }
+
 		private void ExtractFilter (
 			MethodDefinition method, ExceptionHandler eh, 
-			VariableDefinition closure, ParameterDefinition fakeThis, 
+			ClosureInfo closureInfo, ParameterDefinition fakeThis, 
 			ExcGroup group, RewriteContext context,
 			ExcBlock catchBlock
 		) {
 			var insns = method.Body.Instructions;
-			var closureType = closure.VariableType;
+            var closure = closureInfo.ClosureStorage;
+			var closureType = closureInfo.TypeReference;
 			var filterIndex = FilterIndex++;
 			var filterTypeDefinition = new TypeDefinition (
 				method.DeclaringType.Namespace, method.Name + "__filter" + filterIndex.ToString (),
@@ -1300,7 +1336,7 @@ namespace ExceptionRewriter {
 					variableMapping: variableMapping, typeMapping: gpMapping, 
 					context: context
 				);
-				var newClosureLocal = (VariableDefinition)newVariables[closure];
+				var newClosureLocal = newVariables[closure];
 
 				var filterInsns = filterMethod.Body.Instructions;
 				if (filterInsns.Count <= 0)
@@ -1319,7 +1355,7 @@ namespace ExceptionRewriter {
 						// Load the closure from this and store it into our temporary
 						Instruction.Create (OpCodes.Ldarg_0),
 						Instruction.Create (OpCodes.Ldfld, closureField),
-						Instruction.Create (OpCodes.Stloc, newClosureLocal),
+						GenerateSet (newClosureLocal),
 						// Load the exception from arg1 since exception handlers are entered with it on the stack
 						Instruction.Create (OpCodes.Ldarg, excArg)
 					}
@@ -1485,6 +1521,7 @@ namespace ExceptionRewriter {
 				//  because replacing the source instruction range with nops has corrupted
 				//  any remaining catch or filter blocks
 				sourceMethod.Body.ExceptionHandlers.Remove(range.Handler);
+                context.RemovedExceptionHandlers?.Add(range.Handler);
 			}
 
 			CleanMethodBody (targetMethod, sourceMethod, false);
@@ -1497,7 +1534,9 @@ namespace ExceptionRewriter {
 			public List<ExcGroup> NewGroups = new List<ExcGroup>();
 			public List<FilterToInsert> FiltersToInsert = new List<FilterToInsert>();
 			public Dictionary<Instruction, Instruction> ReplacedInstructions = new Dictionary<Instruction, Instruction>();
-		}
+            public List<ExceptionHandler> RemovedExceptionHandlers = new List<ExceptionHandler>();
+            internal Queue<MethodDefinition> MethodQueue;
+        }
 
 		public class ExcGroup {
 			private static int NextID = 0;
@@ -1601,7 +1640,7 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private int RewriteMethod (MethodDefinition method)
+		private int RewriteMethod (MethodDefinition method, Queue<MethodDefinition> queue)
 		{
 			if (!method.HasBody)
 				return 0;
@@ -1633,7 +1672,7 @@ namespace ExceptionRewriter {
 				Console.WriteLine ($"// {method.FullName}...");
 
 			try {
-				RewriteMethodImpl (method);
+				RewriteMethodImpl (method, queue);
 				return 0;
 			} catch (Exception exc) {
 				Console.Error.WriteLine ($"// Error rewriting {method.FullName}:");
@@ -1647,7 +1686,7 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private void RewriteMethodImpl (MethodDefinition method) {
+		private void RewriteMethodImpl (MethodDefinition method, Queue<MethodDefinition> queue) {
 			// Clean up the method body and verify it before rewriting so that any existing violations of
 			//  expectations aren't erroneously blamed on later transforms
 			CleanMethodBody(method, null, true);
@@ -1659,15 +1698,21 @@ namespace ExceptionRewriter {
 				? null
 				: new ParameterDefinition("__this", ParameterAttributes.None, method.DeclaringType);
 
-			var context = new RewriteContext ();
+            var context = new RewriteContext {
+                MethodQueue = queue
+            };
 
 			var filterReferencedVariables = new HashSet<VariableReference>();
 			var filterReferencedArguments = new HashSet<ParameterReference>();
 			CollectReferencedLocals (context, method, fakeThis, filterReferencedVariables, filterReferencedArguments);
 
-			var closureInfo = ConvertToClosure(
-				method, fakeThis, filterReferencedVariables, filterReferencedArguments, context
-			);
+            ClosureInfo closureInfo;
+            if (!ClosureInfos.TryGetValue(method, out closureInfo)) {
+			    closureInfo = ConvertToClosure(
+				    method, fakeThis, filterReferencedVariables, filterReferencedArguments, context
+			    );
+                ClosureInfos[method] = closureInfo;
+            }
 
 			CleanMethodBody(method, null, true);
 
@@ -1677,9 +1722,10 @@ namespace ExceptionRewriter {
 			insns.Append (Nop ("footer"));
 			*/
 
-			ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closureInfo.ClosureVariable, insns, context);
+			ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closureInfo, insns, context);
 
-			StripUnreferencedNops (method);
+            // FIXME
+			// StripUnreferencedNops (method);
 
 			CleanMethodBody (method, null, true);
 
@@ -1690,9 +1736,6 @@ namespace ExceptionRewriter {
 		}
 
 		private void StripUnreferencedNops (MethodDefinition method) {
-			// FIXME
-			return;
-
 			var referenced = new HashSet<Instruction> ();
 
 			foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1795,9 +1838,10 @@ namespace ExceptionRewriter {
 
 		private void ExtractFiltersAndCatchBlocks (
 			MethodDefinition method, TypeReference efilt, 
-			ParameterDefinition fakeThis, VariableDefinition closure, 
+			ParameterDefinition fakeThis, ClosureInfo closureInfo, 
 			Collection<Instruction> insns, RewriteContext context
 		) {
+            var closure = closureInfo.ClosureStorage;
 			var groups = GetOrderedFilters (method).ToList ();
 			var pairs = (from k in groups select k.Key).ToList ();
 			context.Pairs = pairs;
@@ -1831,12 +1875,31 @@ namespace ExceptionRewriter {
 				ComputeExitPoint(excGroup);
 
 				foreach (var eh in eg.group) {
-					var catchBlock = ExtractCatch (method, eh, closure, fakeThis, excGroup, context);
+					var catchBlock = ExtractCatch (method, eh, closureInfo, fakeThis, excGroup, context);
 					excGroup.Blocks.Add (catchBlock);
 
 					if (eh.FilterStart != null)
-						ExtractFilter (method, eh, closure, fakeThis, excGroup, context, catchBlock);
+						ExtractFilter (method, eh, closureInfo, fakeThis, excGroup, context, catchBlock);
+
+                    if (catchBlock.CatchMethod != null) {
+                        context.MethodQueue?.Enqueue (catchBlock.CatchMethod);
+                        // FIXME: Make a new one and point to the arg instead of the old local
+                        var newCi = closureInfo.Clone ();
+                        newCi.ClosureStorage = catchBlock.CatchMethod.Parameters[1];
+                        ClosureInfos.Add (catchBlock.CatchMethod, newCi);
+                    }
 				}
+
+                // If we generated no actual catch methods for this group, don't generate a try/catch for it since it'll just
+                //  be empty. Don't instantiate a filter either
+                if (excGroup.Blocks.All(b => b.CatchMethod == null)) {
+                    // We still need to remove the exception handlers that previously existed here because they're now
+                    //  filled with nops and thus invalid
+				    foreach (var eh in eg.@group)
+					    method.Body.ExceptionHandlers.Remove(eh);
+
+                    continue;
+                }
 
 				var teardownEnclosureLeaveTarget = Nop ("Leave target outside of teardown");
 				var teardownEnclosureLeave = Branch (context, OpCodes.Leave, teardownEnclosureLeaveTarget);
@@ -1950,7 +2013,7 @@ namespace ExceptionRewriter {
 			MethodDefinition method, 
 			TypeDefinition filterType, 
 			VariableDefinition filterVariable,
-			VariableDefinition closureVariable
+			object closureVariable
 		) {
 			var efilt = GetExceptionFilter (method.Module);
 			var skipInit = Nop ("Skip initializing filter " + filterType.Name);
@@ -1966,7 +2029,7 @@ namespace ExceptionRewriter {
 				Instruction.Create (OpCodes.Stloc, filterVariable),
 				// Store the closure into the filter instance so it can access locals
 				Instruction.Create (OpCodes.Ldloc, filterVariable),
-				Instruction.Create (OpCodes.Ldloc, closureVariable),
+				GenerateLoad (closureVariable),
 				Instruction.Create (OpCodes.Stfld, filterType.Fields.First (m => m.Name == "closure")),
 				skipInit,
 
@@ -1985,10 +2048,14 @@ namespace ExceptionRewriter {
 
 		private void ConstructNewExceptionHandler (
 			MethodDefinition method, IGrouping<InstructionPair, ExceptionHandler> group, 
-			ExcGroup excGroup, List<Instruction> newInstructions, VariableDefinition closureVar,
+			ExcGroup excGroup, List<Instruction> newInstructions, object closureVar,
 			Instruction exitPoint, RewriteContext context
 		) {
-			var excVar = new VariableDefinition (method.Module.TypeSystem.Object);
+            // FIXME
+            if (excGroup.Blocks.All(b => b.CatchMethod == null))
+                throw new Exception("No actual catches were extracted");
+
+            var excVar = new VariableDefinition (method.Module.TypeSystem.Object);
 			method.Body.Variables.Add(excVar);
 
 			newInstructions.Add (Instruction.Create (OpCodes.Stloc, excVar));
@@ -2005,6 +2072,10 @@ namespace ExceptionRewriter {
 			var efilt = GetExceptionFilter (method.Module);
 
 			foreach (var h in excGroup.Blocks) {
+                // FIXME
+                if (h.CatchMethod == null)
+                    continue;
+
 				var callCatchPrologue = Nop ("Before call catch " + h.CatchMethod.Name);
 				var callCatchEpilogue = Nop ("After call catch " + h.CatchMethod.Name);
 
@@ -2042,7 +2113,7 @@ namespace ExceptionRewriter {
 				if (h.Handler.CatchType != null)
 					newInstructions.Add (Instruction.Create (OpCodes.Castclass, h.Handler.CatchType));
 
-				newInstructions.Add (Instruction.Create (OpCodes.Ldloc, closureVar));
+				newInstructions.Add (GenerateLoad (closureVar));
 				newInstructions.Add (Instruction.Create (OpCodes.Call, h.CatchMethod));
 
 				// Either rethrow or leave depending on the value returned by the handler
@@ -2165,6 +2236,9 @@ namespace ExceptionRewriter {
 						break;
 					}
 				}
+
+                // FIXME
+                continue;
 
 				if (!verify)
 					continue;

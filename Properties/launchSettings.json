@@ -2,7 +2,7 @@
   "profiles": {
     "ExceptionRewriter": {
       "commandName": "Project",
-      "commandLineArgs": "\"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Debug\\NetFramework.exe\" \"C:\\Users\\Katelyn\\Desktop\\rewritten.exe\" \"\\\\reeir-debian2\\Projects\\mono-wasm\\sdks\\wasm\\obj\\test-suite\\linker-out\\System.dll\" \"C:\\Users\\Katelyn\\Desktop\\System.rewritten.dll\" --warn --verbose"
+      "commandLineArgs": "\"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Debug\\NetFramework.exe\" \"C:\\Users\\Katelyn\\Desktop\\out\\rewritten.debug.exe\" \"C:\\Users\\Katelyn\\Documents\\Projects\\ExceptionTransformTests\\NetFramework\\bin\\Release\\NetFramework.exe\" \"C:\\Users\\Katelyn\\Desktop\\out\\rewritten.release.exe\" --warn --verbose --mark"
     }
   }
 }

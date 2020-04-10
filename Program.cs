@@ -49,6 +49,11 @@ namespace ExceptionRewriter {
 						var arw = new AssemblyRewriter (def, options);
 						int errorCount = arw.Rewrite ();
 
+                        if (options.Mark) {
+                            def.Name.Name = Path.GetFileNameWithoutExtension(dst);
+                            def.Name.Culture = "Rewritten";
+                        }
+
 						if (!options.Audit) {
 							if (errorCount > 0 && false) {
 								Console.Error.WriteLine ($"// Not saving due to error(s): {dst}");
@@ -118,6 +123,9 @@ namespace ExceptionRewriter {
 				case "--symbols":
 					options.EnableSymbols = true;
 					break;
+                case "--mark":
+                    options.Mark = true;
+                    break;
 				default:
 					throw new Exception ("Unsupported argument: " + arg);
 			}
