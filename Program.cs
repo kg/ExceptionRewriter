@@ -125,6 +125,8 @@ namespace ExceptionRewriter {
 					options.Mark = true;
 					break;
 				default:
+                    // FIXME hack to make testing easier
+                    return;
 					throw new Exception ("Unsupported argument: " + arg);
 			}
 		}

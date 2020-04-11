@@ -1747,7 +1747,7 @@ namespace ExceptionRewriter {
 			ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closureInfo, insns, context);
 
 			// FIXME
-			// StripUnreferencedNops (method);
+			StripUnreferencedNops (method);
 
 			CleanMethodBody (method, null, true);
 
@@ -1802,11 +1802,18 @@ namespace ExceptionRewriter {
 			}
 
 			var old = insns.ToArray ();
+            var previousWasNop = false;
 			insns.Clear ();
 
 			foreach (var insn in old) {
-				if ((insn.OpCode.Code == Code.Nop) && !referenced.Contains (insn))
-					continue;
+                if (insn.OpCode.Code == Code.Nop) {
+    				if (previousWasNop && !referenced.Contains (insn))
+	    				continue;
+
+                    previousWasNop = true;
+                } else {
+                    previousWasNop = false;
+                }
 
 				insns.Add (insn);
 			}
@@ -1894,8 +1901,12 @@ namespace ExceptionRewriter {
 			var excGroups = (from @group in groups
 							 let a = @group.Key.A
 							 let b = @group.Key.B
+							 let startIndex = Find(context, insns, a)
 							 let endIndex = Find(context, insns, b)
 							 let predecessor = insns[endIndex - 1]
+                             let size = endIndex - startIndex
+                             orderby size ascending
+                             orderby endIndex descending
 							 select new {
 								 @group,
 								 excGroup = new ExcGroup {
@@ -1904,7 +1915,9 @@ namespace ExceptionRewriter {
 									 TryEndPredecessor = predecessor,
 									 TryEnd = b,
 								 },
-								 endIndex                                 
+                                 startIndex,
+								 endIndex,
+                                 size
 							 }).ToList();
 
 			if (method.FullName.Contains("Lopsided"))
@@ -2261,110 +2274,110 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify) 
-		{
-			var insns = method.Body.Instructions;
+		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify) {
+            var insns = method.Body.Instructions;
 
-			for (int idx = 0; idx < insns.Count; idx++) {
-				var i = insns[idx];
-				if (i.OpCode.Code == Code.Nop)
-					continue;
+            for (int idx = 0; idx < insns.Count; idx++) {
+                var i = insns[idx];
+                if (i.OpCode.Code == Code.Nop)
+                    continue;
 
-				OpCode newOpcode;
-				if (ShortFormRemappings.TryGetValue (i.OpCode.Code, out newOpcode))
-					i.OpCode = newOpcode;
+                OpCode newOpcode;
+                if (ShortFormRemappings.TryGetValue(i.OpCode.Code, out newOpcode))
+                    i.OpCode = newOpcode;
 
-				switch (i.OpCode.Code) {
-					case Code.Rethrow: {
-						bool foundRange = false;
+                switch (i.OpCode.Code) {
+                    case Code.Rethrow: {
+                            bool foundRange = false;
 
-						foreach (var eh in method.Body.ExceptionHandlers) {
-							if (eh.HandlerType == ExceptionHandlerType.Finally)
-								continue;
+                            foreach (var eh in method.Body.ExceptionHandlers) {
+                                if (eh.HandlerType == ExceptionHandlerType.Finally)
+                                    continue;
 
-							int startIndex = insns.IndexOf(eh.HandlerStart),
-								endIndex = insns.IndexOf(eh.HandlerEnd);
+                                int startIndex = insns.IndexOf(eh.HandlerStart),
+                                    endIndex = insns.IndexOf(eh.HandlerEnd);
 
-							if ((idx >= startIndex) && (idx <= endIndex)) {
-								foundRange = true;
-								break;
-							}
-						}
+                                if ((idx >= startIndex) && (idx <= endIndex)) {
+                                    foundRange = true;
+                                    break;
+                                }
+                            }
 
-						if (!foundRange && false)
-							throw new Exception($"Found rethrow instruction outside of catch block: {i}");
+                            if (!foundRange && false)
+                                throw new Exception($"Found rethrow instruction outside of catch block: {i}");
 
-						break;
-					}
-				}
+                            break;
+                        }
+                }
 
-				// FIXME
-				continue;
+                if (verify)
+                    VerifyInstruction(method, oldMethod, i);
+            }
 
-				if (!verify)
-					continue;
+            if (verify)
+                VerifyMethodBody (method, oldMethod, insns);
+        }
 
-				var opInsn = i.Operand as Instruction;
-				var opInsns = i.Operand as Instruction[];
-				var opArg = i.Operand as ParameterDefinition;
-				var opVar = i.Operand as VariableDefinition;
+        private void VerifyMethodBody (MethodDefinition method, MethodDefinition oldMethod, Collection<Instruction> insns) {
+            foreach (var p in method.Parameters)
+                if (p.Index != method.Parameters.IndexOf(p))
+                    throw new Exception($"parameter index mismatch for method {method.FullName}");
 
-				if (opInsn != null) {
-					CheckInRange(opInsn, method, oldMethod, $"(operand of {i.OpCode} instruction)");
+            foreach (var v in method.Body.Variables)
+                if (v.Index != method.Body.Variables.IndexOf(v))
+                    throw new Exception($"variable index mismatch for method {method.FullName}");
 
-					/*
-					if ((i.OpCode.Code == Code.Leave) || (i.OpCode.Code == Code.Leave_S)) {
-						if (renumber && (i.Offset > opInsn.Offset))
-							throw new Exception ($"Leave target {opInsn} precedes leave instruction");
-					}
-					*/
-				} else if (opArg != null) {
-					if ((opArg.Name == "__this") && method.HasThis) {
-						// HACK: method.Body.ThisParameter is unreliable for confusing reasons, and isn't
-						//  present in .Parameters so just ignore the check here
-					} else if (method.Parameters.IndexOf (opArg) < 0) {
-						throw new Exception ($"Parameter {opArg.Name} for opcode {i} is missing for method {method.FullName}");
-					} else if (oldMethod != null && oldMethod.Parameters.IndexOf (opArg) >= 0)
-						throw new Exception ($"Parameter {opArg.Name} for opcode {i} is present in old method for method {method.FullName}");
-				} else if (opVar != null) {
-					if (method.Body.Variables.IndexOf (opVar) < 0)
-						throw new Exception ($"Local {opVar} for opcode {i} is missing for method {method.FullName}");
-					else if (oldMethod != null && oldMethod.Body.Variables.IndexOf (opVar) >= 0)
-						throw new Exception ($"Local {opVar} for opcode {i} is present in old method for method {method.FullName}");
-				} else if (opInsns != null) {
-					foreach (var target in opInsns)
-						CheckInRange(target, method, oldMethod, $"(operand of {i.OpCode} instruction)");
-				}
-			}
+            foreach (var eh in method.Body.ExceptionHandlers) {
+                CheckInRange(eh.HandlerStart, method, oldMethod, "(handler start)");
+                CheckInRange(eh.HandlerEnd, method, oldMethod, "(handler end)");
+                CheckInRange(eh.FilterStart, method, oldMethod, "(filter start)");
+                CheckInRange(eh.TryStart, method, oldMethod, "(try start)");
+                CheckInRange(eh.TryEnd, method, oldMethod, "(try end)");
 
-			if (verify)
-			foreach (var p in method.Parameters)
-				if (p.Index != method.Parameters.IndexOf (p))
-					throw new Exception ($"parameter index mismatch for method {method.FullName}");
+                if (eh.TryStart != null) {
+                    var tryStartIndex = insns.IndexOf(eh.TryStart);
+                    var tryEndIndex = insns.IndexOf(eh.TryEnd);
+                    if (tryEndIndex <= tryStartIndex)
+                        throw new Exception($"Try block contains no instructions at {eh.TryStart}");
+                }
+            }
+        }
 
-			if (verify)
-			foreach (var v in method.Body.Variables)
-				if (v.Index != method.Body.Variables.IndexOf (v))
-					throw new Exception ($"variable index mismatch for method {method.FullName}");
+        private void VerifyInstruction (MethodDefinition method, MethodDefinition oldMethod, Instruction i) {
+            var opInsn = i.Operand as Instruction;
+            var opInsns = i.Operand as Instruction[];
+            var opArg = i.Operand as ParameterDefinition;
+            var opVar = i.Operand as VariableDefinition;
 
-			if (verify)
-			foreach (var eh in method.Body.ExceptionHandlers) {
-				CheckInRange(eh.HandlerStart, method, oldMethod, "(handler start)");
-				CheckInRange(eh.HandlerEnd, method, oldMethod, "(handler end)");
-				CheckInRange(eh.FilterStart, method, oldMethod, "(filter start)");
-				CheckInRange(eh.TryStart, method, oldMethod, "(try start)");
-				CheckInRange(eh.TryEnd, method, oldMethod, "(try end)");
+            if (opInsn != null) {
+                CheckInRange(opInsn, method, oldMethod, $"(operand of {i.OpCode} instruction)");
 
-				if (eh.TryStart != null) {
-					var tryStartIndex = insns.IndexOf(eh.TryStart);
-					var tryEndIndex = insns.IndexOf(eh.TryEnd);
-					if (tryEndIndex <= tryStartIndex)
-						throw new Exception($"Try block contains no instructions at {eh.TryStart}");
-				}
-			}
-		}
-		
-		private Instruction CreateRemappedInstruction (
+                /*
+                if ((i.OpCode.Code == Code.Leave) || (i.OpCode.Code == Code.Leave_S)) {
+                    if (renumber && (i.Offset > opInsn.Offset))
+                        throw new Exception ($"Leave target {opInsn} precedes leave instruction");
+                }
+                */
+            } else if (opArg != null) {
+                if ((opArg.Name == "__this") && method.HasThis) {
+                    // HACK: method.Body.ThisParameter is unreliable for confusing reasons, and isn't
+                    //  present in .Parameters so just ignore the check here
+                } else if (method.Parameters.IndexOf(opArg) < 0) {
+                    throw new Exception($"Parameter {opArg.Name} for opcode {i} is missing for method {method.FullName}");
+                } else if (oldMethod != null && oldMethod.Parameters.IndexOf(opArg) >= 0)
+                    throw new Exception($"Parameter {opArg.Name} for opcode {i} is present in old method for method {method.FullName}");
+            } else if (opVar != null) {
+                if (method.Body.Variables.IndexOf(opVar) < 0)
+                    throw new Exception($"Local {opVar} for opcode {i} is missing for method {method.FullName}");
+                else if (oldMethod != null && oldMethod.Body.Variables.IndexOf(opVar) >= 0)
+                    throw new Exception($"Local {opVar} for opcode {i} is present in old method for method {method.FullName}");
+            } else if (opInsns != null) {
+                foreach (var target in opInsns)
+                    CheckInRange(target, method, oldMethod, $"(operand of {i.OpCode} instruction)");
+            }
+        }
+
+        private Instruction CreateRemappedInstruction (
 			object oldOperand, OpCode oldCode, object operand
 		) {
 			if (operand == null)
