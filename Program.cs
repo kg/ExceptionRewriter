@@ -49,10 +49,8 @@ namespace ExceptionRewriter {
 						var arw = new AssemblyRewriter (def, options);
 						int errorCount = arw.Rewrite ();
 
-                        if (options.Mark) {
-                            def.Name.Name = Path.GetFileNameWithoutExtension(dst);
-                            def.Name.Culture = "Rewritten";
-                        }
+						if (options.Mark)
+							def.Name.Name = Path.GetFileNameWithoutExtension(dst);
 
 						if (!options.Audit) {
 							if (errorCount > 0 && false) {
@@ -75,7 +73,7 @@ namespace ExceptionRewriter {
 						}
 					}
 
-                    Console.WriteLine();
+					Console.WriteLine();
 				}
 
 				return exitCode;
@@ -123,9 +121,9 @@ namespace ExceptionRewriter {
 				case "--symbols":
 					options.EnableSymbols = true;
 					break;
-                case "--mark":
-                    options.Mark = true;
-                    break;
+				case "--mark":
+					options.Mark = true;
+					break;
 				default:
 					throw new Exception ("Unsupported argument: " + arg);
 			}
