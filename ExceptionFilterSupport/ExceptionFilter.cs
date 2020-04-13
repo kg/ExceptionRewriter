@@ -8,31 +8,34 @@ namespace Mono {
         private class HasFilterRunTable : Dictionary<ExceptionFilter, bool> {
         }
 
+        private class ThreadState {
+            public readonly ConditionalWeakTable<object, HasFilterRunTable> HasFilterRun = 
+                new ConditionalWeakTable<object, HasFilterRunTable> ();
+            public readonly List<ExceptionFilter> ExceptionFilters =
+                new List<ExceptionFilter> (128);
+
+            public object LastEvaluatedException = null;
+        }
+
         public static readonly int exception_continue_search = 0;
         public static readonly int exception_execute_handler = 1;
 
         public int Result;
 
-        public static readonly ThreadLocal<List<ExceptionFilter>> ExceptionFilters = 
-            new ThreadLocal<List<ExceptionFilter>>(() => new List<ExceptionFilter>(128));
-
-        private static object LastEvaluatedException = null;
         private static readonly object FilterHasRunSentinel = new object();
 
-        private static readonly ThreadLocal<ConditionalWeakTable<object, HasFilterRunTable>> HasFilterRun =
-            new ThreadLocal<ConditionalWeakTable<object, HasFilterRunTable>>(
-                () => new ConditionalWeakTable<object, HasFilterRunTable>()
-            );
+        private static readonly ThreadLocal<ThreadState> ThreadStates =
+            new ThreadLocal<ThreadState> (() => new ThreadState ());
 
         public abstract int Evaluate (object exc);
 
         public static void Push (ExceptionFilter filter) {
             filter.Result = exception_continue_search;
-            ExceptionFilters.Value.Add(filter);
+            ThreadStates.Value.ExceptionFilters.Add(filter);
         }
 
         public static void Pop (ExceptionFilter filter) {
-            var ef = ExceptionFilters.Value;
+            var ef = ThreadStates.Value.ExceptionFilters;
             if (ef.Count == 0)
                 throw new Exception("Corrupt exception filter stack");
             var current = ef[ef.Count - 1];
@@ -55,7 +58,6 @@ namespace Mono {
             PerformEvaluate(exc);
 
             var result = Result == exception_execute_handler;
-            // Console.WriteLine($"ShouldRunHandler for {this.GetType().Name} == {result}");
             return result;
         }
 
@@ -67,37 +69,36 @@ namespace Mono {
         /// </summary>
         /// <param name="exc">The exception filters are being run for.</param>
         public static void PerformEvaluate (object exc) {
-            // FIXME: Attempt to avoid running filters multiple times when unwinding.
-            // I think this doesn't work right for rethrow?
-            if (LastEvaluatedException == exc)
+            var ts = ThreadStates.Value;
+
+            // Attempt to avoid running filters multiple times when unwinding.
+            // FIXME: This may not be correct for rethrow
+            if (ts.LastEvaluatedException == exc)
                 return;
 
-            var ef = ExceptionFilters.Value;
             var hasLocatedValidHandler = false;
 
             // Set in advance in case the filter throws.
             // These two state variables allow us to early out in the case where Evaluate() is triggered
             //  in multiple stack frames while unwinding even though filters have already run.
-            LastEvaluatedException = exc;
+            ts.LastEvaluatedException = exc;
 
-            var hfrByException = HasFilterRun.Value;
+            var hfrByException = ts.HasFilterRun;
             HasFilterRunTable hfrt;
             if (!hfrByException.TryGetValue(exc, out hfrt)) {
                 hfrt = new HasFilterRunTable();
                 hfrByException.Add(exc, hfrt);
             }
 
-            for (int i = ef.Count - 1; i >= 0; i--) {
-                var filter = ef[i];
+            for (int i = ts.ExceptionFilters.Count - 1; i >= 0; i--) {
+                var filter = ts.ExceptionFilters[i];
                 if (hasLocatedValidHandler) {
                     filter.Result = exception_continue_search;
                     continue;
                 }
 
-                if (hfrt.ContainsKey(filter)) {
-                    // Console.WriteLine($"Skipping filter {filter} because it already ran for exc {exc}");
+                if (hfrt.ContainsKey(filter))
                     continue;
-                }
 
                 var result = filter.Evaluate(exc);
                 hfrt[filter] = result == exception_execute_handler;
