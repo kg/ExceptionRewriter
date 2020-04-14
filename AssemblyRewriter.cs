@@ -211,6 +211,9 @@ namespace ExceptionRewriter {
 				return i;
 		}
 
+		/// <summary>
+		/// Replaces references to 'old' with 'new' within the method body. Will not replace the instruction itself.
+		/// </summary>
 		private void Patch (MethodDefinition method, RewriteContext context, Instruction old, Instruction replacement)
 		{
 			context.ReplacedInstructions[old] = replacement;
@@ -1650,6 +1653,11 @@ namespace ExceptionRewriter {
 
 			public Instruction A, B;
 
+			public InstructionPair (Instruction a, Instruction b) {
+				A = a;
+				B = b;
+			}
+
 			public override int GetHashCode ()
 			{
 				return (A?.GetHashCode () ^ B?.GetHashCode ()) ?? 0;
@@ -1745,7 +1753,7 @@ namespace ExceptionRewriter {
 
 		private readonly HashSet<string> TracedMethodNames = new HashSet<string> {
 			// "DownloadFile",
-			"TestReturnValueWithFinallyAndDefault"
+			"NestedFiltersInOneFunction"
 		};
 
 		private void RewriteMethodImpl (MethodDefinition method, Queue<MethodDefinition> queue)
@@ -1835,6 +1843,9 @@ namespace ExceptionRewriter {
 			if (insn == null)
 				return "null";
 
+			if (!offsets.ContainsKey (insn))
+				return "invalid reference";
+
 			var insns = method.Body.Instructions;
 			var offsetBytes = offsets[insn];
 			return $"IL_{offsetBytes:X4} {insn.OpCode} ({(insn.Operand == null ? "null" : insn.Operand)})";
@@ -1863,6 +1874,9 @@ namespace ExceptionRewriter {
 
 		private void StripUnreferencedNops (MethodDefinition method)
 		{
+			// NOTE: This method may seem cosmetic but stripping unreferenced nops is necessary
+			//  to ensure that stray nops do not remain at the end of try and finally blocks
+			// If stray nops remain there it becomes fallthrough at the end of the block
 			var referenced = new HashSet<Instruction> ();
 
 			foreach (var eh in method.Body.ExceptionHandlers) {
@@ -1886,18 +1900,11 @@ namespace ExceptionRewriter {
 			}
 
 			var old = insns.ToArray ();
-			var previousWasNop = false;
 			insns.Clear ();
 
 			foreach (var insn in old) {
-				if (insn.OpCode.Code == Code.Nop) {
-					if (previousWasNop && !referenced.Contains (insn))
-						continue;
-
-					previousWasNop = true;
-				} else {
-					previousWasNop = false;
-				}
+				if (insn.OpCode == OpCodes.Nop && !referenced.Contains (insn))
+					continue;
 
 				insns.Add (insn);
 			}
@@ -1907,7 +1914,7 @@ namespace ExceptionRewriter {
 		{
 			return method.Body.ExceptionHandlers.ToLookup (
 				eh => {
-					var p = new InstructionPair { A = eh.TryStart, B = eh.TryEnd };
+					var p = new InstructionPair(eh.TryStart, eh.TryEnd);
 					return p;
 				},
 				new InstructionPair.Comparer ()
@@ -1971,12 +1978,6 @@ namespace ExceptionRewriter {
 			return result;
 		}
 
-		private Instruction ComputeActualHandlerEndForFinallyBlock (
-			MethodDefinition method, ExceptionHandler eh
-		) {
-			return eh.HandlerEnd;
-		}
-
 		private void ExtractFiltersAndCatchBlocks (
 			MethodDefinition method, TypeReference efilt,
 			ParameterDefinition fakeThis, ClosureInfo closureInfo,
@@ -2018,15 +2019,8 @@ namespace ExceptionRewriter {
 								 size
 							 }).ToList ();
 
-			var finallyBlocksForTryStarts = method.Body.ExceptionHandlers.Where (eh => eh.HandlerType == ExceptionHandlerType.Finally).ToDictionary (
-				(eh => eh.TryStart), (eh => new {
-					Handler = eh,
-					HandlerStart = eh.HandlerStart,
-					HandlerEnd = ComputeActualHandlerEndForFinallyBlock (method, eh)
-				})
-			);
 
-			if (TracedMethodNames.Contains(method.Name))
+			if (TracedMethodNames.Contains (method.Name))
 				;
 
 			foreach (var eg in excGroups)
@@ -2083,7 +2077,6 @@ namespace ExceptionRewriter {
 					//  anything else happens.
 
 					var teardownInstructions = new List<Instruction> { teardownEnclosureLeave, teardownPrologue };
-
 					foreach (var eh in excGroup.Blocks.ToArray ().Reverse ()) {
 						if (eh.FilterType == null)
 							continue;
@@ -2105,7 +2098,7 @@ namespace ExceptionRewriter {
 					teardownInstructions.Add (teardownEpilogue);
 					teardownInstructions.Add (teardownEnclosureLeaveTarget);
 
-					int insertOffset;
+					var insertOffset = (from eh in eg.@group let idx = Find(context, insns, eh.HandlerEnd) orderby idx descending select idx).First ();
 
 					if (excGroup.ExitPoint != null) {
 						insertOffset = Find (context, insns, excGroup.ExitPoint);
@@ -2119,14 +2112,6 @@ namespace ExceptionRewriter {
 						var nextInsn = (from eh in eg.@group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First ();
 						insertOffset = insns.IndexOf (nextInsn);
 					}
-
-					if (finallyBlocksForTryStarts.TryGetValue (excGroup.TryStart, out var matchingFinallyBlock)) {
-						// If the original set of handlers included a finally block we need to shift its endpoint 
-						//  to be inside our new try/finally, and ensure our try/finally fully surrounds it
-						insertOffset = insns.IndexOf (matchingFinallyBlock.HandlerEnd);
-						matchingFinallyBlock.Handler.HandlerEnd = teardownEnclosureLeave;
-					}
-
 					InsertOps (insns, insertOffset, teardownInstructions.ToArray ());
 
 					// exitPoint = teardownPrologue;
@@ -2146,7 +2131,10 @@ namespace ExceptionRewriter {
 				InsertOps (insns, targetIndex, newHandler.ToArray ());
 
 				var endOffset = Find (context, insns, newHandler[newHandler.Count - 1]);
-				var newEnd = insns[endOffset + 1];
+				// HACK: This ensures that we don't leave any stray nops at the end of a try block
+				//  (that were previously actual instructions) because that will be treated as fallthrough
+				endOffset = FindNextNonNop (insns, endOffset);
+				var newEnd = insns[endOffset];
 
 				var teardownTryStart = Nop ("Teardown try block start");
 				insns.Insert (insns.IndexOf (excGroup.TryStart), teardownTryStart);
@@ -2184,6 +2172,8 @@ namespace ExceptionRewriter {
 
 				foreach (var eh in eg.@group)
 					method.Body.ExceptionHandlers.Remove (eh);
+
+				;
 			}
 
 			foreach (var eg in context.NewGroups) {
@@ -2194,6 +2184,17 @@ namespace ExceptionRewriter {
 						StripUnreferencedNops (eb.CatchMethod);
 				}
 			}
+		}
+
+		private int FindNextNonNop (Collection<Instruction> insns, int offset) {
+			for (int i = offset + 1; i < insns.Count; i++) {
+				if (insns[i].OpCode == OpCodes.Nop)
+					continue;
+
+				return i;
+			}
+
+			return -1;
 		}
 
 		private Instruction[] InitializeExceptionFilter (
@@ -2402,6 +2403,8 @@ namespace ExceptionRewriter {
 
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify)
 		{
+			return;
+
 			var insns = method.Body.Instructions;
 
 			for (int idx = 0; idx < insns.Count; idx++) {
