@@ -1743,8 +1743,18 @@ namespace ExceptionRewriter {
 			}
 		}
 
+		private readonly HashSet<string> TracedMethodNames = new HashSet<string> {
+			// "DownloadFile",
+			"TestReturnValueWithFinallyAndDefault"
+		};
+
 		private void RewriteMethodImpl (MethodDefinition method, Queue<MethodDefinition> queue)
 		{
+			if (TracedMethodNames.Contains(method.Name)) {
+				Console.WriteLine ("== Original handlers ==");
+				DumpExceptionHandlers (method);
+			}
+
 			// Clean up the method body and verify it before rewriting so that any existing violations of
 			//  expectations aren't erroneously blamed on later transforms
 			CleanMethodBody (method, null, true);
@@ -1793,6 +1803,11 @@ namespace ExceptionRewriter {
 			//  presumably because we need to manually update the debugging information after removing
 			//  instructions from the method body.
 			method.DebugInformation = null;
+
+			if (TracedMethodNames.Contains(method.Name)) {
+				Console.WriteLine ("== New handlers ==");
+				DumpExceptionHandlers (method);
+			}
 		}
 
 		private void SortExceptionHandlers (MethodDefinition method, RewriteContext context, Collection<Instruction> insns)
@@ -1814,11 +1829,6 @@ namespace ExceptionRewriter {
 			method.Body.ExceptionHandlers.Clear ();
 			foreach (var eh in sortedEhs)
 				method.Body.ExceptionHandlers.Add (eh);
-
-			if (method.Name.Contains ("DownloadFile") || 
-				method.Name.Contains ("NestedFiltersInOneFunction") ||
-				method.Name.Contains ("Lopsided"))
-				DumpExceptionHandlers (method);
 		}
 
 		private string FormatInstructionReference (MethodDefinition method, Dictionary<Instruction, int> offsets, Instruction insn) {
@@ -1904,15 +1914,11 @@ namespace ExceptionRewriter {
 			);
 		}
 
-		private static IOrderedEnumerable<IGrouping<InstructionPair, ExceptionHandler>> GetOrderedFilters (MethodDefinition method)
+		private static IOrderedEnumerable<IGrouping<InstructionPair, ExceptionHandler>> GetOrderedHandlers (MethodDefinition method)
 		{
 			var handlersByTry = GetHandlersByTry (method);
 
-			return handlersByTry.Where (g =>
-				g.Any (eh => eh.HandlerType == ExceptionHandlerType.Filter)
-			// Sort the groups such that the smallest ones come first. This ensures that for
-			//  nested filters we process the innermost filters first.
-			).OrderBy (g => {
+			return handlersByTry.OrderBy (g => {
 				return g.Key.B.Offset - g.Key.A.Offset;
 			});
 		}
@@ -1965,6 +1971,12 @@ namespace ExceptionRewriter {
 			return result;
 		}
 
+		private Instruction ComputeActualHandlerEndForFinallyBlock (
+			MethodDefinition method, ExceptionHandler eh
+		) {
+			return eh.HandlerEnd;
+		}
+
 		private void ExtractFiltersAndCatchBlocks (
 			MethodDefinition method, TypeReference efilt,
 			ParameterDefinition fakeThis, ClosureInfo closureInfo,
@@ -1972,8 +1984,10 @@ namespace ExceptionRewriter {
 		)
 		{
 			var closure = closureInfo.ClosureStorage;
-			var groups = GetOrderedFilters (method).ToList ();
-			var pairs = (from k in groups select k.Key).ToList ();
+			var handlers = GetOrderedHandlers (method).ToList ();
+			var groupsContainingFilters = handlers.Where (g => g.Any(h => h.HandlerType == ExceptionHandlerType.Filter))
+				.ToList ();
+			var pairs = (from k in groupsContainingFilters select k.Key).ToList ();
 			context.Pairs = pairs;
 
 			var deadHandlers = new List<ExceptionHandler> ();
@@ -1982,7 +1996,7 @@ namespace ExceptionRewriter {
 			//  will not be grouped up properly and we'll end up inserting our try/finally in 
 			//  the middle of it instead of at the end, because the finally roslyn generates is
 			//  after the chain of catches
-			var excGroups = (from @group in groups
+			var excGroups = (from @group in groupsContainingFilters
 							 let a = @group.Key.A
 							 let b = @group.Key.B
 							 let startIndex = Find (context, insns, a)
@@ -2004,7 +2018,15 @@ namespace ExceptionRewriter {
 								 size
 							 }).ToList ();
 
-			if (method.FullName.Contains ("Lopsided"))
+			var finallyBlocksForTryStarts = method.Body.ExceptionHandlers.Where (eh => eh.HandlerType == ExceptionHandlerType.Finally).ToDictionary (
+				(eh => eh.TryStart), (eh => new {
+					Handler = eh,
+					HandlerStart = eh.HandlerStart,
+					HandlerEnd = ComputeActualHandlerEndForFinallyBlock (method, eh)
+				})
+			);
+
+			if (TracedMethodNames.Contains(method.Name))
 				;
 
 			foreach (var eg in excGroups)
@@ -2061,6 +2083,7 @@ namespace ExceptionRewriter {
 					//  anything else happens.
 
 					var teardownInstructions = new List<Instruction> { teardownEnclosureLeave, teardownPrologue };
+
 					foreach (var eh in excGroup.Blocks.ToArray ().Reverse ()) {
 						if (eh.FilterType == null)
 							continue;
@@ -2096,6 +2119,14 @@ namespace ExceptionRewriter {
 						var nextInsn = (from eh in eg.@group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First ();
 						insertOffset = insns.IndexOf (nextInsn);
 					}
+
+					if (finallyBlocksForTryStarts.TryGetValue (excGroup.TryStart, out var matchingFinallyBlock)) {
+						// If the original set of handlers included a finally block we need to shift its endpoint 
+						//  to be inside our new try/finally, and ensure our try/finally fully surrounds it
+						insertOffset = insns.IndexOf (matchingFinallyBlock.HandlerEnd);
+						matchingFinallyBlock.Handler.HandlerEnd = teardownEnclosureLeave;
+					}
+
 					InsertOps (insns, insertOffset, teardownInstructions.ToArray ());
 
 					// exitPoint = teardownPrologue;
