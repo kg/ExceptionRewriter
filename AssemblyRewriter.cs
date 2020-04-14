@@ -1391,7 +1391,7 @@ namespace ExceptionRewriter {
 
 			catchBlock.FilterMethod = filterMethod;
 			catchBlock.FilterType = filterTypeDefinition;
-			catchBlock.FilterField = new FieldDefinition(filterTypeDefinition.Name, FieldAttributes.Public, filterTypeDefinition);
+			catchBlock.FilterField = new FieldDefinition("__filter" + filterIndex, FieldAttributes.Public, filterTypeDefinition);
 			closureInfo.TypeDefinition.Fields.Add(catchBlock.FilterField);
 			catchBlock.FilterConstructor = filterConstructor;
 			catchBlock.FirstFilterInsn = eh.FilterStart;
@@ -1995,11 +1995,7 @@ namespace ExceptionRewriter {
 						if (eh.FilterType == null)
 							continue;
 
-						teardownInstructions.Add (
-							closureInfo.ClosureStorage is ParameterDefinition
-								? Instruction.Create (OpCodes.Ldarg, (ParameterDefinition)closureInfo.ClosureStorage)
-								: Instruction.Create (OpCodes.Ldloc, (VariableDefinition)closureInfo.ClosureStorage)
-						);
+						teardownInstructions.Add (GenerateLoad (closureInfo.ClosureStorage));
 						teardownInstructions.Add (Instruction.Create (OpCodes.Ldfld, eh.FilterField));
 						teardownInstructions.Add (Instruction.Create (OpCodes.Castclass, efilt));
 						teardownInstructions.Add (Instruction.Create (OpCodes.Call, new MethodReference (
@@ -2102,25 +2098,27 @@ namespace ExceptionRewriter {
 			object closureVariable
 		) {
 			var filterType = eh.FilterType;
-			var filterVariable = eh.FilterVariable;
 			var efilt = GetExceptionFilter (method.Module);
 			var skipInit = Nop ("Skip initializing filter " + filterType.Name);
 
 			var result = new Instruction[] {
 				// If the filter is already initialized (we're running in a loop, etc) don't create a new instance
 				Nop ("Initializing filter " + filterType.Name),
-				Instruction.Create (OpCodes.Ldloc, filterVariable),
+				GenerateLoad (closureVariable),
+				Instruction.Create (OpCodes.Ldfld, eh.FilterField),
 				Instruction.Create (OpCodes.Brtrue, skipInit),
 
-				// Create a new instance of the filter
+				// Create a new instance of the filter and store it
+				GenerateLoad (closureVariable),
 				GenerateLoad (closureVariable),
 				Instruction.Create (OpCodes.Newobj, filterType.Methods.First (m => m.Name == ".ctor")),
-				Instruction.Create (OpCodes.Stloc, filterVariable),
+				Instruction.Create (OpCodes.Stfld, eh.FilterField),
 
 				skipInit,
 
 				// Then call Push on the filter instance to activate it
-				Instruction.Create (OpCodes.Ldloc, filterVariable),
+				GenerateLoad (closureVariable),
+				Instruction.Create (OpCodes.Ldfld, eh.FilterField),
 				Instruction.Create (OpCodes.Castclass, efilt),
 				Instruction.Create (OpCodes.Call, new MethodReference (
 						"Push", method.Module.TypeSystem.Void, efilt
@@ -2170,7 +2168,8 @@ namespace ExceptionRewriter {
 				if (h.FilterMethod != null) {
 					// Invoke the filter method and skip past the catch if it rejected the exception
 					var callFilterInsn = Instruction.Create (OpCodes.Call, h.FilterMethod);
-					newInstructions.Add (Instruction.Create (OpCodes.Ldloc, h.FilterVariable));
+					newInstructions.Add (GenerateLoad (closureVar));
+					newInstructions.Add (Instruction.Create (OpCodes.Ldfld, h.FilterField));
 					newInstructions.Add (Instruction.Create (OpCodes.Castclass, efilt));
 					newInstructions.Add (Instruction.Create (OpCodes.Ldloc, excVar));
 					var mref = new MethodReference(
