@@ -2135,14 +2135,7 @@ namespace ExceptionRewriter {
 				var teardownTryStart = Nop ("Teardown try block start");
 				insns.Insert (insns.IndexOf (excGroup.TryStart), teardownTryStart);
 
-				var catchEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
-					CatchType = method.Module.TypeSystem.Object,
-					HandlerStart = newStart,
-					HandlerEnd = newEnd,
-					TryStart = excGroup.TryStart,
-					TryEnd = newStart,
-					FilterStart = null
-				};
+				var newTryStart = excGroup.TryStart;
 
 				// Ensure we initialize and activate all exception filters for the try block before entering it
 				foreach (var eh in excGroup.Blocks) {
@@ -2151,8 +2144,20 @@ namespace ExceptionRewriter {
 
 					var filterInitInstructions = InitializeExceptionFilter (method, eh, closure);
 					var insertOffset = Find (context, insns, excGroup.TryStart);
+					var originalInstructionAtOffset = insns[insertOffset];
 					InsertOps (insns, insertOffset, filterInitInstructions);
+					Patch (method, context, originalInstructionAtOffset, filterInitInstructions[0]);
+					newTryStart = filterInitInstructions[0];
 				}
+
+				var catchEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
+					CatchType = method.Module.TypeSystem.Object,
+					HandlerStart = newStart,
+					HandlerEnd = newEnd,
+					TryStart = newTryStart,
+					TryEnd = newStart,
+					FilterStart = null
+				};
 
 				// Wrap everything in a try/finally to ensure that the exception filters are deactivated even if
 				//  we throw or return
