@@ -600,7 +600,7 @@ namespace ExceptionRewriter {
 			return result;
 		}
 
-		private MethodDefinition CreateConstructor (TypeDefinition type) 
+		private MethodDefinition CreateConstructor (TypeDefinition type, bool includeRet) 
 		{
 			var ctorMethod = new MethodDefinition (
 				".ctor", MethodAttributes.Public | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, 
@@ -614,9 +614,10 @@ namespace ExceptionRewriter {
 						".ctor", type.Module.TypeSystem.Void, 
 						type.BaseType
 					) { HasThis = true }),
-				Nop (),
-				Instruction.Create (OpCodes.Ret)
+				Nop ()
 			});
+            if (includeRet)
+                ctorMethod.Body.Instructions.Add (Instruction.Create (OpCodes.Ret));
 			return ctorMethod;
 		}
 
@@ -725,11 +726,10 @@ namespace ExceptionRewriter {
 			if (!isStatic)
 				extractedVariables[fakeThis] = new FieldDefinition("__this", FieldAttributes.Public, thisType);
 
-			result.Constructor = CreateConstructor (result.TypeDefinition);
+			result.Constructor = CreateConstructor (result.TypeDefinition, false);
 
 			{
 				var ctorInsns = result.Constructor.Body.Instructions;
-				ctorInsns.RemoveAt(ctorInsns.Count - 1);
 
 				foreach (var param in parameters) {
 					var pd = new ParameterDefinition(param.Name, ParameterAttributes.None, param.ParameterType);
@@ -1299,14 +1299,23 @@ namespace ExceptionRewriter {
 
 			filterTypeDefinition.BaseType = GetExceptionFilter (method.Module);
 			method.DeclaringType.NestedTypes.Add (filterTypeDefinition);
-			CreateConstructor (filterTypeDefinition);
+			var filterConstructor = CreateConstructor (filterTypeDefinition, false);
+            var closureConstructorParameter = new ParameterDefinition("closure", ParameterAttributes.None, closureType);
+            filterConstructor.Parameters.Add (closureConstructorParameter);
 
 			var closureField = new FieldDefinition (
 				"closure", FieldAttributes.Public, closureType
 			);
 			filterTypeDefinition.Fields.Add (closureField);
 
-			var filterMethod = new MethodDefinition (
+            InsertOps(filterConstructor.Body.Instructions, filterConstructor.Body.Instructions.Count, new[] {
+                Instruction.Create(OpCodes.Ldarg_0),
+                Instruction.Create(OpCodes.Ldarg, closureConstructorParameter),
+                Instruction.Create(OpCodes.Stfld, closureField),
+                Instruction.Create(OpCodes.Ret)
+            });
+
+            var filterMethod = new MethodDefinition (
 				"Evaluate",
 				MethodAttributes.Virtual | MethodAttributes.Public,
 				method.Module.TypeSystem.Int32
@@ -1383,6 +1392,7 @@ namespace ExceptionRewriter {
 			catchBlock.FilterMethod = filterMethod;
 			catchBlock.FilterType = filterTypeDefinition;
 			catchBlock.FilterVariable = new VariableDefinition(filterTypeDefinition);
+            catchBlock.FilterConstructor = filterConstructor;
 			catchBlock.FirstFilterInsn = eh.FilterStart;
 
 			method.Body.Variables.Add (catchBlock.FilterVariable);
@@ -1587,12 +1597,13 @@ namespace ExceptionRewriter {
 			public ExceptionHandler Handler;
 			public TypeDefinition FilterType;
 			public VariableDefinition FilterVariable;
+            public MethodDefinition FilterConstructor;
 			public MethodDefinition CatchMethod, FilterMethod;
 			public Instruction FirstFilterInsn;
 			public List<Instruction> LeaveTargets;
 			public Dictionary<object, object> Mapping;
 
-			public ExcBlock () {
+            public ExcBlock () {
 				ID = NextID++;
 			}
 
@@ -1898,6 +1909,10 @@ namespace ExceptionRewriter {
 
 			var deadHandlers = new List<ExceptionHandler>();
 
+            // FIXME: In some methods a try { } catch (...) { } catch { } finally { } chain
+            //  will not be grouped up properly and we'll end up inserting our try/finally in 
+            //  the middle of it instead of at the end, because the finally roslyn generates is
+            //  after the chain of catches
 			var excGroups = (from @group in groups
 							 let a = @group.Key.A
 							 let b = @group.Key.B
@@ -2046,7 +2061,7 @@ namespace ExceptionRewriter {
 					if (eh.FilterType == null)
 						continue;
 
-					var filterInitInstructions = InitializeExceptionFilter(method, eh.FilterType, eh.FilterVariable, closure);
+					var filterInitInstructions = InitializeExceptionFilter(method, eh, closure);
 					var insertOffset = Find(context, insns, excGroup.TryStart);
 					InsertOps(insns, insertOffset, filterInitInstructions);
 				}
@@ -2079,10 +2094,11 @@ namespace ExceptionRewriter {
 
 		private Instruction[] InitializeExceptionFilter (
 			MethodDefinition method, 
-			TypeDefinition filterType, 
-			VariableDefinition filterVariable,
+			ExcBlock eh,
 			object closureVariable
 		) {
+            var filterType = eh.FilterType;
+            var filterVariable = eh.FilterVariable;
 			var efilt = GetExceptionFilter (method.Module);
 			var skipInit = Nop ("Skip initializing filter " + filterType.Name);
 
@@ -2093,12 +2109,10 @@ namespace ExceptionRewriter {
 				Instruction.Create (OpCodes.Brtrue, skipInit),
 
 				// Create a new instance of the filter
+				GenerateLoad (closureVariable),
 				Instruction.Create (OpCodes.Newobj, filterType.Methods.First (m => m.Name == ".ctor")),
 				Instruction.Create (OpCodes.Stloc, filterVariable),
-				// Store the closure into the filter instance so it can access locals
-				Instruction.Create (OpCodes.Ldloc, filterVariable),
-				GenerateLoad (closureVariable),
-				Instruction.Create (OpCodes.Stfld, filterType.Fields.First (m => m.Name == "closure")),
+
 				skipInit,
 
 				// Then call Push on the filter instance to activate it
