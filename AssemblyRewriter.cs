@@ -1319,15 +1319,15 @@ namespace ExceptionRewriter {
 
 			filterTypeDefinition.BaseType = GetExceptionFilter (method.Module);
 			method.DeclaringType.NestedTypes.Add (filterTypeDefinition);
-			var filterConstructor = CreateConstructor (filterTypeDefinition, false);
-			var closureConstructorParameter = new ParameterDefinition ("closure", ParameterAttributes.None, closureType);
-			filterConstructor.Parameters.Add (closureConstructorParameter);
 
 			var closureField = new FieldDefinition (
 				"closure", FieldAttributes.Public, closureType
 			);
 			filterTypeDefinition.Fields.Add (closureField);
 
+			var filterConstructor = CreateConstructor (filterTypeDefinition, false);
+			var closureConstructorParameter = new ParameterDefinition ("closure", ParameterAttributes.None, closureType);
+			filterConstructor.Parameters.Add (closureConstructorParameter);
 			InsertOps (filterConstructor.Body.Instructions, filterConstructor.Body.Instructions.Count, new[] {
 				Instruction.Create(OpCodes.Ldarg_0),
 				Instruction.Create(OpCodes.Ldarg, closureConstructorParameter),
@@ -1347,6 +1347,23 @@ namespace ExceptionRewriter {
 			var excArg = new ParameterDefinition ("exc", default (ParameterAttributes), method.Module.TypeSystem.Object);
 			filterMethod.Parameters.Add (excArg);
 
+			GenerateFilterMethodBody (method, eh, fakeThis, context, insns, closure, gpMapping, closureField, filterMethod, excArg);
+
+			catchBlock.FilterMethod = filterMethod;
+			catchBlock.FilterType = filterTypeDefinition;
+			catchBlock.FilterField = new FieldDefinition ("__filter" + filterIndex, FieldAttributes.Public, filterTypeDefinition);
+			closureInfo.TypeDefinition.Fields.Add (catchBlock.FilterField);
+			catchBlock.FilterConstructor = filterConstructor;
+			catchBlock.FirstFilterInsn = eh.FilterStart;
+		}
+
+		private void GenerateFilterMethodBody (
+			MethodDefinition method, ExceptionHandler eh, ParameterDefinition fakeThis, 
+			RewriteContext context, Collection<Instruction> insns, object closure, 
+			Dictionary<TypeReference, GenericParameter> gpMapping, FieldDefinition closureField, 
+			MethodDefinition filterMethod, ParameterDefinition excArg
+		)
+		{
 			int i1 = insns.IndexOf (eh.FilterStart), i2 = insns.IndexOf (eh.HandlerStart);
 			if (i2 < 0)
 				throw new Exception ($"Handler start instruction {eh.HandlerStart} not found in method body");
@@ -1408,13 +1425,6 @@ namespace ExceptionRewriter {
 
 				CleanMethodBody (filterMethod, method, true);
 			}
-
-			catchBlock.FilterMethod = filterMethod;
-			catchBlock.FilterType = filterTypeDefinition;
-			catchBlock.FilterField = new FieldDefinition ("__filter" + filterIndex, FieldAttributes.Public, filterTypeDefinition);
-			closureInfo.TypeDefinition.Fields.Add (catchBlock.FilterField);
-			catchBlock.FilterConstructor = filterConstructor;
-			catchBlock.FirstFilterInsn = eh.FilterStart;
 		}
 
 		private class EhRange {
@@ -1753,7 +1763,7 @@ namespace ExceptionRewriter {
 
 		private readonly HashSet<string> TracedMethodNames = new HashSet<string> {
 			// "DownloadFile",
-			"NestedFiltersInOneFunction"
+			"TestReturnValueWithFinallyAndDefault"
 		};
 
 		private void RewriteMethodImpl (MethodDefinition method, Queue<MethodDefinition> queue)
@@ -2100,24 +2110,7 @@ namespace ExceptionRewriter {
 
 					var insertOffset = (from eh in eg.@group let idx = Find(context, insns, eh.HandlerEnd) orderby idx descending select idx).First ();
 
-					/*
-					if (excGroup.ExitPoint != null) {
-						insertOffset = Find (context, insns, excGroup.ExitPoint);
-						if (insertOffset < 0)
-							ComputeExitPoint (excGroup);
-
-						insertOffset = Find (context, insns, excGroup.ExitPoint);
-						if (insertOffset < 0)
-							throw new Exception ($"Exit point not found: {excGroup.ExitPoint}");
-					} else {
-						var nextInsn = (from eh in eg.@group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First ();
-						insertOffset = insns.IndexOf (nextInsn);
-					}
-					*/
-
 					InsertOps (insns, insertOffset, teardownInstructions.ToArray ());
-
-					// exitPoint = teardownPrologue;
 				}
 
 				var newHandler = new List<Instruction> ();
