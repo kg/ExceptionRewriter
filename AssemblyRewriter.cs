@@ -1787,6 +1787,16 @@ namespace ExceptionRewriter {
 
 			CleanMethodBody (method, null, true);
 
+			SortExceptionHandlers (method, context, insns);
+
+			// FIXME: Cecil currently throws inside the native PDB writer on methods we've modified
+			//  presumably because we need to manually update the debugging information after removing
+			//  instructions from the method body.
+			method.DebugInformation = null;
+		}
+
+		private void SortExceptionHandlers (MethodDefinition method, RewriteContext context, Collection<Instruction> insns)
+		{
 			// HACK: It's difficult to maintain correct exception handler sort order while rewriting,
 			//  so instead, just sort all the exception handlers at the end.
 			var sortedEhs = method.Body.ExceptionHandlers.ToList ();
@@ -1805,13 +1815,40 @@ namespace ExceptionRewriter {
 			foreach (var eh in sortedEhs)
 				method.Body.ExceptionHandlers.Add (eh);
 
-			if (method.Name.Contains ("DownloadFile"))
-				;
+			if (method.Name.Contains ("DownloadFile") || 
+				method.Name.Contains ("NestedFiltersInOneFunction") ||
+				method.Name.Contains ("Lopsided"))
+				DumpExceptionHandlers (method);
+		}
 
-			// FIXME: Cecil currently throws inside the native PDB writer on methods we've modified
-			//  presumably because we need to manually update the debugging information after removing
-			//  instructions from the method body.
-			method.DebugInformation = null;
+		private string FormatInstructionReference (MethodDefinition method, Dictionary<Instruction, int> offsets, Instruction insn) {
+			if (insn == null)
+				return "null";
+
+			var insns = method.Body.Instructions;
+			var offsetBytes = offsets[insn];
+			return $"IL_{offsetBytes:X4} {insn.OpCode} ({(insn.Operand == null ? "null" : insn.Operand)})";
+		}
+
+		private void DumpExceptionHandlers (MethodDefinition method)
+		{
+			var offsets = new Dictionary<Instruction, int> ();
+			var offset = 0;
+			foreach (var insn in method.Body.Instructions) {
+				offsets[insn] = offset;
+				offset += insn.GetSize ();
+			}
+
+			foreach (var eh in method.Body.ExceptionHandlers) {
+				Console.WriteLine ($"handler type  {eh.HandlerType}");
+				Console.WriteLine ($"catch type    {eh.CatchType}");
+				Console.WriteLine ($"try start     {FormatInstructionReference (method, offsets, eh.TryStart)}");
+				Console.WriteLine ($"try end       {FormatInstructionReference (method, offsets, eh.TryEnd)}");
+				Console.WriteLine ($"filter start  {FormatInstructionReference (method, offsets, eh.FilterStart)}");
+				Console.WriteLine ($"handler start {FormatInstructionReference (method, offsets, eh.HandlerStart)}");
+				Console.WriteLine ($"handler end   {FormatInstructionReference (method, offsets, eh.HandlerEnd)}");
+				Console.WriteLine ();
+			}
 		}
 
 		private void StripUnreferencedNops (MethodDefinition method)
