@@ -2100,6 +2100,7 @@ namespace ExceptionRewriter {
 
 					var insertOffset = (from eh in eg.@group let idx = Find(context, insns, eh.HandlerEnd) orderby idx descending select idx).First ();
 
+					/*
 					if (excGroup.ExitPoint != null) {
 						insertOffset = Find (context, insns, excGroup.ExitPoint);
 						if (insertOffset < 0)
@@ -2112,6 +2113,8 @@ namespace ExceptionRewriter {
 						var nextInsn = (from eh in eg.@group orderby eh.HandlerEnd.Offset descending select eh.HandlerEnd).First ();
 						insertOffset = insns.IndexOf (nextInsn);
 					}
+					*/
+
 					InsertOps (insns, insertOffset, teardownInstructions.ToArray ());
 
 					// exitPoint = teardownPrologue;
@@ -2403,8 +2406,6 @@ namespace ExceptionRewriter {
 
 		private void CleanMethodBody (MethodDefinition method, MethodDefinition oldMethod, bool verify)
 		{
-			return;
-
 			var insns = method.Body.Instructions;
 
 			for (int idx = 0; idx < insns.Count; idx++) {
