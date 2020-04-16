@@ -1414,7 +1414,7 @@ namespace ExceptionRewriter {
 
 			var endfilter = insns[i2 - 1];
 			if (!IsEndfilter (endfilter))
-				throw new Exception ("Filter did not end with an endfilter");
+				throw new Exception ($"Filter did not end with an endfilter, found {endfilter}");
 
 			{
 				var variableMapping = new Dictionary<object, object> ();
@@ -1431,7 +1431,7 @@ namespace ExceptionRewriter {
 
 				var oldFilterInsn = filterInsns[filterInsns.Count - 1];
 				if (!IsEndfilter (oldFilterInsn))
-					throw new Exception ("Unexpected last instruction");
+					throw new Exception ($"Unexpected last instruction {oldFilterInsn}");
 
 				var filterReplacement = Instruction.Create (OpCodes.Ret);
 				filterInsns[filterInsns.Count - 1] = filterReplacement;
@@ -1449,19 +1449,17 @@ namespace ExceptionRewriter {
 				);
 
 				// Scan through the extracted method body to find references to the closure object local
-				//  since it is an instance field inside the filter object instead of a local variable
+				//  and remap them to our new local variable
 				for (int i = 0; i < filterInsns.Count; i++) {
 					var insn = filterInsns[i];
 					if (insn.Operand != closure)
 						continue;
 
 					if (insn.OpCode.Code != Code.Ldloc)
-						throw new Exception ("Invalid reference to closure");
+						throw new Exception ($"Invalid reference to closure: {insn}");
 
-					// Replace the ldloc with a ldfld this.closure
-					filterInsns[i] = Instruction.Create (OpCodes.Ldarg, fakeThis);
-					Patch (filterMethod, context, insn, filterInsns[i]);
-					filterInsns.Insert (i + 1, Instruction.Create (OpCodes.Ldfld, closureField));
+					// Remap the ldloc to our new local closure variable
+					filterInsns[i] = Instruction.Create (OpCodes.Ldloc, (VariableDefinition)newClosureLocal);
 				}
 
 				CleanMethodBody (filterMethod, method, true);
