@@ -1208,6 +1208,8 @@ namespace ExceptionRewriter {
 			var vr = operand as VariableReference;
 			var pr = operand as ParameterReference;
 			var operandType = (operand as TypeReference) ?? ((vr != null) ? vr.VariableType : pr.ParameterType);
+			while (operandType.IsByReference)
+				operandType = operandType.GetElementType ();
 
 			switch (operandType.FullName) {
 				case "System.Byte":
@@ -1244,6 +1246,8 @@ namespace ExceptionRewriter {
 			var vr = operand as VariableReference;
 			var pr = operand as ParameterReference;
 			var operandType = (operand as TypeReference) ?? ((vr != null) ? vr.VariableType : pr.ParameterType);
+			while (operandType.IsByReference)
+				operandType = operandType.GetElementType ();
 
 			switch (operandType.FullName) {
 				case "System.Byte":
@@ -1312,12 +1316,14 @@ namespace ExceptionRewriter {
 				TypeAttributes.NestedPublic | TypeAttributes.Class,
 				GetExceptionFilter (method.Module)
 			);
+			var filterField = new FieldDefinition ("__filter" + filterIndex, FieldAttributes.Public, filterTypeDefinition);
 
 			var gpMapping = new Dictionary<TypeReference, GenericParameter> ();
 			CopyGenericParameters (method.DeclaringType, filterTypeDefinition, gpMapping);
 			CopyGenericParameters (method, filterTypeDefinition, gpMapping);
 
-			filterTypeDefinition.BaseType = GetExceptionFilter (method.Module);
+			var efilt = GetExceptionFilter (method.Module);
+			filterTypeDefinition.BaseType = efilt;
 			method.DeclaringType.NestedTypes.Add (filterTypeDefinition);
 
 			var closureField = new FieldDefinition (
@@ -1335,6 +1341,39 @@ namespace ExceptionRewriter {
 				Instruction.Create(OpCodes.Ret)
 			});
 
+			var filterActivationMethod = new MethodDefinition ("Activate", MethodAttributes.Static | MethodAttributes.Public, method.Module.TypeSystem.Void);
+			var filterActivationParameter = new ParameterDefinition ("closure", ParameterAttributes.None, closureType);
+			filterActivationMethod.Parameters.Add (filterActivationParameter);
+			var skipInit = Nop ("Skip initializing filter " + filterTypeDefinition.Name);
+
+			InsertOps (filterActivationMethod.Body.Instructions, 0, new[] {
+				// If the filter is already initialized (we're running in a loop, etc) don't create a new instance
+				Nop ("Initializing filter " + filterTypeDefinition.Name),
+				Instruction.Create (OpCodes.Ldarg, filterActivationParameter),
+				Instruction.Create (OpCodes.Ldfld, filterField),
+				Instruction.Create (OpCodes.Brtrue, skipInit),
+
+				// Create a new instance of the filter and store it
+				Instruction.Create (OpCodes.Ldarg, filterActivationParameter),
+				Instruction.Create (OpCodes.Dup),
+				Instruction.Create (OpCodes.Newobj, filterConstructor),
+				Instruction.Create (OpCodes.Stfld, filterField),
+
+				skipInit,
+
+				// Then call Push on the filter instance to activate it
+				Instruction.Create (OpCodes.Ldarg, filterActivationParameter),
+				Instruction.Create (OpCodes.Ldfld, filterField),
+				Instruction.Create (OpCodes.Castclass, efilt),
+				Instruction.Create (OpCodes.Call, new MethodReference (
+						"Push", method.Module.TypeSystem.Void, efilt
+				) { HasThis = false, Parameters = {
+						new ParameterDefinition (efilt)
+				} }),
+
+				Instruction.Create (OpCodes.Ret)
+			});
+
 			var filterMethod = new MethodDefinition (
 				"Evaluate",
 				MethodAttributes.Virtual | MethodAttributes.Public,
@@ -1342,19 +1381,21 @@ namespace ExceptionRewriter {
 			);
 			filterMethod.Body.InitLocals = true;
 
-			filterTypeDefinition.Methods.Add (filterMethod);
-
 			var excArg = new ParameterDefinition ("exc", default (ParameterAttributes), method.Module.TypeSystem.Object);
 			filterMethod.Parameters.Add (excArg);
 
 			GenerateFilterMethodBody (method, eh, fakeThis, context, insns, closure, gpMapping, closureField, filterMethod, excArg);
 
+			filterTypeDefinition.Methods.Add (filterActivationMethod);
+			filterTypeDefinition.Methods.Add (filterMethod);
+			closureInfo.TypeDefinition.Fields.Add (filterField);
+
 			catchBlock.FilterMethod = filterMethod;
 			catchBlock.FilterType = filterTypeDefinition;
-			catchBlock.FilterField = new FieldDefinition ("__filter" + filterIndex, FieldAttributes.Public, filterTypeDefinition);
-			closureInfo.TypeDefinition.Fields.Add (catchBlock.FilterField);
+			catchBlock.FilterField = filterField;
 			catchBlock.FilterConstructor = filterConstructor;
 			catchBlock.FirstFilterInsn = eh.FilterStart;
+			catchBlock.FilterActivationMethod = filterActivationMethod;
 		}
 
 		private void GenerateFilterMethodBody (
@@ -1636,6 +1677,7 @@ namespace ExceptionRewriter {
 			public Instruction FirstFilterInsn;
 			public List<Instruction> LeaveTargets;
 			public Dictionary<object, object> Mapping;
+			internal MethodDefinition FilterActivationMethod;
 
 			public ExcBlock ()
 			{
@@ -2142,7 +2184,7 @@ namespace ExceptionRewriter {
 					if (eh.FilterType == null)
 						continue;
 
-					var filterInitInstructions = InitializeExceptionFilter (method, eh, closure);
+					var filterInitInstructions = ActivateExceptionFilter (method, eh, closure);
 					var insertOffset = Find (context, insns, excGroup.TryStart);
 					var originalInstructionAtOffset = insns[insertOffset];
 					InsertOps (insns, insertOffset, filterInitInstructions);
@@ -2198,7 +2240,7 @@ namespace ExceptionRewriter {
 			return -1;
 		}
 
-		private Instruction[] InitializeExceptionFilter (
+		private Instruction[] ActivateExceptionFilter (
 			MethodDefinition method,
 			ExcBlock eh,
 			object closureVariable
@@ -2206,32 +2248,11 @@ namespace ExceptionRewriter {
 		{
 			var filterType = eh.FilterType;
 			var efilt = GetExceptionFilter (method.Module);
-			var skipInit = Nop ("Skip initializing filter " + filterType.Name);
 
 			var result = new Instruction[] {
-				// If the filter is already initialized (we're running in a loop, etc) don't create a new instance
-				Nop ("Initializing filter " + filterType.Name),
+				Nop ("Activating filter " + filterType.Name),
 				GenerateLoad (closureVariable),
-				Instruction.Create (OpCodes.Ldfld, eh.FilterField),
-				Instruction.Create (OpCodes.Brtrue, skipInit),
-
-				// Create a new instance of the filter and store it
-				GenerateLoad (closureVariable),
-				GenerateLoad (closureVariable),
-				Instruction.Create (OpCodes.Newobj, filterType.Methods.First (m => m.Name == ".ctor")),
-				Instruction.Create (OpCodes.Stfld, eh.FilterField),
-
-				skipInit,
-
-				// Then call Push on the filter instance to activate it
-				GenerateLoad (closureVariable),
-				Instruction.Create (OpCodes.Ldfld, eh.FilterField),
-				Instruction.Create (OpCodes.Castclass, efilt),
-				Instruction.Create (OpCodes.Call, new MethodReference (
-						"Push", method.Module.TypeSystem.Void, efilt
-				) { HasThis = false, Parameters = {
-						new ParameterDefinition (efilt)
-				} }),
+				Instruction.Create (OpCodes.Call, eh.FilterActivationMethod)
 			};
 
 			return result;
