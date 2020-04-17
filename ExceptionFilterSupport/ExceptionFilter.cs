@@ -100,11 +100,17 @@ namespace Mono {
 				if (hfrt.ContainsKey(filter))
 					continue;
 
-				var result = filter.Evaluate(exc);
-				hfrt[filter] = result == exception_execute_handler;
-				filter.Result = result;
-				if (result == exception_execute_handler)
-					hasLocatedValidHandler = true;
+				// When an exception filter throws on windows netframework, the filter's exception is
+				//  silently discarded and search for an exception handler continues as if it returned false
+				try {
+					var result = filter.Evaluate(exc);
+					hfrt[filter] = result == exception_execute_handler;
+					filter.Result = result;
+					if (result == exception_execute_handler)
+						hasLocatedValidHandler = true;
+				} catch {
+					filter.Result = exception_continue_search;
+				}
 			}
 		}
 	}

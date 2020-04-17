@@ -726,11 +726,18 @@ namespace ExceptionRewriter {
 				if (!parameters.Contains (p))
 					continue;
 
+				// ref/out parameters cannot be shifted into the closure without introducing
+				//  multiple problems
+				if (p.ParameterType.IsByReference)
+					continue;
+
 				var name = (p.Name != null) ? "arg_" + p.Name : "arg" + i;
 				var fieldType = FilterTypeReference (p.ParameterType, functionGpMapping);
+				// FIXME: Is this possible?
 				if (fieldType.IsByReference)
 					fieldType = fieldType.GetElementType ();
-				extractedVariables[p] = new FieldDefinition (name, FieldAttributes.Public, fieldType);
+				var fd = new FieldDefinition (name, FieldAttributes.Public, fieldType);
+				extractedVariables[p] = fd;
 			}
 
 			if (!isStatic)
@@ -742,6 +749,10 @@ namespace ExceptionRewriter {
 				var ctorInsns = result.Constructor.Body.Instructions;
 
 				foreach (var param in parameters) {
+					FieldDefinition fd;
+					if (!extractedVariables.TryGetValue (param, out fd))
+						continue;
+
 					var pd = new ParameterDefinition (param.Name, ParameterAttributes.None, param.ParameterType);
 					result.Constructor.Parameters.Add (pd);
 
@@ -749,7 +760,7 @@ namespace ExceptionRewriter {
 					ctorInsns.Add (Instruction.Create (OpCodes.Ldarg, pd));
 					if (pd.ParameterType.IsByReference)
 						ctorInsns.Add (Instruction.Create (SelectLdindForOperand (pd)));
-					ctorInsns.Add (Instruction.Create (OpCodes.Stfld, extractedVariables[param]));
+					ctorInsns.Add (Instruction.Create (OpCodes.Stfld, fd));
 				}
 
 				ctorInsns.Add (Instruction.Create (OpCodes.Ret));
@@ -773,6 +784,7 @@ namespace ExceptionRewriter {
 
 					FieldDefinition matchingField;
 					var lookupKey = (object)variable ?? arg;
+					// Any ref/out parameters will not have an extracted variable so accesses must not be transformed
 					if (!extractedVariables.TryGetValue (lookupKey, out matchingField))
 						return null;
 
@@ -829,12 +841,6 @@ namespace ExceptionRewriter {
 			});
 
 			InsertOps (insns, 0, toInject.ToArray ());
-
-			// FIXME: Removing variables will break any ldloc_n instructions
-			/*
-			foreach (var v in variables)
-				method.Body.Variables.Remove((VariableDefinition)v);
-			*/
 
 			CleanMethodBody (method, null, true);
 
@@ -1460,6 +1466,11 @@ namespace ExceptionRewriter {
 				var oldFilterInsn = filterInsns[filterInsns.Count - 1];
 				if (!IsEndfilter (oldFilterInsn))
 					throw new Exception ($"Unexpected last instruction {oldFilterInsn}");
+
+				foreach (var insn in filterInsns) {
+					if (insn.Operand is ParameterDefinition)
+						throw new Exception ($"Exception filter references parameter {insn.Operand}, which is not permitted");
+				}
 
 				var filterReplacement = Instruction.Create (OpCodes.Ret);
 				filterInsns[filterInsns.Count - 1] = filterReplacement;
