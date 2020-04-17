@@ -923,6 +923,9 @@ namespace ExceptionRewriter {
 			Func<Instruction, Instruction[]> filter
 		)
 		{
+			if (lastIndex < firstIndex)
+				throw new ArgumentException ("lastIndex must >= firstIndex");
+
 			CleanMethodBody (method, null, true);
 
 			var remapTableFirst = new Dictionary<Instruction, Instruction> ();
@@ -2223,7 +2226,23 @@ namespace ExceptionRewriter {
 
 				foreach (var eh in eg.@group)
 					method.Body.ExceptionHandlers.Remove (eh);
-				;
+
+				// Now that we've constructed our new catch block and updated everything, scan back through the
+				//  try block and insert filter deactivation before every leave instruction that exits the block.
+				var scratch = new List<Instruction> ();
+				FilterRange (
+					method, Find (context, insns, newTryStart), Find (context, insns, newStart) - 1, context,
+					(insn) => {
+						if ((insn.OpCode.Code != Code.Leave) && (insn.OpCode.Code != Code.Leave_S))
+							return null;
+
+						var target = (Instruction)insn.Operand;
+						scratch.Clear ();
+						DeactivateFilters (closureInfo, relevantFilters, scratch);
+						scratch.Add (Branch (context, OpCodes.Leave, target));
+						return scratch.ToArray ();
+					}
+				);
 			}
 
 			foreach (var eg in context.NewGroups) {
