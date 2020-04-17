@@ -706,6 +706,8 @@ namespace ExceptionRewriter {
 			var closureVariable = new VariableDefinition (result.TypeReference);
 			result.ClosureStorage = closureVariable;
 
+			var usedFieldNames = new HashSet<string> ();
+
 			var extractedVariables = variables.ToDictionary (
 				v => (object)v,
 				v => {
@@ -713,8 +715,17 @@ namespace ExceptionRewriter {
 
 					string variableName;
 					if ((method.DebugInformation == null) || !method.DebugInformation.TryGetName (vd, out variableName))
-						variableName = "__local_" + method.Body.Variables.IndexOf (vd);
+						variableName = "local" + method.Body.Variables.IndexOf (vd);
+					else {
+						variableName = "local_" + variableName;
 
+						// HACK: Methods compiled in debug mode can end up with multiple variables that all have the
+						//  same name according to debug information
+						if (usedFieldNames.Contains(variableName))
+							variableName += method.Body.Variables.IndexOf (vd);
+					}
+
+					usedFieldNames.Add (variableName);
 					return new FieldDefinition (variableName, FieldAttributes.Public, FilterTypeReference (v.VariableType, functionGpMapping));
 				}
 			);
@@ -732,10 +743,15 @@ namespace ExceptionRewriter {
 					continue;
 
 				var name = (p.Name != null) ? "arg_" + p.Name : "arg" + i;
+				while (usedFieldNames.Contains(name))
+					name += "_";
+
 				var fieldType = FilterTypeReference (p.ParameterType, functionGpMapping);
 				// FIXME: Is this possible?
 				if (fieldType.IsByReference)
 					fieldType = fieldType.GetElementType ();
+
+				usedFieldNames.Add (name);
 				var fd = new FieldDefinition (name, FieldAttributes.Public, fieldType);
 				extractedVariables[p] = fd;
 			}
