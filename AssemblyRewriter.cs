@@ -2320,6 +2320,7 @@ namespace ExceptionRewriter {
 			);
 
 			var hasFallthrough = excGroup.Blocks.Any (h => h.FilterMethod == null);
+			bool rethrowRequired = !hasFallthrough;
 			var efilt = GetExceptionFilter (method.Module);
 
 			foreach (var h in excGroup.Blocks) {
@@ -2401,7 +2402,7 @@ namespace ExceptionRewriter {
 			}
 
 			newInstructions.Add (
-				exitPoint != null
+				(exitPoint != null) && !rethrowRequired
 					? Branch (context, OpCodes.Leave, exitPoint)
 					: Instruction.Create (OpCodes.Rethrow)
 			);
