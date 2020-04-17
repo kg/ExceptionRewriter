@@ -1106,6 +1106,7 @@ namespace ExceptionRewriter {
 				throw new Exception ("Hit beginning of handler while rewinding past rethrows");
 
 			var leaveTargets = new List<Instruction> ();
+			bool canRethrow = false;
 
 			// FIXME: Use generic parameter mapping to replace GP type references
 			var newMapping = ExtractRangeToMethod (
@@ -1157,6 +1158,8 @@ namespace ExceptionRewriter {
 								break;
 
 						case Code.Rethrow:
+							canRethrow = true;
+
 							if (range == null)
 								return new[] {
 									Nop ("Rethrow"),
@@ -1198,7 +1201,8 @@ namespace ExceptionRewriter {
 				CatchMethod = catchMethod,
 				IsCatchAll = isCatchAll,
 				Mapping = newMapping,
-				LeaveTargets = leaveTargets
+				LeaveTargets = leaveTargets,
+				CanRethrow = canRethrow
 			};
 			return handler;
 		}
@@ -1694,6 +1698,7 @@ namespace ExceptionRewriter {
 			public Instruction FirstFilterInsn;
 			public List<Instruction> LeaveTargets;
 			public Dictionary<object, object> Mapping;
+			public bool CanRethrow;
 			internal MethodDefinition FilterActivationMethod, FilterDeactivationMethod;
 
 			public ExcBlock ()
@@ -2338,13 +2343,18 @@ namespace ExceptionRewriter {
 				// Either rethrow or leave depending on the value returned by the handler
 				var rethrow = Instruction.Create (OpCodes.Rethrow);
 
-				if (h.LeaveTargets.Count > 0) {
+				if ((h.LeaveTargets.Count == 1) && !h.CanRethrow) {
+					// The handler only has one possible leave target and contains no rethrow instructions so
+					//  we can just emit a constant leave
+					newInstructions.Add (Branch (context, OpCodes.Leave, h.LeaveTargets[0]));
+				} else if (h.LeaveTargets.Count > 0) {
 					// Create instructions for handling each possible leave target (in addition to 0 which is rethrow)
-					var switchTargets = new Instruction[h.LeaveTargets.Count + 1];
+					int rethrowOffset = 1;
+					var switchTargets = new Instruction[h.LeaveTargets.Count + rethrowOffset];
 					switchTargets[0] = rethrow;
 
 					for (int l = 0; l < h.LeaveTargets.Count; l++)
-						switchTargets[l + 1] = Branch (context, OpCodes.Leave, h.LeaveTargets[l]);
+						switchTargets[l + rethrowOffset] = Branch (context, OpCodes.Leave, h.LeaveTargets[l]);
 
 					// Use the return value from the handler to select one of the targets we just created
 					newInstructions.Add (Instruction.Create (OpCodes.Switch, switchTargets));
