@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Threading;
@@ -45,17 +45,17 @@ namespace Mono {
 		}
 
 		/// <summary>
-		/// Automatically runs any active exception filters for the exception exc, 
-		///  then returns true if the provided filter indicated that the current block
-		///  should run.
+		/// Checks whether the last filter evaluation selected this handler to run.
 		/// </summary>
-		/// <param name="exc">The exception to pass to the filters</param>
+		/// <param name="exc">The exception being filtered.</param>
 		/// <returns>true if this filter selected the exception handler to run</returns>
 		public bool ShouldRunHandler (object exc) {
+			var ts = ThreadStates.Value;
+
 			if (exc == null)
 				throw new ArgumentNullException("exc");
-
-			PerformEvaluate(exc);
+			if (ts.LastEvaluatedException != exc)
+				throw new ArgumentException ("Passed exception was not evaluated yet");
 
 			var result = Result == exception_execute_handler;
 			return result;

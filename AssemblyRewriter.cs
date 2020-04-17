@@ -2177,11 +2177,20 @@ namespace ExceptionRewriter {
 
 				newHandler.Add (newStart);
 
-				// At the beginning of the catch block we need to deactivate all the filters we activated before
-				//  continuing. It's important to do this here instead of in a finally block because the catch
-				//  block itself could throw, at which point our filters would erroneously be active even though
-				//  we're no longer inside the try region.
-				// We must reverse the filter list for deactivation so that the push/pop operations line up
+				// The first step is to evaluate all the active exception filters, before doing anything else.
+				// This will run all of them (if necessary) and update their result field so we can select which
+				//  catch block(s) to run.
+				newHandler.Add (Instruction.Create (OpCodes.Dup));
+				newHandler.Add (Instruction.Create (OpCodes.Call, new MethodReference (
+						"PerformEvaluate", method.Module.TypeSystem.Void, efilt
+				) { HasThis = false, Parameters = {
+						new ParameterDefinition (method.Module.TypeSystem.Object)
+				} }));
+
+				// Next we need to deactivate all the filters we activated before continuing. It's important to 
+				//  do this here instead of in a finally block because the catch block itself could throw, at 
+				//  which point our filters would erroneously be active.
+				// We must reverse the filter list for deactivation so that the push/pop operations line up.
 				var relevantFilters = excGroup.Blocks.Where (b => b.FilterType != null);
 				DeactivateFilters (closureInfo, relevantFilters.Reverse (), newHandler);
 
