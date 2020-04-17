@@ -832,8 +832,12 @@ namespace ExceptionRewriter {
 			);
 
 			var toInject = new List<Instruction> ();
-			foreach (var param in parameters)
+			foreach (var param in parameters) {
+				if (!extractedVariables.ContainsKey (param))
+					continue;
+
 				toInject.Add (Instruction.Create (OpCodes.Ldarg, (ParameterDefinition)param));
+			}
 
 			toInject.AddRange (new[] {
 				Instruction.Create(OpCodes.Newobj, result.Constructor),
@@ -852,6 +856,11 @@ namespace ExceptionRewriter {
 			foreach (var kvp in extractedVariables) {
 				result.TypeDefinition.Fields.Add (kvp.Value);
 
+				// We generate a set_ static method for every local that was extracted into the closure.
+				// This allows us to transform local set/get operations directly without any temporary loads/stores
+				//  because we can leave the new value on the stack and push the closure ref afterward. If we were
+				//  using stfld directly, we'd have to first store the new value somewhere, then push the closure,
+				//  then push the new value back onto the stack and perform the stfld.
 				{
 					var paramValue = new ParameterDefinition ("value", ParameterAttributes.None, kvp.Value.FieldType);
 					var paramClosure = new ParameterDefinition ("closure", ParameterAttributes.None, result.TypeReference);
@@ -1093,13 +1102,23 @@ namespace ExceptionRewriter {
 			var closureParam = new ParameterDefinition ("__closure", ParameterAttributes.None, closureType);
 			var excParam = new ParameterDefinition ("__exc", ParameterAttributes.None, eh.CatchType ?? method.Module.TypeSystem.Object);
 			var paramMapping = new Dictionary<object, object> {
-				{closure, closureParam }
+				{closure, closureParam}
 			};
 			var closureVariable = new VariableDefinition (closureType);
 			var needsLdind = new HashSet<object> ();
 
 			catchMethod.Parameters.Add (excParam);
 			catchMethod.Parameters.Add (closureParam);
+
+			var catchMethodRefParameters = method.Parameters.Where (p => p.ParameterType.IsByReference).ToList ();
+
+			// Any ref/out parameters to the original method can't be shifted into the closure, so we
+			//  must pass them directly to the catch body instead
+			foreach (var param in catchMethodRefParameters) {
+				var catchParam = new ParameterDefinition (param.Name, ParameterAttributes.None, param.ParameterType);
+				catchMethod.Parameters.Add (catchParam);
+				paramMapping.Add (param, catchParam);
+			}
 
 			var catchInsns = catchMethod.Body.Instructions;
 
@@ -1210,6 +1229,7 @@ namespace ExceptionRewriter {
 			var handler = new ExcBlock {
 				Handler = eh,
 				CatchMethod = catchMethod,
+				CatchMethodRefParameters = catchMethodRefParameters,
 				IsCatchAll = isCatchAll,
 				Mapping = newMapping,
 				LeaveTargets = leaveTargets,
@@ -1707,15 +1727,16 @@ namespace ExceptionRewriter {
 			public bool IsCatchAll;
 
 			public ExceptionHandler Handler;
+			public MethodDefinition CatchMethod;
+			public List<ParameterDefinition> CatchMethodRefParameters;
 			public TypeDefinition FilterType;
 			public FieldDefinition FilterField;
-			public MethodDefinition FilterConstructor;
-			public MethodDefinition CatchMethod, FilterMethod;
+			public MethodDefinition FilterConstructor, FilterMethod;
+			public MethodDefinition FilterActivationMethod, FilterDeactivationMethod;
 			public Instruction FirstFilterInsn;
 			public List<Instruction> LeaveTargets;
 			public Dictionary<object, object> Mapping;
 			public bool CanRethrow;
-			internal MethodDefinition FilterActivationMethod, FilterDeactivationMethod;
 
 			public ExcBlock ()
 			{
@@ -2150,14 +2171,6 @@ namespace ExceptionRewriter {
 
 					if (eh.FilterStart != null)
 						ExtractFilter (method, eh, closureInfo, fakeThis, excGroup, context, catchBlock);
-
-					if (catchBlock.CatchMethod != null) {
-						context.MethodQueue?.Enqueue (catchBlock.CatchMethod);
-						// FIXME: Make a new one and point to the arg instead of the old local
-						var newCi = closureInfo.Clone ();
-						newCi.ClosureStorage = catchBlock.CatchMethod.Parameters[1];
-						ClosureInfos.Add (catchBlock.CatchMethod, newCi);
-					}
 				}
 
 				// If we generated no actual catch methods for this group, don't generate a try/catch for it since it'll just
@@ -2381,6 +2394,11 @@ namespace ExceptionRewriter {
 					newInstructions.Add (Instruction.Create (OpCodes.Castclass, h.Handler.CatchType));
 
 				newInstructions.Add (GenerateLoad (closureVar));
+
+				// Any ref/out params need to be passed by-address into the catch block
+				foreach (var param in h.CatchMethodRefParameters)
+					newInstructions.Add (Instruction.Create (OpCodes.Ldarg, param));
+
 				newInstructions.Add (Instruction.Create (OpCodes.Call, h.CatchMethod));
 
 				// Either rethrow or leave depending on the value returned by the handler
