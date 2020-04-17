@@ -1072,7 +1072,7 @@ namespace ExceptionRewriter {
 			var handlerLastIndex = Find (context, insns, eh.HandlerEnd) - 1;
 
 			var catchMethod = new MethodDefinition (
-				$"{method.Name}__catch{GetOffsetOfInstruction(insns, eh.HandlerStart):X4}",
+				$"{method.Name}__catch{CatchCount++}",
 				MethodAttributes.Static | MethodAttributes.Private,
 				method.Module.TypeSystem.Int32
 			);
@@ -2158,24 +2158,25 @@ namespace ExceptionRewriter {
 					continue;
 				}
 
-				{
-					var relevantFilters = excGroup.Blocks.Where (b => b.FilterType != null).Reverse ().ToList ();
-						/*
-						teardownInstructions.Add (GenerateLoad (closureInfo.ClosureStorage));
-						teardownInstructions.Add (Instruction.Create (OpCodes.Call, eh.FilterDeactivationMethod));
-						*/
-				}
-
 				var newHandler = new List<Instruction> ();
 				var newStart = Nop (
-					"Constructed handler start for handlers " + 
-					string.Join(", ", (from b in excGroup.Blocks select b.Handler.GetHashCode().ToString("X8")))
+					"Constructed handler start for handlers " +
+					string.Join (", ", (from b in excGroup.Blocks select b.Handler.GetHashCode ().ToString ("X8")))
 				);
 				// Insert a generated NOP at the end of the constructed handler to use as the HandlerEnd.
 				// This is simpler and more reliable than trying to pick an existing instruction to use.
 				var newEnd = Nop ("Constructed handler end marker");
 
 				newHandler.Add (newStart);
+
+				// At the beginning of the catch block we need to deactivate all the filters we activated before
+				//  continuing. It's important to do this here instead of in a finally block because the catch
+				//  block itself could throw, at which point our filters would erroneously be active even though
+				//  we're no longer inside the try region.
+				// We must reverse the filter list for deactivation so that the push/pop operations line up
+				var relevantFilters = excGroup.Blocks.Where (b => b.FilterType != null);
+				DeactivateFilters (closureInfo, relevantFilters.Reverse (), newHandler);
+
 				ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, excGroup.ExitPoint, context);
 				newHandler.Add (newEnd);
 
@@ -2194,17 +2195,15 @@ namespace ExceptionRewriter {
 				var newTryStart = excGroup.TryStart;
 
 				// Ensure we initialize and activate all exception filters for the try block before entering it
-				foreach (var eh in excGroup.Blocks) {
-					if (eh.FilterType == null)
-						continue;
+				var activateInstructions = new List<Instruction> ();
+				foreach (var eh in relevantFilters)
+					ActivateExceptionFilter (method, eh, closure, activateInstructions);
 
-					var filterInitInstructions = ActivateExceptionFilter (method, eh, closure);
-					var insertOffset = Find (context, insns, excGroup.TryStart);
-					var originalInstructionAtOffset = insns[insertOffset];
-					InsertOps (insns, insertOffset, filterInitInstructions);
-					Patch (method, context, originalInstructionAtOffset, filterInitInstructions[0]);
-					newTryStart = filterInitInstructions[0];
-				}
+				var insertOffset = Find (context, insns, excGroup.TryStart);
+				var originalInstructionAtOffset = insns[insertOffset];
+				InsertOps (insns, insertOffset, activateInstructions.ToArray());
+				Patch (method, context, originalInstructionAtOffset, activateInstructions[0]);
+				newTryStart = activateInstructions[0];
 
 				var catchEh = new ExceptionHandler (ExceptionHandlerType.Catch) {
 					CatchType = method.Module.TypeSystem.Object,
@@ -2232,6 +2231,13 @@ namespace ExceptionRewriter {
 			}
 		}
 
+		private void DeactivateFilters (ClosureInfo closureInfo, IEnumerable<ExcBlock> filters, List<Instruction> output) {
+			foreach (var filter in filters) {
+				output.Add (GenerateLoad (closureInfo.ClosureStorage));
+				output.Add (Instruction.Create (OpCodes.Call, filter.FilterDeactivationMethod));
+			}
+		}
+
 		private int FindNextNonNop (Collection<Instruction> insns, int offset) {
 			for (int i = offset + 1; i < insns.Count; i++) {
 				if (insns[i].OpCode == OpCodes.Nop)
@@ -2243,22 +2249,18 @@ namespace ExceptionRewriter {
 			return -1;
 		}
 
-		private Instruction[] ActivateExceptionFilter (
+		private void ActivateExceptionFilter (
 			MethodDefinition method,
 			ExcBlock eh,
-			object closureVariable
+			object closureVariable,
+			List<Instruction> output
 		)
 		{
 			var filterType = eh.FilterType;
 			var efilt = GetExceptionFilter (method.Module);
 
-			var result = new Instruction[] {
-				Nop ("Activating filter " + filterType.Name),
-				GenerateLoad (closureVariable),
-				Instruction.Create (OpCodes.Call, eh.FilterActivationMethod)
-			};
-
-			return result;
+			output.Add (GenerateLoad (closureVariable));
+			output.Add (Instruction.Create (OpCodes.Call, eh.FilterActivationMethod));
 		}
 
 		private void ConstructNewExceptionHandler (
