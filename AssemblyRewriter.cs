@@ -1068,8 +1068,11 @@ namespace ExceptionRewriter {
 			var closure = closureInfo.ClosureStorage;
 			var closureType = closureInfo.TypeReference;
 
+			var handlerFirstIndex = Find (context, insns, eh.HandlerStart);
+			var handlerLastIndex = Find (context, insns, eh.HandlerEnd) - 1;
+
 			var catchMethod = new MethodDefinition (
-				method.Name + "__catch" + (CatchCount++),
+				$"{method.Name}__catch{GetOffsetOfInstruction(insns, eh.HandlerStart):X4}",
 				MethodAttributes.Static | MethodAttributes.Private,
 				method.Module.TypeSystem.Int32
 			);
@@ -1090,9 +1093,6 @@ namespace ExceptionRewriter {
 			catchMethod.Parameters.Add (closureParam);
 
 			var catchInsns = catchMethod.Body.Instructions;
-
-			var handlerFirstIndex = insns.IndexOf (eh.HandlerStart);
-			var handlerLastIndex = insns.IndexOf (eh.HandlerEnd) - 1;
 
 			// CHANGE #4: Adding method earlier
 			method.DeclaringType.Methods.Add (catchMethod);
@@ -1374,6 +1374,23 @@ namespace ExceptionRewriter {
 				Instruction.Create (OpCodes.Ret)
 			});
 
+			var filterDeactivationMethod = new MethodDefinition ("Deactivate", MethodAttributes.Static | MethodAttributes.Public, method.Module.TypeSystem.Void);
+			var filterDeactivationParameter = new ParameterDefinition ("closure", ParameterAttributes.None, closureType);
+			filterDeactivationMethod.Parameters.Add (filterActivationParameter);
+
+			InsertOps (filterDeactivationMethod.Body.Instructions, 0, new[] {
+				Instruction.Create (OpCodes.Ldarg, filterActivationParameter),
+				Instruction.Create (OpCodes.Ldfld, filterField),
+				Instruction.Create (OpCodes.Castclass, efilt),
+				Instruction.Create (OpCodes.Call, new MethodReference (
+						"Pop", method.Module.TypeSystem.Void, efilt
+				) { HasThis = false, Parameters = {
+						new ParameterDefinition (efilt)
+				} }),
+
+				Instruction.Create (OpCodes.Ret)
+			});
+
 			var filterMethod = new MethodDefinition (
 				"Evaluate",
 				MethodAttributes.Virtual | MethodAttributes.Public,
@@ -1387,6 +1404,7 @@ namespace ExceptionRewriter {
 			GenerateFilterMethodBody (method, eh, fakeThis, context, insns, closure, gpMapping, closureField, filterMethod, excArg);
 
 			filterTypeDefinition.Methods.Add (filterActivationMethod);
+			filterTypeDefinition.Methods.Add (filterDeactivationMethod);
 			filterTypeDefinition.Methods.Add (filterMethod);
 			closureInfo.TypeDefinition.Fields.Add (filterField);
 
@@ -1396,6 +1414,7 @@ namespace ExceptionRewriter {
 			catchBlock.FilterConstructor = filterConstructor;
 			catchBlock.FirstFilterInsn = eh.FilterStart;
 			catchBlock.FilterActivationMethod = filterActivationMethod;
+			catchBlock.FilterDeactivationMethod = filterDeactivationMethod;
 		}
 
 		private void GenerateFilterMethodBody (
@@ -1675,7 +1694,7 @@ namespace ExceptionRewriter {
 			public Instruction FirstFilterInsn;
 			public List<Instruction> LeaveTargets;
 			public Dictionary<object, object> Mapping;
-			internal MethodDefinition FilterActivationMethod;
+			internal MethodDefinition FilterActivationMethod, FilterDeactivationMethod;
 
 			public ExcBlock ()
 			{
@@ -1803,7 +1822,8 @@ namespace ExceptionRewriter {
 
 		private readonly HashSet<string> TracedMethodNames = new HashSet<string> {
 			// "DownloadFile",
-			"TestReturnValueWithFinallyAndDefault"
+			// "TestReturnValueWithFinallyAndDefault"
+			"Lopsided"
 		};
 
 		private void RewriteMethodImpl (MethodDefinition method, Queue<MethodDefinition> queue)
@@ -1901,8 +1921,27 @@ namespace ExceptionRewriter {
 			return $"IL_{offsetBytes:X4} {insn.OpCode} ({(insn.Operand == null ? "null" : insn.Operand)})";
 		}
 
-		private void DumpExceptionHandlers (MethodDefinition method)
-		{
+		private string FormatInstructionRange (MethodDefinition method, Dictionary<Instruction, int> offsets, Instruction first, Instruction afterLast) {
+			int offset1, offset2;
+			if (!offsets.TryGetValue (first, out offset1) ||
+				!offsets.TryGetValue (afterLast, out offset2))
+				return "invalid reference";
+
+			return $"IL_{offset1:X4} - IL_{offset2:X4} ({offset2 - offset1} byte(s))";
+		}
+
+		private int GetOffsetOfInstruction (Collection<Instruction> instructions, Instruction i) {
+			var offset = 0;
+			foreach (var insn in instructions) {
+				if (insn == i)
+					return offset;
+				offset += insn.GetSize ();
+			}
+
+			return -1;
+		}
+
+		private void DumpExceptionHandlers (MethodDefinition method) {
 			var offsets = new Dictionary<Instruction, int> ();
 			var offset = 0;
 			foreach (var insn in method.Body.Instructions) {
@@ -1911,19 +1950,22 @@ namespace ExceptionRewriter {
 			}
 
 			foreach (var eh in method.Body.ExceptionHandlers) {
-				Console.WriteLine ($"handler type  {eh.HandlerType}");
-				Console.WriteLine ($"catch type    {eh.CatchType}");
+				Console.WriteLine ($"#{eh.GetHashCode():X8}     {eh.HandlerType} {eh.CatchType}");
+				Console.WriteLine ($"try           {FormatInstructionRange (method, offsets, eh.TryStart, eh.TryEnd)}");
 				Console.WriteLine ($"try start     {FormatInstructionReference (method, offsets, eh.TryStart)}");
 				Console.WriteLine ($"try end       {FormatInstructionReference (method, offsets, eh.TryEnd)}");
-				Console.WriteLine ($"filter start  {FormatInstructionReference (method, offsets, eh.FilterStart)}");
+				if (eh.FilterStart != null) {
+					Console.WriteLine ($"filter        {FormatInstructionRange (method, offsets, eh.FilterStart, eh.HandlerStart)}");
+					Console.WriteLine ($"filter start  {FormatInstructionReference (method, offsets, eh.FilterStart)}");
+				}
+				Console.WriteLine ($"handler       {FormatInstructionRange (method, offsets, eh.HandlerStart, eh.HandlerEnd)}");
 				Console.WriteLine ($"handler start {FormatInstructionReference (method, offsets, eh.HandlerStart)}");
 				Console.WriteLine ($"handler end   {FormatInstructionReference (method, offsets, eh.HandlerEnd)}");
 				Console.WriteLine ();
 			}
 		}
 
-		private void StripUnreferencedNops (MethodDefinition method)
-		{
+		private void StripUnreferencedNops (MethodDefinition method) {
 			// NOTE: This method may seem cosmetic but stripping unreferenced nops is necessary
 			//  to ensure that stray nops do not remain at the end of try and finally blocks
 			// If stray nops remain there it becomes fallthrough at the end of the block
@@ -2116,48 +2158,26 @@ namespace ExceptionRewriter {
 					continue;
 				}
 
-				var teardownEnclosureLeaveTarget = Nop ("Leave target outside of teardown");
-				var teardownEnclosureLeave = Branch (context, OpCodes.Leave, teardownEnclosureLeaveTarget);
-				var teardownPrologue = Nop ("Beginning of teardown");
-				var teardownEpilogue = Nop ("End of teardown");
-
 				{
-					// Upon block exit we need to deactivate all our filters. We create teardown code
-					//  and inject it at the exit point for the try block to ensure we tear down before
-					//  anything else happens.
-
-					var teardownInstructions = new List<Instruction> { teardownEnclosureLeave, teardownPrologue };
-					foreach (var eh in excGroup.Blocks.ToArray ().Reverse ()) {
-						if (eh.FilterType == null)
-							continue;
-
+					var relevantFilters = excGroup.Blocks.Where (b => b.FilterType != null).Reverse ().ToList ();
+						/*
 						teardownInstructions.Add (GenerateLoad (closureInfo.ClosureStorage));
-						teardownInstructions.Add (Instruction.Create (OpCodes.Ldfld, eh.FilterField));
-						teardownInstructions.Add (Instruction.Create (OpCodes.Castclass, efilt));
-						teardownInstructions.Add (Instruction.Create (OpCodes.Call, new MethodReference (
-								"Pop", method.Module.TypeSystem.Void, efilt
-						) {
-							HasThis = false,
-							Parameters = {
-								new ParameterDefinition (efilt)
-						}
-						}));
-					}
-
-					teardownInstructions.Add (Instruction.Create (OpCodes.Endfinally));
-					teardownInstructions.Add (teardownEpilogue);
-					teardownInstructions.Add (teardownEnclosureLeaveTarget);
-
-					var insertOffset = (from eh in eg.@group let idx = Find(context, insns, eh.HandlerEnd) orderby idx descending select idx).First ();
-
-					InsertOps (insns, insertOffset, teardownInstructions.ToArray ());
+						teardownInstructions.Add (Instruction.Create (OpCodes.Call, eh.FilterDeactivationMethod));
+						*/
 				}
 
 				var newHandler = new List<Instruction> ();
-				var newStart = Nop ("Constructed handler start");
+				var newStart = Nop (
+					"Constructed handler start for handlers " + 
+					string.Join(", ", (from b in excGroup.Blocks select b.Handler.GetHashCode().ToString("X8")))
+				);
+				// Insert a generated NOP at the end of the constructed handler to use as the HandlerEnd.
+				// This is simpler and more reliable than trying to pick an existing instruction to use.
+				var newEnd = Nop ("Constructed handler end marker");
 
 				newHandler.Add (newStart);
 				ConstructNewExceptionHandler (method, eg.@group, excGroup, newHandler, closure, excGroup.ExitPoint, context);
+				newHandler.Add (newEnd);
 
 				var targetIndex = Find (context, insns, excGroup.TryEndPredecessor);
 				if (targetIndex < 0)
@@ -2170,10 +2190,6 @@ namespace ExceptionRewriter {
 				// HACK: This ensures that we don't leave any stray nops at the end of a try block
 				//  (that were previously actual instructions) because that will be treated as fallthrough
 				endOffset = FindNextNonNop (insns, endOffset);
-				var newEnd = insns[endOffset];
-
-				var teardownTryStart = Nop ("Teardown try block start");
-				insns.Insert (insns.IndexOf (excGroup.TryStart), teardownTryStart);
 
 				var newTryStart = excGroup.TryStart;
 
@@ -2199,21 +2215,10 @@ namespace ExceptionRewriter {
 					FilterStart = null
 				};
 
-				// Wrap everything in a try/finally to ensure that the exception filters are deactivated even if
-				//  we throw or return
-				var teardownEh = new ExceptionHandler (ExceptionHandlerType.Finally) {
-					TryStart = teardownTryStart,
-					TryEnd = teardownPrologue,
-					HandlerStart = teardownPrologue,
-					HandlerEnd = teardownEpilogue
-				};
-
 				method.Body.ExceptionHandlers.Add (catchEh);
-				method.Body.ExceptionHandlers.Add (teardownEh);
 
 				foreach (var eh in eg.@group)
 					method.Body.ExceptionHandlers.Remove (eh);
-
 				;
 			}
 
