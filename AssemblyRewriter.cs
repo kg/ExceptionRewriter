@@ -1198,6 +1198,8 @@ namespace ExceptionRewriter {
 				catchMethod = null;
 			}
 
+			SortExceptionHandlers (catchMethod, context);
+
 			var isCatchAll = (eh.HandlerType == ExceptionHandlerType.Catch) && (eh.CatchType?.FullName == "System.Object");
 			var handler = new ExcBlock {
 				Handler = eh,
@@ -1883,7 +1885,7 @@ namespace ExceptionRewriter {
 
 			CleanMethodBody (method, null, true);
 
-			SortExceptionHandlers (method, context, insns);
+			SortExceptionHandlers (method, context);
 
 			// FIXME: Cecil currently throws inside the native PDB writer on methods we've modified
 			//  presumably because we need to manually update the debugging information after removing
@@ -1896,8 +1898,9 @@ namespace ExceptionRewriter {
 			}
 		}
 
-		private void SortExceptionHandlers (MethodDefinition method, RewriteContext context, Collection<Instruction> insns)
+		private void SortExceptionHandlers (MethodDefinition method, RewriteContext context)
 		{
+			var insns = method.Body.Instructions;
 			// HACK: It's difficult to maintain correct exception handler sort order while rewriting,
 			//  so instead, just sort all the exception handlers at the end.
 			var sortedEhs = method.Body.ExceptionHandlers.ToList ();
