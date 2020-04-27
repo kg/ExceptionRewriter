@@ -39,9 +39,11 @@ namespace ExceptionRewriter {
 					var assemblyResolver = new DefaultAssemblyResolver ();
 					assemblyResolver.AddSearchDirectory (Path.GetDirectoryName (src));
 
+					var wroteOk = false;
+
 					using (var def = AssemblyDefinition.ReadAssembly (src, new ReaderParameters {
-						ReadWrite = false,
-						ReadingMode = ReadingMode.Immediate,
+						ReadWrite = options.Overwrite,
+						ReadingMode = ReadingMode.Deferred,
 						AssemblyResolver = assemblyResolver,
 						ReadSymbols = options.EnableSymbols,
 						SymbolReaderProvider = new DefaultSymbolReaderProvider (throwIfNoSymbol: false)
@@ -60,17 +62,22 @@ namespace ExceptionRewriter {
 								var shouldWriteSymbols = options.EnableSymbols && def.MainModule.SymbolReader != null;
 
 								def.Write (dst + ".tmp", new WriterParameters {
-									WriteSymbols = shouldWriteSymbols
+									WriteSymbols = shouldWriteSymbols,
+									DeterministicMvid = true
 								});
 
-								File.Copy (dst + ".tmp", dst, true);
-								if (File.Exists (dst + ".pdb")) {
-									File.Copy (dst + ".pdb", dst.Replace (".exe", ".pdb"), true);
-									File.Delete (dst + ".pdb");
-								}
-								File.Delete (dst + ".tmp");
+								wroteOk = true;
 							}
 						}
+					}
+
+					if (wroteOk) {
+						File.Copy (dst + ".tmp", dst, true);
+						if (File.Exists (dst + ".pdb")) {
+							File.Copy (dst + ".pdb", dst.Replace (".exe", ".pdb"), true);
+							File.Delete (dst + ".pdb");
+						}
+						File.Delete (dst + ".tmp");
 					}
 
 					Console.WriteLine ();
