@@ -36,42 +36,51 @@ namespace ExceptionRewriter {
 					else if (argv.Length > step)
 						Console.WriteLine ($"// {Path.GetFileName (src)} -> {Path.GetFullPath (dst)}");
 
-					var assemblyResolver = new DefaultAssemblyResolver ();
-					assemblyResolver.AddSearchDirectory (Path.GetDirectoryName (src));
-
 					var wroteOk = false;
 
-					using (var def = AssemblyDefinition.ReadAssembly (src, new ReaderParameters {
-						ReadWrite = options.Overwrite,
-						ReadingMode = ReadingMode.Deferred,
-						AssemblyResolver = assemblyResolver,
-						ReadSymbols = options.EnableSymbols,
-						SymbolReaderProvider = new DefaultSymbolReaderProvider (throwIfNoSymbol: false)
-					})) {
-						var arw = new AssemblyRewriter (def, options);
-						int errorCount = arw.Rewrite ();
+					try {
+						var assemblyResolver = new DefaultAssemblyResolver ();
+						assemblyResolver.AddSearchDirectory (Path.GetDirectoryName (src));
 
-						if (options.Mark)
-							def.Name.Name = Path.GetFileNameWithoutExtension (dst);
+						using (var def = AssemblyDefinition.ReadAssembly (src, new ReaderParameters {
+							ReadWrite = options.Overwrite,
+							ReadingMode = ReadingMode.Deferred,
+							AssemblyResolver = assemblyResolver,
+							ReadSymbols = options.EnableSymbols,
+							SymbolReaderProvider = new DefaultSymbolReaderProvider (throwIfNoSymbol: false)
+						})) {
+							var arw = new AssemblyRewriter (def, options);
+							int errorCount = arw.Rewrite ();
 
-						if (!options.Audit) {
-							if (errorCount > 0 && false) {
-								Console.Error.WriteLine ($"// Not saving due to error(s): {dst}");
-								exitCode += 1;
-							} else {
-								var shouldWriteSymbols = options.EnableSymbols && def.MainModule.SymbolReader != null;
+							if (options.Mark)
+								def.Name.Name = Path.GetFileNameWithoutExtension (dst);
 
-								def.Write (dst + ".tmp", new WriterParameters {
-									WriteSymbols = shouldWriteSymbols,
-									DeterministicMvid = true
-								});
+							if (!options.Audit) {
+								if (errorCount > 0 && false) {
+									Console.Error.WriteLine ($"// Not saving due to error(s): {dst}");
+									exitCode += 1;
+								} else {
+									var shouldWriteSymbols = options.EnableSymbols && def.MainModule.SymbolReader != null;
 
-								wroteOk = true;
+									if (options.Overwrite)
+										def.Write();
+									else
+										def.Write (dst + ".tmp", new WriterParameters {
+											WriteSymbols = shouldWriteSymbols,
+											DeterministicMvid = true
+										});
+
+									wroteOk = true;
+								}
 							}
 						}
+					} catch (Exception exc) {
+						Console.Error.WriteLine ("Unhandled exception while rewriting {0}. Continuing...", src);
+						Console.Error.WriteLine (exc);
+						exitCode += 1;
 					}
 
-					if (wroteOk) {
+					if (wroteOk && !options.Overwrite) {
 						File.Copy (dst + ".tmp", dst, true);
 						if (File.Exists (dst + ".pdb")) {
 							File.Copy (dst + ".pdb", dst.Replace (".exe", ".pdb"), true);
@@ -79,8 +88,6 @@ namespace ExceptionRewriter {
 						}
 						File.Delete (dst + ".tmp");
 					}
-
-					Console.WriteLine ();
 				}
 
 				return exitCode;
