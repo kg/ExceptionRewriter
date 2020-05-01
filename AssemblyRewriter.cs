@@ -608,6 +608,10 @@ namespace ExceptionRewriter {
 			return result;
 		}
 
+		private Instruction Unreachable (RewriteContext context) {
+			return Nop ("unreachable");
+		}
+
 		private MethodDefinition CreateConstructor (TypeDefinition type, bool includeRet)
 		{
 			var ctorMethod = new MethodDefinition (
@@ -1222,7 +1226,7 @@ namespace ExceptionRewriter {
 				}
 			);
 
-			StripUnreferencedNops (catchMethod);
+			CleanupNops (catchMethod);
 			CleanMethodBody (catchMethod, method, false);
 
 			if (catchInsns.Count > 0) {
@@ -1714,6 +1718,7 @@ namespace ExceptionRewriter {
 			public List<FilterToInsert> FiltersToInsert = new List<FilterToInsert> ();
 			public Dictionary<Instruction, Instruction> ReplacedInstructions = new Dictionary<Instruction, Instruction> ();
 			public List<ExceptionHandler> RemovedExceptionHandlers = new List<ExceptionHandler> ();
+			public Instruction Unreachable;
 			internal Queue<MethodDefinition> MethodQueue;
 		}
 
@@ -1882,7 +1887,7 @@ namespace ExceptionRewriter {
 		private readonly HashSet<string> TracedMethodNames = new HashSet<string> {
 			// "DownloadFile",
 			// "TestReturnValueWithFinallyAndDefault"
-			"Lopsided"
+			"LopsidedWithFinally"
 		};
 
 		private void RewriteMethodImpl (MethodDefinition method, Queue<MethodDefinition> queue)
@@ -1905,8 +1910,11 @@ namespace ExceptionRewriter {
 
 			var context = new RewriteContext {
 				MethodName = method.FullName,
-				MethodQueue = queue
+				MethodQueue = queue,
+				Unreachable = Nop ("unreachable")
 			};
+
+			method.Body.Instructions.Add (context.Unreachable);
 
 			var filterReferencedVariables = new HashSet<VariableReference> ();
 			var filterReferencedArguments = new HashSet<ParameterReference> ();
@@ -1931,7 +1939,7 @@ namespace ExceptionRewriter {
 			ExtractFiltersAndCatchBlocks (method, efilt, fakeThis, closureInfo, insns, context);
 
 			// FIXME
-			StripUnreferencedNops (method);
+			CleanupNops (method);
 
 			CleanMethodBody (method, null, true);
 
@@ -2026,11 +2034,37 @@ namespace ExceptionRewriter {
 			}
 		}
 
+		private void CleanupNops (MethodDefinition method) {
+			// Perform a first pass of nop removal to make the shifting pass simpler to debug
+			StripUnreferencedNops (method);
+			// Shift references to make more nops removable
+			ShiftReferencesToMakeNopsStrippable (method);
+			// Remove them
+			StripUnreferencedNops (method);
+		}
+
+		private HashSet<Instruction> CollectReferencedInstructions (Collection<Instruction> insns) {
+			var result = new HashSet<Instruction> ();
+
+			foreach (var insn in insns) {
+				var operand = insn.Operand as Instruction;
+				if (operand != null)
+					result.Add (operand);
+
+				var operands = insn.Operand as Instruction[];
+				if (operands != null)
+					foreach (var i in operands)
+						result.Add (i);
+			}
+
+			return result;
+		}
+
 		private void StripUnreferencedNops (MethodDefinition method) {
 			// NOTE: This method may seem cosmetic but stripping unreferenced nops is necessary
 			//  to ensure that stray nops do not remain at the end of try and finally blocks
 			// If stray nops remain there it becomes fallthrough at the end of the block
-			var referenced = new HashSet<Instruction> ();
+			var referenced = CollectReferencedInstructions (method.Body.Instructions);
 
 			foreach (var eh in method.Body.ExceptionHandlers) {
 				referenced.Add (eh.HandlerStart);
@@ -2041,17 +2075,6 @@ namespace ExceptionRewriter {
 			}
 
 			var insns = method.Body.Instructions;
-			foreach (var insn in insns) {
-				var operand = insn.Operand as Instruction;
-				if (operand != null)
-					referenced.Add (operand);
-
-				var operands = insn.Operand as Instruction[];
-				if (operands != null)
-					foreach (var i in operands)
-						referenced.Add (i);
-			}
-
 			var old = insns.ToArray ();
 			insns.Clear ();
 
@@ -2061,6 +2084,70 @@ namespace ExceptionRewriter {
 
 				insns.Add (insn);
 			}
+		}
+
+		private void ShiftReferencesToMakeNopsStrippable (MethodDefinition method) {
+			// Even after stripping unreferenced nops, the end of try blocks may contain a single 
+			//  nop instruction in some scenarios (typically being used as a boundary point).
+			// This violates verification rules so we need to shift references to that nop
+			//  forward until they point at something that isn't a nop. After this the nop
+			//  will not be referenced and the strip operation can remove it.
+			// Normally shifting the references forward would potentially invalidate the method's
+			//  exception handlers, but since we're just growing the handlers to contain more nops
+			//  and we know those will be removed, this should have no observable side effects.
+			
+			var insns = method.Body.Instructions;
+
+			// As a safeguard, we want to make sure we never push references *past* any start
+			//  instructions as this would cause blocks to overlap in a very bad way.
+			var startInstructions = new HashSet<Instruction> ();
+			foreach (var eh in method.Body.ExceptionHandlers) {
+				startInstructions.Add (eh.TryStart);
+				startInstructions.Add (eh.HandlerStart);
+			}
+
+			foreach (var eh in method.Body.ExceptionHandlers) {
+				// Start points being nops should be fine, and we've already removed any exception
+				//  filters, so all we need to do is fix up the end references to ensure that they
+				//  are pointing past any nops that they would otherwise keep alive.
+				eh.TryEnd = ShiftReferenceToMakeNopsStrippable (insns, startInstructions, eh.TryEnd);
+				eh.HandlerEnd = ShiftReferenceToMakeNopsStrippable (insns, startInstructions, eh.HandlerEnd);
+			}
+		}
+
+		private Instruction ShiftReferenceToMakeNopsStrippable (Collection<Instruction> insns, HashSet<Instruction> startInstructions, Instruction endPoint) {
+			var result = endPoint;
+			var originalOffset = insns.IndexOf (result);
+			var offset = originalOffset;
+			if (offset < 0)
+				throw new Exception ($"Instruction {result} not found in method body");
+
+			while (
+				(result.OpCode.Code == Code.Nop) && 
+				// While we could attempt to shift past *all* nop instructions, the only
+				//  trouble-makers we care about are the "unreachable" ones we've inserted
+				//  at the end of certain exception handler blocks.
+				// Doing this also avoids some problems with overlapping exception blocks
+				//  that I never figured out the cause of.
+				((result.Operand as string) == "unreachable")
+			) {
+				offset += 1;
+
+				// This means the nop was at the end of the method body, in which case it
+				//  should be fine to leave it referenced.
+				if (offset >= insns.Count)
+					return result;
+
+				result = insns[offset];
+
+				// Make sure we don't move too far and create invalid overlap between
+				//  exception handler blocks
+				// FIXME: This check may not be necessary.
+				if (startInstructions.Contains (result))
+					break;
+			}
+
+			return result;
 		}
 
 		private static ILookup<InstructionPair, ExceptionHandler> GetHandlersByTry (MethodDefinition method)
@@ -2218,7 +2305,7 @@ namespace ExceptionRewriter {
 				);
 				// Insert a generated NOP at the end of the constructed handler to use as the HandlerEnd.
 				// This is simpler and more reliable than trying to pick an existing instruction to use.
-				var newEnd = Nop ("Constructed handler end marker");
+				var newEnd = Unreachable (context);
 
 				newHandler.Add (newStart);
 
@@ -2312,9 +2399,9 @@ namespace ExceptionRewriter {
 			foreach (var eg in context.NewGroups) {
 				foreach (var eb in eg.Blocks) {
 					if (eb.FilterMethod != null)
-						StripUnreferencedNops (eb.FilterMethod);
+						CleanupNops (eb.FilterMethod);
 					if (eb.CatchMethod != null)
-						StripUnreferencedNops (eb.CatchMethod);
+						CleanupNops (eb.CatchMethod);
 				}
 			}
 		}
